@@ -1,0 +1,76 @@
+# ===================================================
+# Library Digitization System - .gitignore
+# ===================================================
+
+# ============ SECRETS / ENV (KHÔNG BAO GIỜ commit) ============
+.env
+.env.*
+!.env.example
+ui/.env
+ui/.env.*
+!ui/.env.example
+*.pem
+*.key
+secrets/
+
+# ============ PYTHON ============
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ============ NODE / NEXT.JS ============
+node_modules/
+/ui/node_modules/
+.next/
+/ui/.next/
+out/
+/ui/out/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ============ DỮ LIỆU RUNTIME (job data, output số hóa) ============
+data/
+/data/digitization/
+configs/*
+!configs/.gitkeep
+logs/
+*.log
+
+# ============ DOCKER / VOLUMES ============
+postgres_data/
+redis_data/
+n8n_data/
+grafana_data/
+filebrowser_data/
+
+# ============ OS / IDE ============
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# ============ TẠM ============
+tmp/
+temp/
+*.tmp

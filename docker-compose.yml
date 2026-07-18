@@ -1,0 +1,224 @@
+services:
+  # n8n Workflow Automation
+  n8n:
+    profiles: ["extras"]
+    image: n8nio/n8n:latest
+    container_name: library-n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD:-changeme}
+      - N8N_HOST=${N8N_HOST:-localhost}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - N8N_SECURE_COOKIE=false
+      - NODE_ENV=production
+      - WEBHOOK_URL=http://${N8N_HOST:-localhost}:5678/
+      - GENERIC_TIMEZONE=${TIMEZONE:-Asia/Ho_Chi_Minh}
+      - EXECUTIONS_PROCESS=main
+      - EXECUTIONS_MODE=regular
+      - LIBRARY_API_URL=${LIBRARY_API_URL}
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - DSPACE_API_URL=${DSPACE_API_URL:-https://lib.hpu.edu.vn/server}
+      - DSPACE_API_TOKEN=${DSPACE_API_TOKEN}
+      - DSPACE_BASE_URL=${DSPACE_BASE_URL:-https://lib.hpu.edu.vn}
+      - DSPACE_DEFAULT_COLLECTION=${DSPACE_DEFAULT_COLLECTION}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-library-admin@hpu.edu.vn}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/workflows
+      - ./scripts:/opt/library-digitization/scripts
+      - ${DIGITIZE_DATA_DIR}:/data/digitization
+    networks:
+      - library-net
+    depends_on:
+      - postgres
+      - redis
+
+  # PostgreSQL Database
+  postgres:
+    # profiles: ["extras"]
+    image: postgres:15-alpine
+    container_name: library-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-library_digitization}
+      - POSTGRES_USER=${POSTGRES_USER:-libraryuser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --locale=en_US.UTF-8
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - library-net
+    ports:
+      - "5432:5432"
+
+  # Redis for Queue Management
+  redis:
+    image: redis:7-alpine
+    container_name: library-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - library-net
+    ports:
+      - "6379:6379"
+
+  # Processing Worker (Python with GPU support)
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    restart: unless-stopped
+    environment:
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB:-library_digitization}
+      - POSTGRES_USER=${POSTGRES_USER:-libraryuser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
+      - DIGITIZE_DATA_DIR=/data/digitization/jobs
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ./scripts:/app/scripts
+      - ./configs:/app/configs
+      - ${DIGITIZE_DATA_DIR}:/data/digitization
+    networks:
+      - library-net
+    depends_on:
+      - redis
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "10"        # 10 logical cores/worker
+          memory: "12G"     # 12GB/worker (an toàn)
+        reservations:
+          cpus: "8"         # Đảm bảo tối thiểu
+          memory: "8G"
+
+  # FastAPI Service - Enhanced API with UI support
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: library-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DIGITIZE_DATA_DIR=/data/digitization/jobs
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB:-library_digitization}
+      - POSTGRES_USER=${POSTGRES_USER:-libraryuser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-changeme}
+      - REDIS_HOST=redis
+      - DSPACE_API_URL=${DSPACE_API_URL}
+      - DSPACE_API_TOKEN=${DSPACE_API_TOKEN}
+    volumes:
+      - ./api:/app/api
+      - ./scripts:/app/scripts
+      - ./configs:/app/configs
+      - ${DIGITIZE_DATA_DIR}:/data/digitization
+    networks:
+      - library-net
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # UI Service - Digitization Dashboard
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    container_name: library-ui
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # DSpace config
+      - NEXT_PUBLIC_DSPACE_URL=${DSPACE_BASE_URL}
+      
+      # OCR API config
+      - NEXT_PUBLIC_OCR_API_URL=http://api:8000
+      
+      # Claude API (for metadata extraction)
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      
+      # Node environment
+      - NODE_ENV=production
+    networks:
+      - library-net
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Monitoring Dashboard (Optional - Grafana)
+  grafana:
+    profiles: ["extras"]
+    image: grafana/grafana:latest
+    container_name: library-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"  # Changed to 3001 to avoid conflict with UI
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-changeme}
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - library-net
+    depends_on:
+      - postgres
+
+  # File Browser (Optional - for managing processed files)
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    container_name: library-filebrowser
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ${DIGITIZE_DATA_DIR}:/srv
+      - filebrowser_data:/database
+    environment:
+      - FB_DATABASE=/database/filebrowser.db
+      - FB_ROOT=/srv
+    networks:
+      - library-net
+
+volumes:
+  n8n_data:
+    driver: local
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  grafana_data:
+    driver: local
+  filebrowser_data:
+    driver: local
+
+networks:
+  library-net:
+    driver: bridge

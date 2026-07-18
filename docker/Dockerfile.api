@@ -1,0 +1,53 @@
+# Library Digitization System - API Container
+# FastAPI REST API cho quản lý và giám sát
+
+FROM python:3.10-slim
+
+# Set environment
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y curl \
+    poppler-utils \
+    ghostscript \
+    imagemagick \
+    tesseract-ocr \
+    tesseract-ocr-vie \
+    gcc \
+    libpq-dev \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create working directory
+WORKDIR /app
+
+# Copy requirements and install
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy application files
+COPY scripts /app/scripts
+COPY configs /app/configs
+
+# Create necessary directories
+RUN mkdir -p /app/logs
+
+# =========================
+# DATA DIR (VOLUME)
+# =========================
+ENV DIGITIZE_DATA_DIR=/data/digitization/jobs
+RUN mkdir -p /data/digitization/jobs
+RUN chmod -R 755 /data/digitization
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python3 -c "import requests; requests.get('http://localhost:8000/health')" || exit 1
+
+# Run API server
+CMD ["uvicorn", "scripts.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

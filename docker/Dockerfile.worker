@@ -1,0 +1,98 @@
+# Library Digitization System - Worker Container
+# Hỗ trợ GPU NVIDIA cho OCR tăng tốc
+
+FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
+
+# Set environment
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+ENV TMPDIR=/tmp
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    python3-dev \
+    tesseract-ocr \
+    tesseract-ocr-vie \
+    tesseract-ocr-eng \
+    libtesseract-dev \
+    imagemagick \
+    ghostscript \
+    qpdf \
+    unpaper \
+    pngquant \
+    poppler-utils \
+    libopencv-dev \
+    python3-opencv \
+    wget \
+    curl \
+    git \
+    build-essential \
+    automake \
+    libtool \
+    libleptonica-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install jbig2enc from source (REQUIRED for --optimize 3)
+RUN git clone --depth 1 https://github.com/agl/jbig2enc /tmp/jbig2enc && \
+    cd /tmp/jbig2enc && \
+    ./autogen.sh && \
+    ./configure && \
+    make && \
+    make install && \
+    ldconfig && \
+    rm -rf /tmp/jbig2enc
+
+# Configure ImageMagick for PDF processing
+RUN sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml || true
+
+# Install Tesseract language data (best quality) + OSD
+RUN mkdir -p /usr/share/tesseract-ocr/5/tessdata && \
+    cd /usr/share/tesseract-ocr/5/tessdata && \
+    wget -q https://github.com/tesseract-ocr/tessdata_best/raw/main/vie.traineddata && \
+    wget -q https://github.com/tesseract-ocr/tessdata_best/raw/main/eng.traineddata && \
+    wget -q https://github.com/tesseract-ocr/tessdata_best/raw/main/osd.traineddata
+
+# Create Tesseract config directory and files
+RUN mkdir -p /usr/share/tesseract-ocr/5/tessdata/configs /usr/share/tesseract-ocr/5/tessdata/tessconfigs && \
+    echo "tessedit_create_hocr 1" > /usr/share/tesseract-ocr/5/tessdata/configs/hocr && \
+    echo "tessedit_create_txt 1" > /usr/share/tesseract-ocr/5/tessdata/configs/txt && \
+    echo "tessedit_create_pdf 1" > /usr/share/tesseract-ocr/5/tessdata/configs/pdf && \
+    cp /usr/share/tesseract-ocr/5/tessdata/configs/* /usr/share/tesseract-ocr/5/tessdata/tessconfigs/ && \
+    chmod -R 755 /usr/share/tesseract-ocr/5/tessdata
+
+# Create working directory
+WORKDIR /app
+
+# Copy requirements and install Python packages
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir -r requirements.txt
+
+# Install OCRmyPDF and dependencies
+RUN pip3 install --no-cache-dir \
+    ocrmypdf \
+    pikepdf
+
+# Copy application files
+COPY scripts /app/scripts
+COPY configs /app/configs
+
+ENV DIGITIZE_DATA_DIR=/data/digitization/jobs
+# Create necessary directories with proper permissions
+RUN mkdir -p /data/digitization/jobs /app/logs /tmp/ocrmypdf && \
+    chmod 1777 /tmp && \
+    chmod -R 755 /data/digitization && \
+    chmod -R 777 /tmp/ocrmypdf
+
+# Set permissions
+RUN chmod +x /app/scripts/*.py || true
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python3 -c "import sys; sys.exit(0)"
+
+# Run worker
+CMD ["python3", "-m", "scripts.worker"]
