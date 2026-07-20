@@ -148,6 +148,51 @@ CREATE TRIGGER trg_log_metadata_change
     EXECUTE FUNCTION log_metadata_change();
 
 -- =====================================================================
+-- 7b. AUDIT LOG — nhật ký kiểm toán BẤT BIẾN (YC-AU)
+--   Append-only: chặn UPDATE/DELETE/TRUNCATE bằng trigger (YC-AU-03) — kể cả quản trị viên.
+--   get: truy được toàn vòng đời tài liệu (YC-AU-01); ghi ai/khi nào/cũ→mới (YC-AU-02);
+--        chế độ + model đã dùng (YC-AU-04).
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS audit_log (
+    id           BIGSERIAL PRIMARY KEY,
+    document_id  TEXT,                    -- tài liệu liên quan (NULL nếu thao tác hệ thống)
+    action       VARCHAR(50)  NOT NULL,   -- upload|process|edit_field|confirm|dspace_push|sensitivity_change|...
+    actor        VARCHAR(150),            -- ai thực hiện (YC-AU-02)
+    field_key    VARCHAR(100),            -- trường bị sửa (nếu có)
+    old_value    TEXT,                    -- giá trị cũ (YC-AU-02)
+    new_value    TEXT,                    -- giá trị mới
+    mode         VARCHAR(20),             -- cloud|local (YC-AU-04)
+    model        VARCHAR(150),            -- tên + phiên bản model (YC-AU-04)
+    detail       JSONB,                   -- thông tin bổ sung
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_document_id ON audit_log(document_id);
+CREATE INDEX IF NOT EXISTS idx_audit_created_at  ON audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_actor       ON audit_log(actor);
+CREATE INDEX IF NOT EXISTS idx_audit_action      ON audit_log(action);
+
+-- Bất biến (YC-AU-03): mọi UPDATE/DELETE/TRUNCATE đều bị từ chối, kể cả bởi quản trị viên.
+CREATE OR REPLACE FUNCTION prevent_audit_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_log bất biến (append-only): không được thực hiện % (YC-AU-03)', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_audit_no_update ON audit_log;
+CREATE TRIGGER trg_audit_no_update BEFORE UPDATE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_mutation();
+
+DROP TRIGGER IF EXISTS trg_audit_no_delete ON audit_log;
+CREATE TRIGGER trg_audit_no_delete BEFORE DELETE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_mutation();
+
+DROP TRIGGER IF EXISTS trg_audit_no_truncate ON audit_log;
+CREATE TRIGGER trg_audit_no_truncate BEFORE TRUNCATE ON audit_log
+    FOR EACH STATEMENT EXECUTE FUNCTION prevent_audit_mutation();
+
+-- =====================================================================
 -- 8. SEED DATA cho các bảng lookup
 --    Bắt buộc: các giá trị mặc định app dùng phải tồn tại trước khi
 --    documents insert (book, queued, pending).
