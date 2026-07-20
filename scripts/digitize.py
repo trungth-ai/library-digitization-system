@@ -22,8 +22,9 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from pypdf import PdfReader
-import anthropic
+# Lazy import (chuyển vào trong hàm) cho pypdf & anthropic: giúp module import được ở môi trường
+# tối giản (chưa cài 2 gói này) — phục vụ test tầng logic build_metadata và lớp provider.
+# Hành vi runtime KHÔNG đổi: import thực hiện ngay trước khi dùng, khi deps có mặt.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -297,6 +298,7 @@ class PDFAConverter:
 class PDFTextExtractor:
     def extract(self, pdf_path: str, max_pages: int = 10) -> str:
         """Extract text from first 8 pages + last 2 pages"""
+        from pypdf import PdfReader  # lazy import
         reader = PdfReader(pdf_path)
         total_pages = len(reader.pages)
         pages = []
@@ -322,7 +324,11 @@ class PDFTextExtractor:
 class AIMetadataExtractor:
     def __init__(self, config: ProcessingConfig, api_key: Optional[str]):
         self.config = config
-        self.client = anthropic.Anthropic(api_key=api_key) if api_key else None
+        if api_key:
+            import anthropic  # lazy import
+            self.client = anthropic.Anthropic(api_key=api_key)
+        else:
+            self.client = None
     
     def extract(self, pdf_path: str) -> Dict:
         """Extract metadata using AI"""
