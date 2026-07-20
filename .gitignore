@@ -70,6 +70,11 @@ Thumbs.db
 *.swp
 *~
 
+# ============ EVAL (đo đạc) ============
+# Tài liệu thật để đo có thể nhạy cảm → KHÔNG commit. Mẫu nằm ở scripts/eval/samples/.
+eval_data/
+eval_out/
+
 # ============ TẠM ============
 tmp/
 temp/
