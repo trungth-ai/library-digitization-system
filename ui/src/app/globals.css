@@ -10,6 +10,19 @@
   --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+
+  /* Design system HPU (#1e3a5f) — dùng: bg-hpu-primary, text-hpu-primary... */
+  --color-hpu-primary: #1e3a5f;
+  --color-hpu-primary-hover: #2d5a8e;
+  --color-hpu-primary-light: #e8f0fe;
+  --color-hpu-success: #10b981;
+  --color-hpu-success-light: #d1fae5;
+  --color-hpu-danger: #ef4444;
+  --color-hpu-danger-light: #fee2e2;
+  --color-hpu-warning: #f59e0b;
+  --color-hpu-warning-light: #fef3c7;
+  --color-hpu-info: #3b82f6;
+  --color-hpu-info-light: #dbeafe;
 }
 
 @media (prefers-color-scheme: dark) {
