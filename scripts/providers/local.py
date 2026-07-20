@@ -67,6 +67,11 @@ class LocalProvider(ModelProvider):
     # -- ModelProvider ----------------------------------------------------
     def extract_fields(self, text: str, schema: ExtractionSchema) -> ExtractionResult:
         self.config.document_type = schema.document_type
+
+        # Lược đồ khác dublin_core (vd công văn) → generic schema-driven
+        if schema.code != "dublin_core":
+            return self._extract_generic(text, schema)
+
         t0 = time.perf_counter()
         used_ai = False
         try:
@@ -92,6 +97,28 @@ class LocalProvider(ModelProvider):
             for m in metadata
         ]
         return ExtractionResult(fields=fields, raw=result)
+
+    def _complete(self, prompt: str) -> str:
+        """Gọi Ollama với 1 prompt tự do → text (dùng cho generic schema-driven)."""
+        return self._call_generate(prompt)
+
+    def _extract_generic(self, text: str, schema: ExtractionSchema) -> ExtractionResult:
+        """Trích xuất theo lược đồ bất kỳ (không phải dublin_core)."""
+        from scripts.providers.prompt import extract_with_schema
+        t0 = time.perf_counter()
+        used_ai = False
+        try:
+            result = extract_with_schema(self._complete, text, schema)
+            used_ai = True
+        except Exception as e:  # noqa: BLE001 - không mất dữ liệu (YC-MP-05)
+            logger.warning("Generic extraction (local) lỗi: %s", e)
+            result = ExtractionResult(fields=[])
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info(
+            "model_call provider=%s model=%s ai=%s latency_ms=%d fields=%d schema=%s",
+            self.name, self.model, used_ai, latency_ms, len(result.fields), schema.code,
+        )
+        return result
 
     def embed(self, texts: List[str]) -> List[List[float]]:
         """Tạo embedding tại chỗ (YC-RG-02) — dùng cho RAG ở GĐ3."""
