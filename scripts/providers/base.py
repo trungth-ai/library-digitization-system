@@ -45,6 +45,7 @@ class ExtractionSchema:
     `context_strategy` là thuộc tính của lược đồ (YC-SC-04) — thay cho hằng số cứng "8 trang đầu/2 cuối".
     """
     code: str                              # vd "dublin_core", "cong_van"
+    name: str = ""                         # nhãn hiển thị lược đồ
     document_type: str = "book"            # book | thesis | cong_van | ...
     fields: List[SchemaField] = field(default_factory=list)
     context_strategy: str = "first8_last2" # chiến lược chọn ngữ cảnh

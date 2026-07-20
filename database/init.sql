@@ -193,6 +193,64 @@ CREATE TRIGGER trg_audit_no_truncate BEFORE TRUNCATE ON audit_log
     FOR EACH STATEMENT EXECUTE FUNCTION prevent_audit_mutation();
 
 -- =====================================================================
+-- 7c. LƯỢC ĐỒ TRÍCH XUẤT dạng DỮ LIỆU (YC-SC-01) — cấu hình được, không sửa mã
+--   Mỗi lược đồ có độ nhạy cảm (YC-DR-01) + chiến lược chọn ngữ cảnh (YC-SC-04).
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS extraction_schemas (
+    code             VARCHAR(50)  PRIMARY KEY,
+    name             VARCHAR(200) NOT NULL,
+    document_type    VARCHAR(50)  NOT NULL,
+    context_strategy VARCHAR(50)  NOT NULL DEFAULT 'first8_last2',
+    sensitivity      VARCHAR(20)  NOT NULL DEFAULT 'public',
+    is_active        BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS schema_fields (
+    id          BIGSERIAL PRIMARY KEY,
+    schema_code VARCHAR(50)  NOT NULL REFERENCES extraction_schemas(code) ON DELETE CASCADE,
+    key         VARCHAR(100) NOT NULL,
+    label       VARCHAR(200),
+    required    BOOLEAN      NOT NULL DEFAULT FALSE,
+    data_type   VARCHAR(20)  NOT NULL DEFAULT 'text',   -- text|date|number|list
+    language    VARCHAR(20),
+    description TEXT,
+    sort_order  INTEGER      NOT NULL DEFAULT 0,
+    CONSTRAINT uq_schema_field UNIQUE (schema_code, key)
+);
+CREATE INDEX IF NOT EXISTS idx_schema_fields_code ON schema_fields(schema_code);
+
+-- Seed 2 lược đồ khởi tạo: Dublin Core (YC-SC-02) + Công văn hành chính (YC-SC-03)
+INSERT INTO extraction_schemas (code, name, document_type, context_strategy, sensitivity) VALUES
+    ('dublin_core', 'Dublin Core (sách/khóa luận)', 'book',     'first8_last2', 'public'),
+    ('cong_van',    'Công văn hành chính',          'cong_van', 'full',         'internal')
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO schema_fields (schema_code, key, label, required, data_type, language, sort_order) VALUES
+    ('dublin_core', 'dc.title',                'Tiêu đề',              TRUE,  'text',   'vi_VN', 1),
+    ('dublin_core', 'dc.title.alternative',    'Tiêu đề phụ',          FALSE, 'text',   'en_US', 2),
+    ('dublin_core', 'dc.contributor.author',   'Tác giả',              TRUE,  'list',   'vi_VN', 3),
+    ('dublin_core', 'dc.contributor.advisor',  'Giảng viên hướng dẫn', FALSE, 'list',   'vi_VN', 4),
+    ('dublin_core', 'dc.publisher',            'Nhà xuất bản',         FALSE, 'text',   'vi_VN', 5),
+    ('dublin_core', 'dc.date.issued',          'Năm xuất bản',         FALSE, 'number', NULL,    6),
+    ('dublin_core', 'dc.subject',              'Từ khóa',              FALSE, 'list',   'vi_VN', 7),
+    ('dublin_core', 'dc.description.abstract', 'Tóm tắt',              FALSE, 'text',   'vi_VN', 8),
+    ('dublin_core', 'dc.type',                 'Loại',                 TRUE,  'text',   'en_US', 9),
+    ('dublin_core', 'dc.language.iso',         'Ngôn ngữ',             FALSE, 'text',   NULL,    10),
+    ('dublin_core', 'dc.identifier.isbn',      'ISBN',                 FALSE, 'text',   NULL,    11),
+    ('cong_van',    'so_hieu',                 'Số hiệu',              TRUE,  'text',   NULL,    1),
+    ('cong_van',    'ngay_ban_hanh',           'Ngày ban hành',        FALSE, 'date',   NULL,    2),
+    ('cong_van',    'co_quan_ban_hanh',        'Cơ quan ban hành',     TRUE,  'text',   NULL,    3),
+    ('cong_van',    'loai_van_ban',            'Loại văn bản',         FALSE, 'text',   NULL,    4),
+    ('cong_van',    'trich_yeu',               'Trích yếu',            TRUE,  'text',   NULL,    5),
+    ('cong_van',    'do_khan',                 'Độ khẩn',              FALSE, 'text',   NULL,    6),
+    ('cong_van',    'do_mat',                  'Độ mật',               FALSE, 'text',   NULL,    7),
+    ('cong_van',    'noi_nhan',                'Nơi nhận',             FALSE, 'list',   NULL,    8),
+    ('cong_van',    'nguoi_ky',                'Người ký',             FALSE, 'text',   NULL,    9)
+ON CONFLICT (schema_code, key) DO NOTHING;
+
+-- =====================================================================
 -- 8. SEED DATA cho các bảng lookup
 --    Bắt buộc: các giá trị mặc định app dùng phải tồn tại trước khi
 --    documents insert (book, queued, pending).
