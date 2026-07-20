@@ -87,6 +87,11 @@ services:
       - REDIS_PORT=6379
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # Model provider (YC-MP-04) — dùng khi worker trích xuất qua factory (GĐ1).
+      # Mặc định 'cloud' giữ nguyên hành vi hiện tại; đổi 'local' để dùng Ollama tại chỗ.
+      - MODEL_PROVIDER=${MODEL_PROVIDER:-cloud}
+      - OLLAMA_URL=http://ollama:11434
+      - LOCAL_MODEL=${LOCAL_MODEL:-qwen2.5:7b}
     volumes:
       - ./scripts:/app/scripts
       - ./configs:/app/configs
@@ -104,6 +109,40 @@ services:
         reservations:
           cpus: "8"         # Đảm bảo tối thiểu
           memory: "8G"
+
+  # Model serving tại chỗ (Ollama) — YC-MS. Đặt trong profile "local-ai" để KHÔNG ảnh hưởng
+  # deploy hiện tại: `docker compose up` mặc định KHÔNG chạy service này (bổ sung, không viết lại).
+  #   Bật chế độ tại chỗ:  docker compose --profile local-ai up -d
+  #   Tải model 1 lần:     docker compose exec ollama ollama pull qwen2.5:7b
+  #   Kiểm chứng ngắt mạng (KT-BM-01): sau khi có model trong volume, ngắt Internet vẫn xử lý được.
+  ollama:
+    profiles: ["local-ai"]
+    image: ollama/ollama:latest
+    container_name: library-ollama
+    restart: unless-stopped
+    # KHÔNG map cổng ra host (YC-MS-01, YC-BM-05): chỉ truy cập trong mạng nội bộ library-net.
+    expose:
+      - "11434"
+    volumes:
+      # YC-MS-02: model lưu trên volume, không tải lại mỗi lần khởi động
+      - ollama_data:/root/.ollama
+    networks:
+      - library-net
+    healthcheck:
+      # YC-MS-04: kiểm tra sẵn sàng trước khi đưa tài liệu vào xử lý
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # GPU tùy chọn: nếu server có NVIDIA GPU, bỏ comment khối dưới (SRS: không GPU thì chạy CPU).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
 
   # FastAPI Service - Enhanced API with UI support
   api:
@@ -208,6 +247,8 @@ services:
       - library-net
 
 volumes:
+  ollama_data:          # YC-MS-02: lưu model tại chỗ, bền vững qua khởi động lại
+    driver: local
   n8n_data:
     driver: local
   postgres_data:
