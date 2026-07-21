@@ -25,6 +25,22 @@ export function StatusBadge({ code, label }) {
   );
 }
 
+const SENSITIVITY = {
+  public:    { cls: "bg-hpu-info-light text-hpu-info", label: "Công khai" },
+  internal:  { cls: "bg-hpu-warning-light text-hpu-warning", label: "Nội bộ" },
+  sensitive: { cls: "bg-hpu-danger-light text-hpu-danger", label: "Nhạy cảm" },
+};
+
+/** Nhãn độ nhạy cảm lược đồ (YC-DR-01) — quyết định chế độ xử lý. */
+export function SensitivityBadge({ value }) {
+  const s = SENSITIVITY[value] || { cls: "bg-gray-100 text-gray-600", label: value || "?" };
+  return (
+    <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${s.cls}`}>
+      {s.label}
+    </span>
+  );
+}
+
 /**
  * ConfidenceBadge (YC-CF-04): tô màu điểm tin cậy để cán bộ tập trung kiểm tra.
  * >=0.7 xanh (tin cậy) · 0.5–0.7 vàng (cần xem) · <0.5 đỏ (nghi bịa/ảo giác).
