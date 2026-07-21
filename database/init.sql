@@ -262,7 +262,8 @@ INSERT INTO document_types (code, label, description, is_active, sort_order) VAL
     ('thesis',    'Khóa luận / Đồ án',    'Khóa luận, đồ án, luận văn tốt nghiệp',   TRUE, 2),
     ('textbook',  'Giáo trình',           'Giáo trình giảng dạy',                    TRUE, 3),
     ('journal',   'Tạp chí',              'Tạp chí, kỷ yếu khoa học',                TRUE, 4),
-    ('reference', 'Tài liệu tham khảo',   'Tài liệu tham khảo khác',                 TRUE, 5)
+    ('reference', 'Tài liệu tham khảo',   'Tài liệu tham khảo khác',                 TRUE, 5),
+    ('cong_van',  'Công văn',             'Công văn, văn bản hành chính',            TRUE, 6)
 ON CONFLICT (code) DO NOTHING;
 
 -- 8.2 Trạng thái OCR (khớp worker.py: queued→ocr→extracting→exporting→completed/failed)

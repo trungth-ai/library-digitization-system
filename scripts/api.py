@@ -25,6 +25,10 @@ from pydantic import BaseModel
 import scripts.db as db
 from scripts.sse import job_event_stream
 
+# Module GĐ1-2 + envelope HPU (endpoints MỚI dùng envelope; route cũ giữ nguyên — ADR-003)
+from scripts.core import reports, audit, schema_store
+from scripts.core.responses import success, error as err_envelope
+
 
 # ---------------------------------------------------------------------
 # CONFIG
@@ -724,6 +728,69 @@ async def get_job_statuses():
 @app.get("/api/v2/lookup/dspace-statuses")
 async def get_dspace_statuses():
     return db.get_dspace_upload_statuses()
+
+
+# ---------------------------------------------------------------------
+# ROUTES - SCHEMAS / AUDIT / REPORTS (endpoints MỚI, envelope HPU — ADR-003)
+# ---------------------------------------------------------------------
+
+@app.get("/api/v2/schemas")
+async def api_list_schemas():
+    """Danh sách lược đồ trích xuất (YC-SC)."""
+    return success(schema_store.list_schemas(), "Danh sách lược đồ")
+
+
+@app.get("/api/v2/schemas/{code}")
+async def api_get_schema(code: str):
+    """Chi tiết 1 lược đồ (YC-SC)."""
+    s = schema_store.load_schema(code)
+    if not s:
+        return JSONResponse(status_code=404,
+                            content=err_envelope(f"Không tìm thấy lược đồ '{code}'", code="NOT_FOUND"))
+    return success(schema_store.schema_to_dict(s), "Chi tiết lược đồ")
+
+
+@app.get("/api/v2/reports/by-mode")
+async def api_report_by_mode(date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None)):
+    """Báo cáo tài liệu theo chế độ xử lý cloud/local (YC-DR-06)."""
+    return success(reports.report_by_mode(date_from, date_to), "Thống kê theo chế độ")
+
+
+@app.get("/api/v2/reports/field-edits")
+async def api_report_field_edits(date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None)):
+    """Trường bị cán bộ sửa nhiều nhất (YC-CF-07)."""
+    return success(reports.report_field_edit_rate(date_from, date_to), "Tỉ lệ trường bị sửa")
+
+
+@app.get("/api/v2/reports/throughput")
+async def api_report_throughput(date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None)):
+    """Throughput OCR theo ngày (hoàn thành/thất bại)."""
+    return success(reports.report_throughput(date_from, date_to), "Throughput theo ngày")
+
+
+@app.get("/api/v2/reports/actions")
+async def api_report_actions(date_from: Optional[str] = Query(None), date_to: Optional[str] = Query(None)):
+    """Tổng quan số thao tác theo loại (từ audit)."""
+    return success(reports.report_action_summary(date_from, date_to), "Tổng quan thao tác")
+
+
+@app.get("/api/v2/jobs/{job_id}/audit")
+async def api_document_audit(job_id: str):
+    """Nhật ký kiểm toán toàn vòng đời 1 tài liệu (YC-AU-01)."""
+    return success(audit.get_document_audit_trail(job_id), "Nhật ký tài liệu")
+
+
+@app.get("/api/v2/audit")
+async def api_list_audit(
+    actor:     Optional[str] = Query(None),
+    action:    Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    limit:     int           = Query(500, ge=1, le=5000),
+):
+    """Kết xuất nhật ký kiểm toán theo bộ lọc thời gian/người/loại (YC-AU-05)."""
+    rows = audit.list_audit(actor=actor, action=action, date_from=date_from, date_to=date_to, limit=limit)
+    return success(rows, "Nhật ký kiểm toán")
 
 
 # ---------------------------------------------------------------------
