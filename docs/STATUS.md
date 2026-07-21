@@ -1,6 +1,6 @@
 # DocuFlow HP — Trạng thái nâng cấp & Bàn giao
 
-> Cập nhật: 20/07/2026. Repo: `github.com/trungth-ai/library-digitization-system` (17 commit).
+> Cập nhật: 21/07/2026. Repo: `github.com/trungth-ai/library-digitization-system` (21 commit).
 > Tài liệu này để bất kỳ kỹ sư nào tiếp quản (YC-VH-01) nắm được đã làm gì, cách kiểm chứng, còn gì.
 
 ## 1. Đã hoàn thành (backend modules, kiểm chứng ở dev)
@@ -16,6 +16,8 @@
 | 2 | Báo cáo (theo chế độ / tỉ lệ sửa / throughput) | `scripts/core/reports.py` | verify PostgreSQL |
 | 2 | Lược đồ cấu hình lưu DB | `scripts/core/schema_store.py` + bảng | verify PostgreSQL |
 | 3 | Chia đoạn theo cấu trúc (RAG) | `scripts/core/chunking.py` | `pytest` |
+| 2 | Tích hợp API: endpoints reports/audit/schemas (envelope HPU) | `scripts/api.py` | verify logic (psycopg2+PG) + py_compile |
+| 2 | UI: dashboard `/bao-cao` + quản trị lược đồ `/luoc-do` | `ui/src/app/` | verify qua preview trình duyệt |
 
 **66 pytest PASS** + 4 lần kiểm chứng trên PostgreSQL 17. Không hồi quy, không đụng code production đang chạy.
 
@@ -34,8 +36,8 @@ python -m pytest tests/ -q            # 66 passed
 
 | Việc | Cần gì | Ai |
 |---|---|---|
-| **Tích hợp** module vào `worker`/`api.py` + endpoints envelope | server (redis + postgres) để chạy & verify | 🤖 code được, verify ở server |
-| **UI**: dashboard báo cáo, tô màu confidence (YC-CF-04), màn quản trị lược đồ (YC-SC-05) | trình duyệt + Next.js dev server | 🤖 code + verify qua preview |
+| Endpoints đọc (reports/audit/schemas) ĐÃ thêm `api.py`; còn **wire vào worker** + chạy **HTTP e2e** | server (redis + postgres) | 🤖 code được, verify ở server |
+| UI `/bao-cao` + `/luoc-do` ĐÃ xong (verify preview); còn **nối API thật** + trang upload/duyệt | trình duyệt + backend chạy | 🤖 verify qua preview |
 | **YC-RG** embedding + tra cứu (GĐ3) | Ollama embedding + `pgvector` | 🤖 structure, số liệu cần env |
 | **Số liệu đo GĐ0** (KT-CX/KT-HN) cho hồ sơ | server + Ollama + BD-01 + đáp án chuẩn | 👤 bạn |
 | **Bảng giấy phép** (YC-PL) + video ngắt mạng + văn bản pháp lý | rà soát + quay + pháp chế | 👤 bạn |
