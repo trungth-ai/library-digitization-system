@@ -175,71 +175,15 @@ if [ ! -f ".env" ]; then
     fi
 fi
 
-# Initialize database
+# Database schema: dùng database/init.sql CÓ SẴN trong repo (schema thật: documents,
+# job_statuses, metadata_fields, audit_log, extraction_schemas...). KHÔNG tạo/ghi đè ở đây —
+# tránh phá schema đúng bằng schema legacy. Postgres tự chạy init.sql khi khởi tạo container lần đầu.
 echo ""
-echo "Creating database initialization script..."
-mkdir -p database
-cat > database/init.sql << 'EOF'
--- Library Digitization System Database
--- PostgreSQL initialization script
-
-CREATE TABLE IF NOT EXISTS digitization_log (
-    id SERIAL PRIMARY KEY,
-    filename VARCHAR(255) NOT NULL,
-    dspace_item_id VARCHAR(100),
-    processing_time FLOAT,
-    ocr_confidence FLOAT,
-    ai_enhanced BOOLEAN DEFAULT FALSE,
-    metadata JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS processing_queue (
-    id SERIAL PRIMARY KEY,
-    file_path VARCHAR(500) NOT NULL,
-    status VARCHAR(50) DEFAULT 'pending',
-    priority INTEGER DEFAULT 0,
-    collection_id VARCHAR(100),
-    metadata JSONB,
-    error_message TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    started_at TIMESTAMP,
-    completed_at TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS metadata_cache (
-    id SERIAL PRIMARY KEY,
-    file_hash VARCHAR(64) UNIQUE NOT NULL,
-    extracted_metadata JSONB,
-    ocr_text TEXT,
-    confidence FLOAT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_log_created ON digitization_log(created_at);
-CREATE INDEX idx_log_dspace ON digitization_log(dspace_item_id);
-CREATE INDEX idx_queue_status ON processing_queue(status);
-CREATE INDEX idx_queue_priority ON processing_queue(priority);
-CREATE INDEX idx_cache_hash ON metadata_cache(file_hash);
-
--- Create function to update timestamp
-CREATE OR REPLACE FUNCTION update_modified_column()
-RETURNS TRIGGER AS $$
-BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$ language 'plpgsql';
-
--- Create trigger
-CREATE TRIGGER update_log_modtime
-    BEFORE UPDATE ON digitization_log
-    FOR EACH ROW
-    EXECUTE FUNCTION update_modified_column();
-EOF
-
-echo -e "${GREEN}Database initialization script created${NC}"
+if [ -f "database/init.sql" ]; then
+    echo -e "${GREEN}Database schema: dùng database/init.sql có sẵn trong repo${NC}"
+else
+    echo -e "${YELLOW}CẢNH BÁO: thiếu database/init.sql — kéo lại từ repo trước khi deploy${NC}"
+fi
 
 # Create systemd service (optional)
 echo ""

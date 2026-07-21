@@ -1,29 +1,16 @@
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
-
 export const metadata = {
-  title: "Library Digitization System",
-  description: "HPU Library — OCR & DSpace Upload Management",
+  title: "DocuFlow HP — Số hóa tài liệu",
+  description: "HPU — Số hóa & trích xuất dữ liệu tự động từ hồ sơ giấy",
 };
 
+// Dùng font hệ thống (system-ui) theo design system HPU — KHÔNG phụ thuộc Google Fonts,
+// để docker build chạy được cả khi air-gapped / không có ca-certificates.
 export default function RootLayout({ children }) {
   return (
-    <html lang="en">
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
-      >
-        {children}
-      </body>
+    <html lang="vi">
+      <body className="antialiased">{children}</body>
     </html>
   );
 }

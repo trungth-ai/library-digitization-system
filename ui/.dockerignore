@@ -1,0 +1,12 @@
+# Build context cho ui/Dockerfile. Loại node_modules/.next/.git + secrets (.env có Claude key).
+node_modules
+.next
+out
+.git
+.gitignore
+.dockerignore
+.env
+.env.*
+!.env.example
+npm-debug.log*
+*.md

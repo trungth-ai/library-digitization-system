@@ -1,0 +1,34 @@
+# Build context cho api/worker (context = repo root). Loại thứ không cần + secrets.
+.git
+.gitignore
+.dockerignore
+# Secrets — KHÔNG bao giờ đưa vào image
+.env
+.env.*
+!.env.example
+ui/.env
+ui/.env.*
+
+# Frontend (build riêng qua ui/Dockerfile)
+ui/
+
+# Tài liệu, dữ liệu, test
+docs/
+*.md
+tests/
+eval_data/
+eval_out/
+
+# Python caches / venv
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Dữ liệu runtime / volumes
+data/
+postgres_data/
+redis_data/
+ollama_data/
