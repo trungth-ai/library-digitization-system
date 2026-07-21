@@ -5,6 +5,30 @@
 
 ---
 
+## ADR-006: Bỏ Google Fonts (dùng system font) + hardening để deploy air-gapped
+**Status:** Accepted · **Date:** 2026-07-21 · **Decided by:** Đội phát triển
+
+**Context:** UI dùng `next/font/google` (Geist) → `next build` tải font từ Google lúc build. Trên
+`node:20-alpine` (thiếu ca-certificates) hoặc server **air-gapped** (đúng kịch bản chế độ tại chỗ),
+docker build **fail**. Kèm vài lỗi deploy khác: UI healthcheck gọi `/api/health` không tồn tại, thiếu
+`.dockerignore` (lộ `.env` vào image), `Dockerfile.api` healthcheck `import requests` (thiếu dependency),
+`install.sh` ghi đè `database/init.sql` bằng schema legacy.
+
+**Decision:** Bỏ `next/font/google`, dùng **system font** (`system-ui...`) — trùng đúng design system HPU.
+Thêm route `/api/health`; thêm `.dockerignore` (root + ui) chặn secret/rác; healthcheck `Dockerfile.api`
+dùng `urllib` (stdlib); dọn `next.config.mjs`; `install.sh` KHÔNG ghi đè init.sql.
+
+**Rationale:** (1) Build chạy được air-gapped/alpine — nhất quán triết lý "chạy tại chỗ, không phụ thuộc
+mạng ngoài"; (2) không lộ khóa API vào image; (3) hệ deploy `docker compose up` chạy được.
+
+**Consequences:** ✅ `npm run build` không cần mạng/TLS-flag (verify exit 0). ✅ Không lộ secret.
+⚠️ `NEXT_PUBLIC_*` vẫn cần truyền qua **build-args** khi build UI image (xem `docs/DEPLOY.md` mục 4).
+
+**Alternatives:** Self-host file font Geist (`next/font/local`) — thêm asset, không cần vì HPU dùng system font;
+thêm `ca-certificates` vào alpine + giữ Google font — vẫn fail khi air-gapped, bị loại.
+
+---
+
 ## ADR-005: Lazy import pypdf & anthropic trong digitize.py
 **Status:** Accepted · **Date:** 2026-07-18 · **Decided by:** Đội phát triển
 
