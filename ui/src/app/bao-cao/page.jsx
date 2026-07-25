@@ -8,9 +8,11 @@ import { formatNumber, formatPercent } from "@/lib/format";
 // ---- Dữ liệu mẫu (mock) ----
 const STATS = { total: 1284, completed: 1102, processing: 47, failed: 12 };
 
+// Báo cáo theo CHẾ ĐỘ xử lý (YC-DR-06), không theo công cụ: mỗi chế độ có thể do nhiều công cụ
+// đảm nhiệm (đám mây: Claude/OpenAI/Gemini...; tại chỗ: Ollama/vLLM/llama.cpp...) — xem ADR-007.
 const BY_MODE = [
-  { mode: "Đám mây (Claude)", code: "cloud", docs: 812, ratio: 0.66 },
-  { mode: "Tại chỗ (Ollama)", code: "local", docs: 418, ratio: 0.34 },
+  { mode: "Đám mây", code: "cloud", docs: 812, ratio: 0.66 },
+  { mode: "Tại chỗ", code: "local", docs: 418, ratio: 0.34 },
 ];
 
 const FIELD_EDITS = [

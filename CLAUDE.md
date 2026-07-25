@@ -19,7 +19,8 @@ tại Trung tâm Thông tin Thư viện HPU từ 2025. Quy trình: upload PDF �
 - **Backend**: Python 3.12, FastAPI, PostgreSQL 15 (psycopg2 pool), Redis 7 (queue + pub/sub), SSE.
 - **Worker**: OCRmyPDF + Tesseract (vie+eng) + Ghostscript; trích metadata qua lớp model provider.
 - **Frontend**: Next.js 16 (App Router), React 19, Tailwind 4.
-- **AI**: hiện dùng Claude (cloud). Đang bổ sung provider tại chỗ (Ollama/vLLM) — xem ADR-002.
+- **AI**: lớp provider đa công cụ — mặc định Claude (đám mây); tại chỗ có Ollama/vLLM/llama.cpp/LM Studio/TGI;
+  đám mây khác có OpenAI/Azure/Gemini/Groq/OpenRouter... Đổi bằng `MODEL_PROVIDER` — xem ADR-007, ADR-002.
 - **Tích hợp**: DSpace 6.3/7.x REST API.
 - **Hạ tầng**: Docker Compose (postgres, redis, api, worker, ui + n8n/grafana/filebrowser tùy chọn).
 
@@ -70,7 +71,10 @@ docker compose up -d --build
 ## Ranh giới thực thi của Claude Code
 - Làm việc trên bản local `D:\PROJECT\library-digitization-system` + commit lên GitHub (private).
 - **KHÔNG deploy lên server production** (10.1.1.101) — việc deploy do người phụ trách quyết định.
-- Test model tại chỗ cần Ollama + mô hình; nếu máy dev thiếu, viết code + test mock và ghi rõ cần chạy thật ở đâu.
+- Test model tại chỗ cần máy chủ model + mô hình đã tải; nếu máy dev thiếu, viết code + test mock và ghi rõ cần chạy thật ở đâu.
+- **Thêm công cụ LLM mới**: nói giao thức tương thích OpenAI → thêm MỘT dòng vào `scripts/providers/registry.py`;
+  giao thức riêng → thêm lớp con `TextGenProvider` (chỉ cần `_complete`) + một dòng `factory._BUILDERS`.
+  KHÔNG sửa `base.py`, KHÔNG sửa `router.py`, KHÔNG gọi SDK nhà cung cấp (dùng `urllib` — giữ air-gapped).
 
 ## Tài liệu liên quan
 - `docs/PRODUCT.md` — mô tả sản phẩm + kiến trúc nâng cấp

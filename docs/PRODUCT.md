@@ -52,16 +52,24 @@ hồi (RAG)** — giải quyết cả 3 hạn chế trên và mở ra khả năn
               Công khai │                    │ Nội bộ / Nhạy cảm
                         ▼                    ▼
               ┌──────────────────┐  ┌──────────────────────┐
-              │ CloudProvider    │  │ LocalProvider        │
-              │ (Claude API)     │  │ (Ollama/vLLM tại chỗ)│
+              │ Công cụ ĐÁM MÂY  │  │ Công cụ TẠI CHỖ      │
+              │ claude (mặc định)│  │ ollama (mặc định)    │
+              │ openai · gemini  │  │ vllm · llamacpp      │
+              │ azure · groq ... │  │ lmstudio · tgi       │
               └────────┬─────────┘  └──────────┬───────────┘
                        └──────────┬────────────┘
                         Lớp trừu tượng hóa mô hình (YC-MP)
                         — mọi phần hệ thống chỉ gọi qua đây —
 ```
+Mỗi ô trên là **một dòng cấu hình**, không phải một lần viết lại mã: công cụ nào đảm nhiệm chế độ nào do
+`CLOUD_PROVIDER`/`LOCAL_PROVIDER` quyết định (ADR-007). Nhờ vậy sản phẩm không khóa vào **bất kỳ** nhà
+cung cấp nào — kể cả nhà cung cấp tại chỗ.
 - **Chế độ đám mây**: giữ nguyên hành vi hiện tại cho tài liệu công khai (độ chính xác cao).
 - **Chế độ tại chỗ**: mô hình mở chạy trong mạng nội bộ, xử lý tài liệu nhạy cảm, hoạt động cả khi
   ngắt Internet. **Mặc định an toàn**: không rõ độ nhạy cảm → dùng tại chỗ.
+- **Nhiều công cụ cho mỗi chế độ**: thêm một công cụ nói giao thức tương thích OpenAI chỉ là thêm một
+  dòng vào bảng đăng ký; công cụ có giao thức riêng thì thêm một lớp nhỏ (YC-MP-08). Điểm cuối khai báo
+  "tại chỗ" được kiểm tra có thực sự nằm trong mạng nội bộ — chốt an toàn thứ hai cho YC-DR-03.
 - **Ràng buộc cứng**: tài liệu Nội bộ/Nhạy cảm KHÔNG bao giờ ra đám mây, kể cả khi người dùng chọn
   thủ công (YC-DR-03).
 

@@ -5,6 +5,58 @@
 
 ---
 
+## ADR-007: Bảng đăng ký nhiều công cụ mô hình — tách `name` (công cụ) khỏi `deployment` (chế độ)
+**Status:** Accepted · **Date:** 2026-07-25 · **Decided by:** Đội phát triển
+
+**Context:** ADR-001/002 đã dựng lớp trừu tượng hóa và chọn Ollama cho GĐ0. Nhưng khi hiện thực,
+`factory.get_provider(kind)` chỉ nhận `kind ∈ {cloud, local}`, trong đó `"cloud"` **thực chất nghĩa là
+Claude** và `"local"` **nghĩa là Ollama**. Cùng lúc đó `router.resolve_mode()` cũng trả về đúng hai chuỗi
+ấy, nhưng ở đó chúng mang nghĩa **chế độ triển khai** (cơ sở của ràng buộc cứng YC-DR-03).
+
+Hai khái niệm khác nhau bị trộn vào một chuỗi → hệ quả: thêm công cụ thứ ba (vLLM) là **thêm được vào
+factory nhưng làm vỡ định tuyến** — router không bao giờ trả về `"vllm"`, và không có chỗ nào biết
+`"vllm"` là máy trong phòng máy chủ hay dịch vụ thuê ngoài. Nói cách khác, thiết kế cũ vẫn ngầm khóa vào
+**hai** nhà cung cấp thay vì một — đúng cái bẫy mà ADR-001 muốn tránh.
+
+**Decision:**
+1. `ModelProvider` tách hai thuộc tính: `name` = **công cụ** (`claude`, `ollama`, `vllm`, `gemini`...),
+   `deployment` = **chế độ** (`cloud` | `local`). Ràng buộc cứng YC-DR-03 chỉ dựa vào `deployment`.
+   Mặc định của `deployment` là `cloud` (mặc định an toàn: lớp con chưa khai báo thì bị coi là "ra ngoài").
+2. `registry.py` là **bảng đăng ký** công cụ. Thêm lựa chọn = thêm một dòng; chỉ khi gặp giao thức mới
+   mới cần thêm một lớp `ModelProvider`.
+3. `textgen.TextGenProvider` gom logic trích xuất/dự phòng/nhật ký dùng chung → lớp con chỉ hiện thực
+   `_complete(prompt) -> str`.
+4. `OpenAICompatProvider` phủ cả họ giao thức tương thích OpenAI: **tại chỗ** (vLLM, llama.cpp,
+   LM Studio, TGI, cổng `/v1` của Ollama) và **đám mây** (OpenAI, Azure, Groq, OpenRouter, Together,
+   DeepSeek, Mistral). `GeminiProvider` bổ sung một định dạng dây khác hẳn.
+5. `MODEL_PROVIDER` nhận tên công cụ; hai bí danh `cloud`/`local` trỏ tới `CLOUD_PROVIDER`/`LOCAL_PROVIDER`
+   → cấu hình đang chạy không phải sửa gì, và router chỉ cần quyết định chế độ.
+6. **Chốt an toàn mới:** provider khai báo `local` mà điểm cuối không thuộc dải mạng nội bộ thì factory
+   **từ chối khởi tạo** (mở bằng `ALLOW_PUBLIC_LOCAL_ENDPOINT=1` nếu đường truyền đã được kiểm soát).
+   Router cũng từ chối nếu `LOCAL_PROVIDER` lại là một công cụ đám mây.
+
+**Rationale:** (1) "Không khóa nhà cung cấp" chỉ có thật khi lựa chọn thứ ba **rẻ như lựa chọn thứ hai**;
+(2) một điểm cuối tương thích OpenAI có thể ở trong hay ngoài tổ chức — suy diễn từ tên công cụ là sai,
+phải khai báo tường minh; (3) ràng buộc cứng YC-DR-03 trước đây tin vào một chuỗi mà **cấu hình có thể
+làm sai nghĩa** — nay có hai lớp phòng vệ độc lập; (4) so sánh nhiều công cụ trong một lần chạy
+`run_eval` cho phép chọn công cụ GĐ1 bằng số liệu (YC-MP-07) chứ không bằng cảm tính.
+
+**Consequences:** ✅ Thêm công cụ tại chỗ/đám mây = 1 dòng cấu hình. ✅ Ollama trở thành một lựa chọn
+bình thường, ADR-002 hết vai trò "khóa mềm". ✅ Nhật ký YC-MP-06 nay phân biệt được công cụ *và* chế độ.
+✅ 112/112 kiểm thử đạt, gồm kiểm thử không hồi quy đường Claude (KT-KH).
+⚠️ **Breaking (nội bộ):** `provider.name` đổi `"cloud"→"claude"`, `"local"→"ollama"`. Giá trị này đi vào
+log và JSON kết quả `run_eval` → số liệu đo trước 25/07/2026 dùng tên cũ. `CloudProvider`/`LocalProvider`
+vẫn là bí danh lớp nên mã cũ import được.
+⚠️ Chưa hiện thực Vertex AI / AWS Bedrock (cần thư viện xác thực SigV4/GCP, trái nguyên tắc "không thêm
+phụ thuộc cho chế độ tại chỗ") — dùng qua `openai_compat` nếu có cổng tương thích.
+
+**Alternatives:** (a) Thêm `elif kind == "vllm"` vào factory — làm vỡ router, bị loại; (b) suy diễn
+`deployment` từ URL — sai với tên miền nội bộ hợp lệ, chỉ dùng làm **chốt kiểm tra** chứ không làm nguồn
+sự thật; (c) dùng SDK `openai`/`google-generativeai` — kéo thêm phụ thuộc vào đường chạy air-gapped
+(ADR-006), bị loại, dùng `urllib` như `LocalProvider`.
+
+---
+
 ## ADR-006: Bỏ Google Fonts (dùng system font) + hardening để deploy air-gapped
 **Status:** Accepted · **Date:** 2026-07-21 · **Decided by:** Đội phát triển
 
@@ -86,7 +138,8 @@ dùng `core/responses.py` (envelope HPU). Di trú endpoint cũ dần khi cập n
 ---
 
 ## ADR-002: Ollama là công cụ model-serving tại chỗ cho GĐ 0 (thay được qua cấu hình)
-**Status:** Accepted · **Date:** 2026-07-18 · **Decided by:** Đội phát triển
+**Status:** Accepted (bổ sung bởi **ADR-007**: Ollama nay chỉ là MỘT dòng trong bảng đăng ký; vLLM,
+llama.cpp, LM Studio, TGI đã dùng được ngay bằng cấu hình) · **Date:** 2026-07-18 · **Decided by:** Đội phát triển
 
 **Context:** GĐ0 cần một công cụ phục vụ mô hình tại chỗ để đo đạc. SRS (mục 2.2.1): giai đoạn kiểm
 chứng chọn công cụ **dựng nhanh nhất**, không tối ưu hiệu năng; và công cụ phải **thay được**.

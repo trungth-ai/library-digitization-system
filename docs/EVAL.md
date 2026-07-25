@@ -30,16 +30,26 @@ Xem mẫu: `scripts/eval/samples/ground_truth.sample.json` + `scripts/eval/sampl
 ## 2. Chạy đo
 
 ```bash
-# So sánh 2 chế độ trên cùng tập (cần CLAUDE_API_KEY cho cloud; Ollama chạy cho local)
+# Xem công cụ khả dụng + biến môi trường mỗi công cụ cần
+python -m scripts.eval.run_eval --list-providers
+
+# So sánh nhiều công cụ trên CÙNG tập tài liệu, CÙNG đáp án chuẩn, một lần chạy
 python -m scripts.eval.run_eval \
     --data ./eval_data \
     --truth ./eval_data/ground_truth.json \
     --schema book \
-    --providers cloud,local \
+    --providers claude,ollama,vllm \
     --out ./eval_out
 ```
 - `--schema`: `book` | `thesis` | `cong_van`.
-- `--providers`: `cloud`, `local`, hoặc `cloud,local` (chế độ đánh giá — KT-CX-03).
+- `--providers`: tên công cụ cụ thể (`claude`, `ollama`, `vllm`, `llamacpp`, `openai`, `gemini`...) hoặc
+  bí danh chế độ (`cloud`, `local`). Nhiều tên = chế độ đánh giá song song (KT-CX-03, YC-MP-07).
+- Mỗi công cụ cần cấu hình riêng trước khi chạy: khóa API (đám mây) hoặc máy chủ model đang chạy
+  (tại chỗ) — xem `docs/LOCAL_MODE.md` mục 3.
+
+> 💡 Hai phép so sánh khác nhau, đừng trộn: **(a) cloud vs local** trả lời "chế độ tại chỗ có dùng được
+> không" (bằng chứng cho hồ sơ); **(b) ollama vs vllm vs llamacpp** trả lời "công cụ tại chỗ nào nên
+> dùng ở GĐ1". Phép (b) phải chạy trên **cùng một model** mới công bằng.
 
 ## 3. Đọc kết quả
 - Bảng in ra: độ chính xác **từng trường** + tổng + **tỉ lệ bịa** + thời gian TB/tài liệu.
@@ -59,4 +69,8 @@ python -m scripts.eval.run_eval \
 - Lược đồ `cong_van` cần **generic schema-driven prompt** (bước kế) để provider trích theo lược đồ này;
   hiện `book`/`thesis` (Dublin Core) chạy đầy đủ → đủ cho **KT-KH** (không hồi quy trên tài liệu thư viện)
   và **KT-CX trên sách**.
-- Số liệu phải chạy trên môi trường thật (Ollama + tài liệu + đáp án chuẩn).
+- Số liệu phải chạy trên môi trường thật (máy chủ model + tài liệu + đáp án chuẩn) — không có con số nào
+  trong tài liệu này được tạo ra bằng suy đoán.
+- Kết quả JSON ghi cả `provider` và `deployment` → bảng trong hồ sơ nói rõ **công cụ nào** và **dữ liệu
+  chạy ở đâu**. Lưu ý: số liệu đo trước 25/07/2026 dùng tên cũ (`cloud`/`local` thay vì `claude`/`ollama`)
+  — xem ADR-007 khi đối chiếu file cũ.

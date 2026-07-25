@@ -45,10 +45,36 @@
 | Next.js / React | Frontend | MIT (tham khảo) | ✅ Thường được | | ☐ |
 | Docker Engine | Triển khai | Apache-2.0 (tham khảo) | ✅ Thường được | Docker Desktop có điều khoản riêng cho DN lớn | ☐ |
 | **Ollama** | Model serving tại chỗ | MIT (tham khảo) | ✅ Thường được | License của Ollama ≠ license của MODEL chạy trên nó (rà mục 1) | ☐ |
+| **vLLM** | Model serving tại chỗ (tùy chọn) | Apache-2.0 (tham khảo) | ✅ Thường được | Permissive. Image `vllm/vllm-openai` kéo theo CUDA runtime của NVIDIA — **điều khoản NVIDIA riêng**, xác minh nếu phân phối lại image | ☐ |
+| **llama.cpp** | Model serving tại chỗ (tùy chọn) | MIT (tham khảo) | ✅ Thường được | Permissive. Model GGUF có giấy phép RIÊNG (rà mục 1) | ☐ |
+| **HF text-generation-inference** | Model serving tại chỗ (tùy chọn) | ⚠️ **Xác minh theo phiên bản** | ⚠️ **Có điều kiện** | 🟠 TGI từng đổi sang **HFOILv1.0** (hạn chế thương mại) rồi quay lại Apache-2.0 — PHẢI kiểm đúng tag đang dùng | ☐ |
+| **LM Studio** | Thử nghiệm trên máy trạm | ⚠️ **Nguồn đóng** | ⚠️ **Xác minh** | 🟠 Không phải OSS; điều khoản dùng trong tổ chức/thương mại phải đọc riêng. Chỉ dùng để thử, KHÔNG đưa vào vận hành | ☐ |
+
+## 2b. Điều khoản dịch vụ mô hình ĐÁM MÂY (YC-PL-01, YC-BM)
+
+> ⚠️ Với dịch vụ đám mây, **giấy phép phần mềm không phải câu hỏi chính** — câu hỏi chính là:
+> *nội dung tài liệu gửi lên có bị lưu lại/dùng để huấn luyện không, lưu ở đâu, bao lâu?* Đây là vấn đề
+> bảo vệ dữ liệu, không phải SHTT, và phải có ý kiến pháp lý bằng văn bản (YC-PL-06).
+>
+> Nhắc lại ràng buộc kỹ thuật đã cài trong sản phẩm: **chỉ tài liệu Công khai** được gửi tới nhóm này
+> (YC-DR-03, không ghi đè được). Tài liệu Nội bộ/Nhạy cảm luôn xử lý tại chỗ.
+
+| Dịch vụ | Dùng ở | Có huấn luyện trên dữ liệu gửi lên? | Thời gian lưu | Vùng dữ liệu | Đã xác minh |
+|---|---|---|---|---|---|
+| Anthropic Claude | provider `claude` (đang vận hành) | | | | ☐ |
+| OpenAI | provider `openai` | | | | ☐ |
+| Azure OpenAI | provider `azure_openai` | | | (chọn được vùng) | ☐ |
+| Google Gemini | provider `gemini` | | | | ☐ |
+| OpenRouter / Groq / Together / DeepSeek / Mistral | provider tương ứng | ⚠️ **Rà từng nhà cung cấp** — cổng trung gian còn phụ thuộc nhà cung cấp phía sau | | | ☐ |
+
+> 💡 Cách điền: đọc **Data Processing Addendum / API terms** của đúng gói dịch vụ đang mua (gói API
+> thường khác gói tiêu dùng). Không suy luận từ tài liệu marketing.
 
 ## 3. Việc cần làm trước khi ký Bản cam kết (test plan KT-PL)
 - [ ] **KT-PL-01/02/03** — Rà giấy phép mọi model + biến thể, điền bảng mục 1, kết luận rõ "dùng được / có điều kiện / không dùng được".
 - [ ] **KT-PL-04** — Rà giấy phép mọi thành phần nguồn mở, đặc biệt **xác minh Ghostscript** (phiên bản + điều kiện) và **Redis** (phiên bản + license).
+- [ ] **Mục 2b** — Rà điều khoản dữ liệu của MỌI dịch vụ đám mây thực sự bật trong `.env`. Dịch vụ không
+      dùng thì ghi rõ "không sử dụng" — hồ sơ chỉ cần cam kết cho những gì sản phẩm thật sự gọi tới.
 - [ ] **KT-PL-05** — Kết luận khả năng thương mại hóa; loại bỏ/thay thế thành phần "không dùng được".
 - [ ] **YC-PL-04** — Văn bản xác định **quyền sở hữu mã nguồn** giữa Nhà trường và các tác giả (sản phẩm xây trong giờ làm việc, trên hạ tầng Nhà trường).
 - [ ] **YC-PL-06** — Ý kiến pháp lý bằng văn bản về bảo vệ dữ liệu cá nhân / bí mật nhà nước (kỹ thuật KHÔNG thay thế được yêu cầu này).
