@@ -110,3 +110,39 @@ def test_schemas_co_san():
     assert get_schema("book").document_type == "book"
     assert get_schema("cong_van").document_type == "cong_van"
     assert cong_van_schema().sensitivity == "internal"  # mặc định an toàn
+
+
+# --- CLI đo đạc: hỗ trợ nhiều công cụ (ADR-007) ---
+
+def test_report_ghi_ca_che_do_trien_khai():
+    """Bảng so sánh trong hồ sơ phải nói rõ dữ liệu chạy Ở ĐÂU, không chỉ tên công cụ."""
+    class _MockProvider:
+        name, deployment, model, version = "vllm", "local", "Qwen2.5-7B", ""
+
+        def extract_fields(self, text, schema):
+            return ExtractionResult(fields=[FieldValue(key="so_hieu", value="01/QĐ")])
+
+    rep = run_provider_eval(_MockProvider(), {"d1": "x"}, {"d1": {"so_hieu": "01/QĐ"}},
+                            get_schema("cong_van"))
+    assert rep.provider == "vllm" and rep.deployment == "local"
+
+    from scripts.eval.run_eval import report_to_dict
+    assert report_to_dict(rep)["deployment"] == "local"
+
+
+def test_list_providers_liet_ke_ca_hai_che_do(capsys):
+    """`--list-providers` phải chạy được và nêu cả công cụ tại chỗ lẫn đám mây."""
+    from scripts.eval.run_eval import main
+    assert main(["--list-providers"]) == 0
+    out = capsys.readouterr().out
+    for name in ("ollama", "vllm", "llamacpp", "claude", "gemini"):
+        assert name in out
+    assert "TẠI CHỖ" in out and "ĐÁM MÂY" in out
+
+
+def test_thieu_tham_so_bat_buoc_thi_bao_loi():
+    """Không có --data/--truth và cũng không --list-providers → lỗi rõ, không chạy nửa vời."""
+    import pytest
+    from scripts.eval.run_eval import main
+    with pytest.raises(SystemExit):
+        main([])

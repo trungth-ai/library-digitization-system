@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """
-CLI đo đạc GĐ0 (KT-CX / KT-HN): chạy tập tài liệu qua các chế độ (cloud/local), so khớp với đáp án
-chuẩn, xuất bảng độ chính xác theo TỪNG trường + thời gian — theo mẫu ghi kết quả (test plan 6.1).
+CLI đo đạc GĐ0 (KT-CX / KT-HN): chạy tập tài liệu qua NHIỀU công cụ mô hình, so khớp với đáp án chuẩn,
+xuất bảng độ chính xác theo TỪNG trường + thời gian — theo mẫu ghi kết quả (test plan 6.1).
 
 Cách dùng:
+    # Xem danh sách công cụ khả dụng
+    python -m scripts.eval.run_eval --list-providers
+
     # Chuẩn bị: thư mục chứa <doc_id>.txt (văn bản đã trích) + ground_truth.json {doc_id: {field: value}}
     python -m scripts.eval.run_eval --data ./eval_data --truth ./eval_data/ground_truth.json \\
-        --schema book --providers cloud,local --out ./eval_out
+        --schema book --providers claude,ollama,vllm --out ./eval_out
 
-Lưu ý: cần cấu hình provider (CLAUDE_API_KEY cho cloud; Ollama chạy cho local). Số liệu phải ĐO THẬT
-(nguyên tắc SRS "đo được mới tuyên bố") — không điền con số chưa chạy.
+`--providers` nhận tên công cụ cụ thể (claude, ollama, vllm, llamacpp, openai, gemini...) hoặc bí danh
+chế độ (cloud, local). So sánh nhiều công cụ trong MỘT lần chạy chính là cơ sở chọn công cụ cho GĐ1
+theo số liệu thật, thay vì theo cảm tính (YC-MP-07).
+
+Lưu ý: cần cấu hình từng công cụ trước (khóa API cho dịch vụ đám mây; máy chủ model chạy cho tại chỗ).
+Số liệu phải ĐO THẬT (nguyên tắc SRS "đo được mới tuyên bố") — không điền con số chưa chạy.
 """
 
 import os
@@ -44,7 +51,9 @@ def load_ground_truth(path: str) -> Dict[str, Dict]:
 def render_table(report: EvalReport) -> str:
     """Bảng độ chính xác theo từng trường (KT-CX yêu cầu báo cáo per-field)."""
     lines = []
-    lines.append(f"  Provider: {report.provider}  |  Model: {report.model or '(n/a)'}  |  Cỡ mẫu: {report.n_docs} tài liệu")
+    che_do = {"local": "tại chỗ", "cloud": "đám mây"}.get(report.deployment, report.deployment or "?")
+    lines.append(f"  Công cụ: {report.provider} ({che_do})  |  Model: {report.model or '(n/a)'}  |  "
+                 f"Cỡ mẫu: {report.n_docs} tài liệu")
     lines.append(f"  Độ chính xác tổng: {report.overall_accuracy*100:.1f}%  |  "
                  f"Tỉ lệ bịa (ảo giác): {report.hallucination_rate*100:.1f}%  |  "
                  f"Thời gian TB: {report.avg_latency_ms:.0f} ms/tài liệu")
@@ -60,6 +69,7 @@ def render_table(report: EvalReport) -> str:
 def report_to_dict(report: EvalReport) -> dict:
     return {
         "provider": report.provider,
+        "deployment": report.deployment,
         "model": report.model,
         "version": report.version,
         "n_docs": report.n_docs,
@@ -75,14 +85,55 @@ def report_to_dict(report: EvalReport) -> dict:
     }
 
 
+def _force_utf8_stdout() -> None:
+    """Console Windows mặc định cp1252 → chữ tiếng Việt có dấu làm vỡ CLI. Ép UTF-8 (YC-VH-04)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError):
+            pass   # môi trường không cho đổi (vd stdout bị chuyển hướng lạ) → bỏ qua
+
+
+def print_provider_list() -> None:
+    """In bảng công cụ mô hình khả dụng (YC-MS-08 ở mức CLI)."""
+    from scripts.providers.registry import list_presets
+    from scripts.providers.base import DEPLOY_CLOUD, DEPLOY_LOCAL
+
+    for deployment, title in ((DEPLOY_LOCAL, "TẠI CHỖ — dữ liệu KHÔNG ra khỏi Nhà trường"),
+                              (DEPLOY_CLOUD, "ĐÁM MÂY — dữ liệu ra ngoài, CHỈ cho tài liệu Công khai")):
+        print(f"\n{title}")
+        print("-" * 78)
+        for p in list_presets(deployment):
+            # Máy chủ tại chỗ thường không đặt khóa → nêu rõ là tùy chọn, tránh gây hiểu là bắt buộc
+            key = ""
+            if p.key_env:
+                key = (f"  cần {p.key_env}" if deployment == DEPLOY_CLOUD
+                       else f"  khóa tùy chọn: {p.key_env}")
+            print(f"  {p.name:<16}{p.label:<42}{key}")
+            if p.note:
+                print(f"  {'':<16}↳ {p.note}")
+    print("\nBí danh: cloud = CLOUD_PROVIDER, local = LOCAL_PROVIDER")
+    print("⚠️  Rà giấy phép model TRƯỚC khi tải/dùng — điền docs/LICENSES.md (YC-PL-01/02).")
+
+
 def main(argv=None):
+    _force_utf8_stdout()
     ap = argparse.ArgumentParser(description="Harness đo đạc DocuFlow HP (KT-CX/KT-HN)")
-    ap.add_argument("--data", required=True, help="Thư mục tài liệu (.txt/.pdf)")
-    ap.add_argument("--truth", required=True, help="File ground_truth.json")
+    ap.add_argument("--data", help="Thư mục tài liệu (.txt/.pdf)")
+    ap.add_argument("--truth", help="File ground_truth.json")
     ap.add_argument("--schema", default="book", help="Lược đồ: book | thesis | cong_van")
-    ap.add_argument("--providers", default="cloud", help="Danh sách provider, phẩy: cloud,local")
+    ap.add_argument("--providers", default="cloud",
+                    help="Danh sách công cụ, phẩy: claude,ollama,vllm... (hoặc bí danh cloud,local)")
     ap.add_argument("--out", default="./eval_out", help="Thư mục xuất kết quả JSON")
+    ap.add_argument("--list-providers", action="store_true",
+                    help="In danh sách công cụ mô hình khả dụng rồi thoát")
     args = ap.parse_args(argv)
+
+    if args.list_providers:
+        print_provider_list()
+        return 0
+    if not args.data or not args.truth:
+        ap.error("cần --data và --truth (hoặc dùng --list-providers)")
 
     docs = load_documents(args.data)
     truth = load_ground_truth(args.truth)

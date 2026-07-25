@@ -81,6 +81,7 @@ class FieldStat:
 @dataclass
 class EvalReport:
     provider: str = ""
+    deployment: str = ""   # cloud | local — để bảng so sánh trong hồ sơ nói rõ dữ liệu chạy ở đâu
     model: str = ""
     version: str = ""
     n_docs: int = 0
@@ -138,6 +139,7 @@ def run_provider_eval(provider, docs: Dict[str, str],
     """
     report = EvalReport(
         provider=getattr(provider, "name", "?"),
+        deployment=getattr(provider, "deployment", ""),
         model=getattr(provider, "model", ""),
         version=getattr(provider, "version", ""),
     )
