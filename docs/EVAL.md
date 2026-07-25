@@ -33,6 +33,9 @@ Xem mẫu: `scripts/eval/samples/ground_truth.sample.json` + `scripts/eval/sampl
 # Xem công cụ khả dụng + biến môi trường mỗi công cụ cần
 python -m scripts.eval.run_eval --list-providers
 
+# Kiểm công cụ đã sẵn sàng chưa TRƯỚC khi đo (tránh đo ra số rác)
+python -m scripts.eval.run_eval --health --providers claude,ollama
+
 # So sánh nhiều công cụ trên CÙNG tập tài liệu, CÙNG đáp án chuẩn, một lần chạy
 python -m scripts.eval.run_eval \
     --data ./eval_data \
@@ -66,9 +69,13 @@ python -m scripts.eval.run_eval \
 | BD-05 Nhạy cảm mô phỏng | 5–10 | Kiểm thử định tuyến (GĐ1) |
 
 ## 5. Giới hạn hiện tại
-- Lược đồ `cong_van` cần **generic schema-driven prompt** (bước kế) để provider trích theo lược đồ này;
-  hiện `book`/`thesis` (Dublin Core) chạy đầy đủ → đủ cho **KT-KH** (không hồi quy trên tài liệu thư viện)
-  và **KT-CX trên sách**.
+- Lược đồ `cong_van` **đã chạy được**: prompt/parse theo lược đồ bất kỳ nằm ở `scripts/providers/prompt.py`,
+  dùng chung cho mọi công cụ nên so sánh giữa các chế độ là công bằng (KT-CX-03). `book`/`thesis`
+  (Dublin Core) đi đúng đường của hệ đang chạy → đủ cho **KT-KH** (không hồi quy) và **KT-CX trên sách**.
+- **Chưa đo tài nguyên** (YC-MS-07): harness ghi thời gian/tài liệu nhưng chưa ghi RAM/GPU. Khi so
+  Ollama vs vLLM vs llama.cpp, hãy ghi tay thông số máy + `docker stats` kèm bảng kết quả.
+- **Worker chưa dùng lớp provider** (ADR-004): `run_eval` gọi provider trực tiếp, nên số liệu ở đây phản
+  ánh chất lượng trích xuất của từng công cụ, **chưa** phản ánh thông lượng pipeline production.
 - Số liệu phải chạy trên môi trường thật (máy chủ model + tài liệu + đáp án chuẩn) — không có con số nào
   trong tài liệu này được tạo ra bằng suy đoán.
 - Kết quả JSON ghi cả `provider` và `deployment` → bảng trong hồ sơ nói rõ **công cụ nào** và **dữ liệu

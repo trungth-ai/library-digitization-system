@@ -158,12 +158,18 @@ nmap -p 11434,8000,8080 <IP_may_chu>
 
 ### Health (YC-MS-04)
 ```bash
+# Cách khuyến nghị: kiểm qua chính lớp provider (mã thoát 1 nếu chưa sẵn sàng)
+docker compose exec api python -m scripts.eval.run_eval --health --providers ollama,vllm,llamacpp
+```
+Lệnh này soát cả **model đã nạp chưa** — điểm cuối sống nhưng thiếu model vẫn báo chưa sẵn sàng, kèm
+câu lệnh cần chạy (vd `ollama pull qwen2.5:7b`).
+
+```bash
+# Kiểm thô ở mức HTTP nếu cần chẩn đoán mạng nội bộ
 docker compose exec worker curl -s http://ollama:11434/api/tags      # Ollama
 docker compose exec worker curl -s http://vllm:8000/v1/models        # vLLM
 docker compose exec worker curl -s http://llamacpp:8080/v1/models    # llama.cpp
 ```
-`provider.health()` còn soát cả **model đã nạp chưa** — điểm cuối sống nhưng thiếu model vẫn báo
-`ready=False` kèm câu lệnh cần chạy.
 
 ## 7. Kiến trúc liên quan
 - Lớp trừu tượng hóa: `scripts/providers/` — xem `__init__.py` để biết vai trò từng file.

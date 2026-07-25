@@ -13,9 +13,13 @@
 | GĐ 2 | 10–11/2026 | Lược đồ cấu hình được + Kiểm toán/Báo cáo | Chung kết T11 |
 | GĐ 3 | 12/2026–5/2027 | Lớp RAG & khai thác dữ liệu | Cam kết 6 tháng |
 
-> **Hôm nay 18/7/2026 → đang trong GĐ 0, còn ~12 ngày tới hạn hồ sơ.** Kỷ luật phạm vi GĐ 0 là ưu
+> **Cập nhật 25/7/2026 → đang trong GĐ 0, còn 5 ngày tới hạn hồ sơ.** Kỷ luật phạm vi GĐ 0 là ưu
 > tiên số 1: SRS cảnh báo rủi ro lớn nhất là *ôm quá phạm vi* → GĐ 0 KHÔNG làm RAG, schema UI, routing
 > tự động, confidence đầy đủ, audit đầy đủ.
+>
+> 📍 **Tiến độ thực tế** (đã vượt kế hoạch GĐ 0 ở phần lớp mô hình, xem `docs/STATUS.md` và
+> `docs/PLAN.md`): phần code của GĐ 0 đã xong; đường găng còn lại là **số liệu đo thật + bằng chứng
+> ngắt mạng + bảng giấy phép** — đều cần máy chủ và người phụ trách, không phải cần code.
 
 ---
 
@@ -26,11 +30,13 @@
 NHẤT có giá trị lâu dài". Là việc code thuần, không cần phần cứng đặc biệt.
 - YC-MP-01: interface `ModelProvider` (`extract_fields`, `embed`, `health`) — `scripts/providers/base.py`
 - YC-MP-02: `CloudProvider` bọc logic Claude hiện tại — **giữ nguyên hành vi** (KT-KH-01, KT-CN-04)
-- YC-MP-03: `LocalProvider` gọi công cụ tại chỗ (Ollama) (KT-CN-03)
+- YC-MP-03: provider gọi công cụ tại chỗ — Ollama, **và** vLLM/llama.cpp/LM Studio/TGI (KT-CN-03)
 - YC-MP-04: chọn provider qua cấu hình/`.env`, không sửa mã (KT-CN-05)
 - YC-MP-06: **log mỗi lần gọi model** (provider/model/version/latency) — nền tảng "log chi tiết"
 - YC-MP-05: dự phòng — provider lỗi → job vào trạng thái lỗi có mô tả, không mất dữ liệu (KT-CN-06)
-- Nền tảng: `structured logging` + `request_id`/`job_id` tương quan; `src/core/responses.py` + `exceptions.py` (chuẩn HPU, cho code mới)
+- **Kéo sớm từ GĐ 1** (ADR-007, làm luôn vì rẻ khi lớp trừu tượng còn mới): YC-MP-08 phép thử thêm công
+  cụ = một lớp nhỏ; YC-MS-05 model riêng cho từng tác vụ; YC-MS-06 thay công cụ bằng cấu hình.
+- Nền tảng: `structured logging` + `request_id`/`job_id` tương quan; `scripts/core/responses.py` + `scripts/core/exceptions.py` (chuẩn HPU, cho code mới)
 - **DoD:** cùng một tài liệu chạy được qua cả CloudProvider và LocalProvider bằng đổi cấu hình; test không hồi quy pass; có log gọi model truy vấn được.
 
 ### Sprint 0B — Model serving tại chỗ (Docker)
@@ -58,7 +64,7 @@ NHẤT có giá trị lâu dài". Là việc code thuần, không cần phần c
 
 | Sprint | Nội dung | YC | KT |
 |---|---|---|---|
-| **1** | Hoàn thiện model abstraction (cấu hình, dự phòng, chế độ đánh giá) + local serving (đa model, đo tài nguyên, thay-thế-được) | YC-MP-04→08, YC-MS-04→08 | KT-CN-06b/c/d, KT-HN-03 |
+| **1** | ~~Hoàn thiện model abstraction~~ **phần lớn đã xong ở GĐ 0** (ADR-007). Còn lại: **YC-MS-07** đo tài nguyên (thời gian/RAM/GPU) mỗi lần gọi, **YC-MS-08** giao diện quản trị hiện công cụ/model + tình trạng (nay chỉ có ở CLI), **chính sách dự phòng chéo công cụ**, và **wire pipeline** (`worker.py` dùng router thay vì gọi trực tiếp — ADR-004) | YC-MS-07/08, YC-MP-07 | KT-CN-06b/c/d, KT-HN-03 |
 | **2** | Định tuyến theo độ nhạy cảm — **ràng buộc cứng** không ghi đè | YC-DR-01→06 | KT-BM-05→10 |
 | **3** | Điểm tin cậy từng trường + kiểm tra hợp lệ + thử lại + tô màu + **chống ảo giác** | YC-CF-01→05 | KT-CN-07→10, KT-CX-07/08 |
 | **4** | Kiểm chứng bảo mật đầy đủ + hồ sơ pháp lý + ngưỡng hiệu năng | YC-BM-01→05, YC-PL đầy đủ, YC-PC-02/03 | KT-BM, KT-PL-06→09, KT-HN-02 |

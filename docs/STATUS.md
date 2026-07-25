@@ -1,6 +1,6 @@
 # DocuFlow HP — Trạng thái nâng cấp & Bàn giao
 
-> Cập nhật: 21/07/2026. Repo: `github.com/trungth-ai/library-digitization-system`.
+> Cập nhật: 25/07/2026. Repo: `github.com/trungth-ai/library-digitization-system`.
 > Số commit mới nhất: xem `git log --oneline`. Tài liệu này để kỹ sư tiếp quản (YC-VH-01) nắm nhanh:
 > đã làm gì, cách kiểm chứng, còn gì — và **bắt đầu lần nâng cấp tiếp theo từ mục 4**.
 
@@ -22,12 +22,13 @@
 | 3 | Chia đoạn theo cấu trúc (RAG) | `scripts/core/chunking.py` | pytest |
 | — | **Deploy hardening** (font system, /api/health, .dockerignore, healthcheck, next.config, install.sh) | nhiều | **UI build exit 0 (không TLS flag)** |
 
-**164 pytest PASS · 5 lần verify PostgreSQL 17 · 1 verify UI preview · UI build sạch.** Không hồi quy, không đụng pipeline production.
+**167 pytest PASS · 5 lần verify PostgreSQL 17 · 1 verify UI preview · UI build sạch.** Không hồi quy, không đụng pipeline production.
 
 ## 2. Cách kiểm chứng
 ```bash
-python -m pytest tests/ -q                 # 164 passed (không cần DB/mạng)
+python -m pytest tests/ -q                 # 167 passed (không cần DB/mạng)
 python -m scripts.eval.run_eval --list-providers   # bảng công cụ mô hình khả dụng
+python -m scripts.eval.run_eval --health           # kiểm tra sẵn sàng (YC-MS-04)
 cd ui && npm run build                     # UI build (KHÔNG cần TLS flag sau khi bỏ Google font)
 # Verify DB (Windows, không cần Docker): initdb → Start-Process postgres.exe → psql -f database/init.sql
 #   → psql/python verify (mẫu script ở scratchpad các phiên trước)
@@ -53,7 +54,9 @@ Thứ tự đề xuất (bắt đầu từ đây):
 5. **Chuẩn hóa NEXT_PUBLIC build-args** cho UI image (xem `docs/DEPLOY.md` mục 4) khi deploy thật.
 
 ## 5. Bản đồ tài liệu (đọc theo nhu cầu)
+- `README.md` — điểm vào: sản phẩm, bắt đầu nhanh, chọn công cụ mô hình, bản đồ tài liệu.
 - `CLAUDE.md` — điểm neo dự án (stack, quy tắc, ranh giới).
+- `docs/PLAN.md` — sprint đang chạy + việc code còn nợ.
 - `docs/PRODUCT.md` — mô tả sản phẩm + kiến trúc hai chế độ + RAG.
 - `docs/REQUIREMENTS.md` — bảng yêu cầu YC-* + chuẩn HPU.
 - `docs/ROADMAP.md` — lộ trình chia sprint (GĐ0-3).

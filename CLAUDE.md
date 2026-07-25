@@ -49,7 +49,8 @@ docker compose up -d --build
 
 ## Quy tắc BẮT BUỘC (theo chuẩn HPU + nguyên tắc SRS)
 1. **API envelope** `{status, data, message}` (+ `meta` phân trang, `code`/`errors` khi lỗi) — qua
-   `src/core/responses.py` (`success/error/paginated`). **Code mới** tuân thủ ngay; endpoint cũ
+   `scripts/core/responses.py` (`success/error/paginated`) — sẽ chuyển sang `src/core/` khi tái cấu
+   trúc, hiện **chưa có thư mục `src/`**. **Code mới** tuân thủ ngay; endpoint cũ
    (`/api/v1/process`, `/api/v2/*`) giữ nguyên để không phá UI đang chạy, di trú dần (ADR-003).
 2. **Soft delete**: KHÔNG hard delete. Dùng `status`. (Hiện `delete_job` xóa cứng — cần sửa, xem ROADMAP.)
 3. **Mọi bảng** có `id, created_at, updated_at, status`.
@@ -77,6 +78,10 @@ docker compose up -d --build
   KHÔNG sửa `base.py`, KHÔNG sửa `router.py`, KHÔNG gọi SDK nhà cung cấp (dùng `urllib` — giữ air-gapped).
 
 ## Tài liệu liên quan
+- `README.md` — điểm vào: bắt đầu nhanh, chọn công cụ mô hình, bản đồ tài liệu
+- `docs/STATUS.md` — bàn giao: đã làm gì, kiểm chứng thế nào, còn gì
+- `docs/LOCAL_MODE.md` — chọn/bật công cụ (Ollama, vLLM, llama.cpp...) + chọn model + ngắt mạng
+- `docs/DEPLOY.md` — triển khai + hai chốt an toàn có thể làm deploy dừng
 - `docs/PRODUCT.md` — mô tả sản phẩm + kiến trúc nâng cấp
 - `docs/REQUIREMENTS.md` — yêu cầu kỹ thuật (bảng YC-*) + chuẩn HPU
 - `docs/ROADMAP.md` — lộ trình chia sprint
