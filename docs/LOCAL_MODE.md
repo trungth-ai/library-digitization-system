@@ -23,8 +23,48 @@ python -m scripts.eval.run_eval --list-providers
 | | `ollama_openai` | Chính máy chủ Ollama nhưng qua cổng `/v1` tương thích OpenAI. |
 | **Đám mây** | `claude` | Đang vận hành thật từ 2025 — **mặc định**, giữ nguyên hành vi (YC-MP-02). |
 | | `openai`, `azure_openai`, `gemini` | Nhà cung cấp lớn; dùng để so sánh chi phí/độ chính xác. |
+| | `moonshot` (bí danh **`kimi`**) | Ngữ cảnh dài 32k/128k — phù hợp tài liệu OCR nhiều trang. |
+| | `dashscope` (bí danh **`qwen`**) | Qwen bản dịch vụ. Cân nhắc: Qwen bản **mở** chạy tại chỗ được (mục 1b). |
 | | `openrouter`, `groq`, `together`, `deepseek`, `mistral` | So sánh nhiều model NHANH mà chưa phải tự dựng máy chủ. |
 | | `openai_compat` | Điểm cuối tương thích OpenAI chưa có trong bảng (vd dịch vụ trong nước). |
+
+> Vùng dữ liệu: `moonshot` và `dashscope` mặc định dùng **điểm cuối quốc tế**. Bản Trung Quốc đổi bằng
+> `MOONSHOT_BASE_URL` / `DASHSCOPE_BASE_URL` — đây là quyết định của Nhà trường, không phải mặc định
+> kỹ thuật, và cần nêu trong ý kiến pháp lý về bảo vệ dữ liệu (YC-PL-06).
+
+## 1b. Chọn MODEL — khác với chọn công cụ
+
+Đây là chỗ dễ lẫn nhất. **Công cụ** (mục 1) là thứ *phục vụ* model; **model** là thứ chạy trên đó.
+Nhiều tên quen thuộc là **model**, không phải công cụ → đã dùng được ngay, không cần thêm dòng nào:
+
+```env
+# Qwen tại chỗ (đang là mặc định của hệ thống)
+LOCAL_PROVIDER=ollama
+OLLAMA_MODEL=qwen2.5:7b
+
+# Xiaomi MiMo tại chỗ — chỉ là một giá trị cấu hình
+LOCAL_PROVIDER=vllm
+VLLM_MODEL=XiaomiMiMo/MiMo-7B-RL
+```
+
+| Họ model | Chạy tại chỗ | Giấy phép (THAM KHẢO — phải xác minh) | Ghi chú kỹ thuật |
+|---|---|---|---|
+| **Qwen** (Alibaba) | ✅ `qwen2.5:7b`, `Qwen/Qwen2.5-7B-Instruct` | Nhiều bản Apache-2.0, **một số cỡ có giấy phép riêng** | Tiếng Việt khá; đang là mặc định của hệ thống |
+| **Xiaomi MiMo** | ✅ `XiaomiMiMo/MiMo-7B-RL` | Xác minh trên model card | 7B → vừa cấu hình worker hiện tại |
+| **DeepSeek** | ⚠️ chỉ bản **distill** | Bản distill theo giấy phép **model NỀN** (Qwen/Llama) | Xem cảnh báo dưới |
+| **Kimi K2** (Moonshot) | ❌ không khả thi tại chỗ | Modified MIT (xác minh) | ~1000 tỉ tham số MoE — cần cụm nhiều GPU, không chạy trên máy chủ thư viện → dùng qua `kimi` (đám mây) |
+| **Llama / Gemma** | ✅ | **CÓ ràng buộc**, không phải OSS thuần | Xem `docs/LICENSES.md` mục 1 |
+| **PhoGPT / Vistral / SeaLLM** | ✅ | Rà tới model nền | Model tiếng Việt — đáng thử cho tài liệu tiếng Việt |
+
+> ⚠️ **Bẫy giấy phép với DeepSeek:** `deepseek-r1:7b` / `:8b` trong Ollama **KHÔNG phải** DeepSeek-R1
+> thật — chúng là bản **chưng cất (distill) từ Qwen hoặc Llama**. Hệ quả: (1) giấy phép phải truy về
+> model nền, và nếu nền là Llama thì kèm ràng buộc của Llama Community License; (2) không được ghi
+> "dùng DeepSeek-R1" trong hồ sơ. DeepSeek-V3/R1 bản đầy đủ là 671 tỉ tham số MoE → không chạy được
+> trên hạ tầng hiện tại, muốn dùng thì qua dịch vụ `deepseek` (đám mây).
+
+> 💡 **Trần phần cứng hiện tại:** worker được cấp 10 CPU / 12GB RAM, GPU tùy chọn. Trên CPU, model
+> **7B lượng tử hóa 4-bit** (~5–6GB) là mức thực tế; 14B rất chật; từ 32B trở lên cần GPU. Chọn model
+> theo trần này trước, đo độ chính xác sau — đừng chọn model không chạy nổi rồi mới đo.
 
 > ⚠️ **Giấy phép trước, hiệu năng sau:** rà giấy phép model **TRƯỚC** khi tải/dùng và điền
 > `docs/LICENSES.md` (YC-PL-01/02). Bảng trên là công cụ *phục vụ* model — giấy phép công cụ ≠ giấy phép model.

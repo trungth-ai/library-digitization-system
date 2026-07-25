@@ -9,7 +9,7 @@
 | GĐ | Hạng mục | Module | Kiểm chứng |
 |---|---|---|---|
 | 0 | Lớp trừu tượng hóa mô hình (cloud/local/generic) + factory | `scripts/providers/{base,cloud,local,factory,prompt}.py` | pytest + regression |
-| 0 | **Nhiều công cụ mô hình** — bảng đăng ký 16 lựa chọn (6 tại chỗ / 10 đám mây), tách `name`↔`deployment` (ADR-007) | `scripts/providers/{registry,textgen,openai_compat,gemini}.py` | pytest (46 test mock, không cần mạng) |
+| 0 | **Nhiều công cụ mô hình** — bảng đăng ký 18 lựa chọn (6 tại chỗ / 12 đám mây, có Kimi + Qwen dịch vụ), tách `name`↔`deployment` (ADR-007) | `scripts/providers/{registry,textgen,openai_compat,gemini}.py` | pytest (95 test mock, không cần mạng) |
 | 0 | Model serving tại chỗ: Ollama + **vLLM** + **llama.cpp** (3 profile riêng) | `docker-compose.yml` | `docs/LOCAL_MODE.md` |
 | 0 | Harness đo đạc nhiều công cụ (`--providers claude,ollama,vllm`) | `scripts/eval/` | pytest + smoke CLI |
 | 1 | Định tuyến độ nhạy cảm (ràng buộc cứng) | `scripts/providers/router.py` | pytest |
@@ -22,11 +22,11 @@
 | 3 | Chia đoạn theo cấu trúc (RAG) | `scripts/core/chunking.py` | pytest |
 | — | **Deploy hardening** (font system, /api/health, .dockerignore, healthcheck, next.config, install.sh) | nhiều | **UI build exit 0 (không TLS flag)** |
 
-**112 pytest PASS · 5 lần verify PostgreSQL 17 · 1 verify UI preview · UI build sạch.** Không hồi quy, không đụng pipeline production.
+**164 pytest PASS · 5 lần verify PostgreSQL 17 · 1 verify UI preview · UI build sạch.** Không hồi quy, không đụng pipeline production.
 
 ## 2. Cách kiểm chứng
 ```bash
-python -m pytest tests/ -q                 # 112 passed (không cần DB/mạng)
+python -m pytest tests/ -q                 # 164 passed (không cần DB/mạng)
 python -m scripts.eval.run_eval --list-providers   # bảng công cụ mô hình khả dụng
 cd ui && npm run build                     # UI build (KHÔNG cần TLS flag sau khi bỏ Google font)
 # Verify DB (Windows, không cần Docker): initdb → Start-Process postgres.exe → psql -f database/init.sql

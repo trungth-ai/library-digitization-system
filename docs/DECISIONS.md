@@ -28,7 +28,9 @@ factory nhưng làm vỡ định tuyến** — router không bao giờ trả v�
    `_complete(prompt) -> str`.
 4. `OpenAICompatProvider` phủ cả họ giao thức tương thích OpenAI: **tại chỗ** (vLLM, llama.cpp,
    LM Studio, TGI, cổng `/v1` của Ollama) và **đám mây** (OpenAI, Azure, Groq, OpenRouter, Together,
-   DeepSeek, Mistral). `GeminiProvider` bổ sung một định dạng dây khác hẳn.
+   DeepSeek, Mistral, **Moonshot/Kimi**, **DashScope/Qwen**). `GeminiProvider` bổ sung một định dạng dây
+   khác hẳn. Bảng đăng ký có **bí danh thương hiệu** (`kimi`→`moonshot`, `qwen`→`dashscope`) vì cán bộ
+   nhớ tên model chứ không nhớ tên công ty; nhật ký vẫn ghi tên nhà cung cấp chuẩn.
 5. `MODEL_PROVIDER` nhận tên công cụ; hai bí danh `cloud`/`local` trỏ tới `CLOUD_PROVIDER`/`LOCAL_PROVIDER`
    → cấu hình đang chạy không phải sửa gì, và router chỉ cần quyết định chế độ.
 6. **Chốt an toàn mới:** provider khai báo `local` mà điểm cuối không thuộc dải mạng nội bộ thì factory

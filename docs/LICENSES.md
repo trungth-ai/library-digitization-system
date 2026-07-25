@@ -22,6 +22,12 @@
 - Họ **Qwen** (Alibaba): nhiều bản Apache-2.0, nhưng một số cỡ có giấy phép riêng → kiểm từng bản.
 - Họ **Llama** (Meta): "Llama Community License" — CÓ ràng buộc (không phải OSS thuần), giới hạn quy mô người dùng.
 - Họ **Gemma** (Google): "Gemma Terms of Use" — có ràng buộc sử dụng.
+- **Xiaomi MiMo** (vd `MiMo-7B-RL`): rà trên model card; cỡ 7B vừa hạ tầng hiện tại.
+- **Kimi K2** (Moonshot): trọng số mở nhưng ~1000 tỉ tham số MoE → **không khả thi tại chỗ** với hạ tầng
+  hiện tại; nếu dùng thì qua dịch vụ đám mây (rà mục 2b thay vì mục này).
+- **DeepSeek**: 🔴 **CẢNH BÁO TRUY NGUỒN** — `deepseek-r1:7b/8b` phổ biến trên Ollama là bản **chưng cất
+  (distill) từ Qwen hoặc Llama**, KHÔNG phải R1 thật. Giấy phép phải truy về **model nền** (nếu nền là
+  Llama thì kèm ràng buộc Llama Community License), và hồ sơ **không được ghi "dùng DeepSeek-R1"**.
 - Model tiếng Việt (**PhoGPT**, **Vistral**, **SeaLLM**...): rà kỹ, nhiều bản dựa trên nền có ràng buộc.
 - Embedding (cho RAG - GĐ3): rà riêng model embedding (vd bge-m3, multilingual-e5...) — thường Apache/MIT nhưng phải xác minh.
 
@@ -65,7 +71,14 @@
 | OpenAI | provider `openai` | | | | ☐ |
 | Azure OpenAI | provider `azure_openai` | | | (chọn được vùng) | ☐ |
 | Google Gemini | provider `gemini` | | | | ☐ |
+| Moonshot AI (Kimi) | provider `moonshot`/`kimi` | | | ⚠️ Mặc định điểm cuối **quốc tế**; bản `.cn` lưu tại Trung Quốc | ☐ |
+| Alibaba DashScope (Qwen) | provider `dashscope`/`qwen` | | | ⚠️ Mặc định **Singapore**; bản `.aliyuncs.com` lưu tại Trung Quốc | ☐ |
 | OpenRouter / Groq / Together / DeepSeek / Mistral | provider tương ứng | ⚠️ **Rà từng nhà cung cấp** — cổng trung gian còn phụ thuộc nhà cung cấp phía sau | | | ☐ |
+
+> 🔴 **Vùng dữ liệu là câu hỏi riêng, không lẫn với giấy phép.** Với nhà cung cấp có điểm cuối ở nhiều
+> vùng (Moonshot, DashScope), việc chọn vùng nào là **quyết định của Nhà trường** và phải nằm trong ý
+> kiến pháp lý (YC-PL-06), không phải mặc định kỹ thuật. Sản phẩm chỉ bảo đảm phần kỹ thuật: **tài liệu
+> Nội bộ/Nhạy cảm không bao giờ đi tới bất kỳ điểm cuối đám mây nào** (YC-DR-03).
 
 > 💡 Cách điền: đọc **Data Processing Addendum / API terms** của đúng gói dịch vụ đang mua (gói API
 > thường khác gói tiêu dùng). Không suy luận từ tài liệu marketing.

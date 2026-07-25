@@ -215,9 +215,11 @@ def get_provider(kind: Optional[str] = None, config=None) -> ModelProvider:
     name = resolve_provider_name(kind)
     preset = get_preset(name)
     if preset is None:
+        from scripts.providers.registry import _NAME_ALIASES
         raise ValueError(
             f"MODEL_PROVIDER không hợp lệ: '{name}'. Các lựa chọn: "
-            f"{', '.join(sorted(PRESETS))} (hoặc bí danh 'cloud'/'local')."
+            f"{', '.join(sorted(PRESETS))}. "
+            f"Bí danh: {', '.join(sorted(_NAME_ALIASES))}, và 'cloud'/'local' theo chế độ."
         )
 
     provider = _BUILDERS[preset.kind](preset, config)

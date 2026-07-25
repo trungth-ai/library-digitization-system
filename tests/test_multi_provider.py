@@ -230,6 +230,8 @@ def test_moi_preset_deu_dung_duoc_va_khai_bao_day_du():
     ("together", DEPLOY_CLOUD),
     ("deepseek", DEPLOY_CLOUD),
     ("mistral", DEPLOY_CLOUD),
+    ("moonshot", DEPLOY_CLOUD),
+    ("dashscope", DEPLOY_CLOUD),
 ])
 def test_factory_dung_duoc_moi_cong_cu_qua_cau_hinh(monkeypatch, name, expect_deployment):
     """KT-CN-05: đổi công cụ CHỈ bằng biến môi trường, không sửa mã."""
@@ -238,6 +240,39 @@ def test_factory_dung_duoc_moi_cong_cu_qua_cau_hinh(monkeypatch, name, expect_de
     assert isinstance(p, ModelProvider)
     assert p.name == name
     assert p.deployment == expect_deployment
+
+
+@pytest.mark.parametrize("bi_danh,ten_thuc", [
+    ("kimi", "moonshot"),        # cán bộ quen gọi tên model, không phải tên hãng
+    ("qwen", "dashscope"),
+    ("alibaba", "dashscope"),
+    ("anthropic", "claude"),
+])
+def test_bi_danh_thuong_hieu_tro_dung_nha_cung_cap(monkeypatch, bi_danh, ten_thuc):
+    monkeypatch.setenv("MODEL_PROVIDER", bi_danh)
+    p = get_provider()
+    assert p.name == ten_thuc          # nhật ký ghi tên nhà cung cấp chuẩn (YC-MP-06)
+    assert p.deployment == DEPLOY_CLOUD
+
+
+def test_kimi_va_qwen_dung_diem_cuoi_va_khoa_dung(monkeypatch):
+    """Điểm cuối mặc định là bản QUỐC TẾ; khóa đọc theo quy ước của chính nhà cung cấp."""
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-kimi")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-qwen")
+
+    kimi = get_provider(kind="kimi")
+    assert kimi.endpoint == "https://api.moonshot.ai/v1"
+    assert kimi._headers()["Authorization"] == "Bearer sk-kimi"
+
+    qwen = get_provider(kind="qwen")
+    assert qwen.endpoint == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    assert qwen._headers()["Authorization"] == "Bearer sk-qwen"
+
+
+def test_doi_vung_du_lieu_bang_bien_moi_truong(monkeypatch):
+    """Vùng dữ liệu là quyết định của Nhà trường → phải đổi được bằng cấu hình, không sửa mã."""
+    monkeypatch.setenv("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1")
+    assert get_provider(kind="kimi").endpoint == "https://api.moonshot.cn/v1"
 
 
 def test_factory_azure_thieu_endpoint_bao_loi_ro(monkeypatch):

@@ -36,6 +36,25 @@ from scripts.providers.textgen import TextGenProvider
 logger = logging.getLogger("provider.openai_compat")
 
 
+def _tu_choi_json_mode(message: str) -> bool:
+    """
+    Lỗi này có phải do máy chủ không hỗ trợ `response_format` không?
+
+    Mỗi nhà cung cấp báo một kiểu: vLLM/llama.cpp nêu thẳng tên tham số, còn DashScope (Qwen) hay một số
+    cổng khác chỉ nói "tham số không hợp lệ / không được hỗ trợ". Nhận diện rộng một chút để đường lùi
+    thực sự hoạt động, nhưng vẫn KHÔNG nuốt các lỗi khác (401 khóa sai, 404 sai model, 429 quá hạn mức)
+    — những lỗi đó phải nổi lên cho cán bộ vận hành thấy.
+    """
+    msg = (message or "").lower()
+    if "response_format" in msg:
+        return True
+    # Thông điệp chung chung: chỉ coi là từ chối JSON mode khi có dấu hiệu "không hỗ trợ" + "json"
+    khong_ho_tro = any(k in msg for k in ("not support", "unsupported", "not_supported",
+                                         "invalid parameter", "invalid_parameter",
+                                         "unknown field", "unrecognized"))
+    return khong_ho_tro and "json" in msg
+
+
 class OpenAICompatProvider(TextGenProvider):
     """Trích xuất/embedding qua điểm cuối tương thích OpenAI."""
 
@@ -118,7 +137,7 @@ class OpenAICompatProvider(TextGenProvider):
             out = self._request("/chat/completions", payload)
         except RuntimeError as e:
             # Máy chủ không hiểu `response_format` → thử lại một lần không có nó (tương thích ngược)
-            if self.json_mode and "response_format" in str(e):
+            if self.json_mode and _tu_choi_json_mode(str(e)):
                 logger.info("[%s] Máy chủ không hỗ trợ response_format → gọi lại không dùng JSON mode",
                             self.name)
                 payload.pop("response_format")

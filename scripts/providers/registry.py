@@ -143,6 +143,23 @@ _CLOUD_PRESETS = [
         deployment=DEPLOY_CLOUD, base_url="https://api.mistral.ai/v1", key_env="MISTRAL_API_KEY",
         default_model="mistral-small-latest", default_embed_model="mistral-embed",
     ),
+    ProviderPreset(
+        name="moonshot", label="Moonshot AI — Kimi (đám mây)", kind=KIND_OPENAI_COMPAT,
+        deployment=DEPLOY_CLOUD, base_url="https://api.moonshot.ai/v1", key_env="MOONSHOT_API_KEY",
+        default_model="moonshot-v1-32k",
+        note="Bí danh: `kimi`. Ngữ cảnh dài (32k/128k) — phù hợp tài liệu OCR nhiều trang. "
+             "Điểm cuối Trung Quốc: MOONSHOT_BASE_URL=https://api.moonshot.cn/v1 (khác vùng dữ liệu).",
+    ),
+    ProviderPreset(
+        name="dashscope", label="Alibaba DashScope — Qwen (đám mây)", kind=KIND_OPENAI_COMPAT,
+        deployment=DEPLOY_CLOUD,
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        key_env="DASHSCOPE_API_KEY", default_model="qwen-plus",
+        default_embed_model="text-embedding-v3",
+        note="Bí danh: `qwen`. Mặc định điểm cuối quốc tế (Singapore); bản Trung Quốc: "
+             "DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1. "
+             "LƯU Ý: Qwen bản MỞ chạy tại chỗ được — không cần dịch vụ này (xem mục model ở LOCAL_MODE.md).",
+    ),
     # Lối mở tổng quát: bất kỳ điểm cuối tương thích OpenAI chưa có trong bảng (dịch vụ trong nước,
     # máy chủ nội bộ của đơn vị khác...). MẶC ĐỊNH AN TOÀN là `cloud`: một điểm cuối lạ phải bị coi là
     # "ra ngoài" cho tới khi người quản trị khai báo ngược lại (OPENAI_COMPAT_DEPLOYMENT=local).
@@ -157,9 +174,22 @@ _CLOUD_PRESETS = [
 
 PRESETS: Dict[str, ProviderPreset] = {p.name: p for p in (_LOCAL_PRESETS + _CLOUD_PRESETS)}
 
+#: Bí danh theo TÊN THƯƠNG HIỆU người dùng quen gọi → tên nhà cung cấp trong bảng.
+#: Cán bộ nghĩ tới "Kimi"/"Qwen" (tên model) chứ không nghĩ tới "Moonshot"/"DashScope" (tên dịch vụ);
+#: chấp nhận cả hai cách gọi để cấu hình không phải tra cứu.
+_NAME_ALIASES = {
+    "kimi": "moonshot",
+    "qwen": "dashscope",
+    "alibaba": "dashscope",
+    "anthropic": "claude",
+    "vllm_openai": "vllm",
+}
+
 
 def get_preset(name: str) -> Optional[ProviderPreset]:
-    return PRESETS.get((name or "").lower().strip())
+    """Tra preset theo tên công cụ hoặc bí danh thương hiệu."""
+    key = (name or "").lower().strip()
+    return PRESETS.get(_NAME_ALIASES.get(key, key))
 
 
 def list_presets(deployment: Optional[str] = None) -> List[ProviderPreset]:

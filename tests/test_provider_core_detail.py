@@ -202,6 +202,35 @@ def test_gemini_cung_di_duong_luoc_do_tong_quat():
 # 3. NHÁNH LỖI / BIÊN
 # =====================================================================
 
+@pytest.mark.parametrize("thong_diep,ky_vong", [
+    ("HTTP 400: unknown field response_format", True),           # vLLM / llama.cpp
+    ("InvalidParameter: response_format is not supported", True),  # DashScope (Qwen)
+    ("HTTP 400: json mode not supported by this model", True),
+    ("HTTP 401: invalid api key", False),      # khóa sai — KHÔNG được nuốt
+    ("HTTP 404: model not found", False),      # sai tên model — KHÔNG được nuốt
+    ("HTTP 429: rate limit exceeded", False),  # quá hạn mức — KHÔNG được nuốt
+])
+def test_nhan_dien_tu_choi_json_mode(thong_diep, ky_vong):
+    """Đường lùi JSON mode phải rộng đủ để dùng được, hẹp đủ để không che lỗi thật."""
+    from scripts.providers.openai_compat import _tu_choi_json_mode
+    assert _tu_choi_json_mode(thong_diep) is ky_vong
+
+
+def test_loi_that_khong_bi_duong_lui_json_che_mat():
+    """Khóa sai phải nổi lên NGAY, không được thử lại rồi báo lỗi khác gây nhầm lẫn."""
+    prov = OpenAICompatProvider(base_url="https://api.moonshot.ai/v1", model="m", api_key="sai")
+    calls = []
+
+    def _fake(path, payload=None, method="POST"):
+        calls.append(payload)
+        raise RuntimeError("HTTP 401 từ moonshot: invalid api key")
+
+    prov._request = _fake
+    with pytest.raises(RuntimeError, match="401"):
+        prov._complete("prompt")
+    assert len(calls) == 1          # chỉ gọi MỘT lần, không thử lại vô ích
+
+
 def test_phan_hoi_thieu_choices_bao_loi_ro():
     prov = OpenAICompatProvider(base_url="http://vllm:8000/v1", model="m", deployment=DEPLOY_LOCAL)
     prov._request = lambda path, payload=None, method="POST": {"usage": {}}
