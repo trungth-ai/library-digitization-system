@@ -88,10 +88,38 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       # Model provider (YC-MP-04) — dùng khi worker trích xuất qua factory (GĐ1).
-      # Mặc định 'cloud' giữ nguyên hành vi hiện tại; đổi 'local' để dùng Ollama tại chỗ.
+      # Mặc định 'cloud' giữ nguyên hành vi hiện tại. Danh sách công cụ: scripts/providers/registry.py
       - MODEL_PROVIDER=${MODEL_PROVIDER:-cloud}
+      # Công cụ đảm nhiệm mỗi chế độ khi định tuyến theo độ nhạy cảm (YC-DR).
+      # Tài liệu Nội bộ/Nhạy cảm LUÔN đi vào LOCAL_PROVIDER (ràng buộc cứng YC-DR-03).
+      - CLOUD_PROVIDER=${CLOUD_PROVIDER:-claude}
+      - LOCAL_PROVIDER=${LOCAL_PROVIDER:-ollama}
+      # -- Công cụ TẠI CHỖ: điểm cuối là tên service trong mạng nội bộ library-net --
       - OLLAMA_URL=http://ollama:11434
       - LOCAL_MODEL=${LOCAL_MODEL:-qwen2.5:7b}
+      - OLLAMA_EMBED_MODEL=${OLLAMA_EMBED_MODEL:-}
+      - VLLM_BASE_URL=${VLLM_BASE_URL:-http://vllm:8000/v1}
+      - VLLM_MODEL=${VLLM_MODEL:-}
+      - LLAMACPP_BASE_URL=${LLAMACPP_BASE_URL:-http://llamacpp:8080/v1}
+      - LLAMACPP_MODEL=${LLAMACPP_MODEL:-local-model}
+      # -- Công cụ ĐÁM MÂY: chỉ có hiệu lực khi được chọn; khóa nào trống thì công cụ đó không dùng được --
+      - CLOUD_MODEL=${CLOUD_MODEL:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - TOGETHER_API_KEY=${TOGETHER_API_KEY:-}
+      - AZURE_OPENAI_BASE_URL=${AZURE_OPENAI_BASE_URL:-}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
+      - AZURE_OPENAI_MODEL=${AZURE_OPENAI_MODEL:-}
+      - OPENAI_COMPAT_BASE_URL=${OPENAI_COMPAT_BASE_URL:-}
+      - OPENAI_COMPAT_MODEL=${OPENAI_COMPAT_MODEL:-}
+      - OPENAI_COMPAT_API_KEY=${OPENAI_COMPAT_API_KEY:-}
+      - OPENAI_COMPAT_DEPLOYMENT=${OPENAI_COMPAT_DEPLOYMENT:-cloud}
     volumes:
       - ./scripts:/app/scripts
       - ./configs:/app/configs
@@ -110,10 +138,19 @@ services:
           cpus: "8"         # Đảm bảo tối thiểu
           memory: "8G"
 
-  # Model serving tại chỗ (Ollama) — YC-MS. Đặt trong profile "local-ai" để KHÔNG ảnh hưởng
-  # deploy hiện tại: `docker compose up` mặc định KHÔNG chạy service này (bổ sung, không viết lại).
-  #   Bật chế độ tại chỗ:  docker compose --profile local-ai up -d
-  #   Tải model 1 lần:     docker compose exec ollama ollama pull qwen2.5:7b
+  # ===================================================================
+  # MODEL SERVING TẠI CHỖ (YC-MS) — BA lựa chọn, mỗi lựa chọn một profile RIÊNG.
+  # `docker compose up` mặc định KHÔNG chạy cái nào (bổ sung, không viết lại).
+  # Chỉ bật MỘT công cụ tại một thời điểm để không tranh RAM/GPU:
+  #     Ollama    (dựng nhanh nhất, CPU tốt):  docker compose --profile local-ai up -d
+  #     vLLM      (thông lượng cao, cần GPU):  docker compose --profile local-ai-vllm up -d
+  #     llama.cpp (nhẹ nhất, CPU):             docker compose --profile local-ai-llamacpp up -d
+  # Rồi đặt LOCAL_PROVIDER=ollama | vllm | llamacpp trong .env. KHÔNG service nào map cổng ra host
+  # (YC-MS-01, YC-BM-05) — chỉ truy cập được trong mạng nội bộ library-net.
+  # ===================================================================
+
+  # Lựa chọn 1 — Ollama (ADR-002: công cụ của GĐ0)
+  #   Tải model 1 lần:  docker compose exec ollama ollama pull qwen2.5:7b
   #   Kiểm chứng ngắt mạng (KT-BM-01): sau khi có model trong volume, ngắt Internet vẫn xử lý được.
   ollama:
     profiles: ["local-ai"]
@@ -143,6 +180,72 @@ services:
     #         - driver: nvidia
     #           count: all
     #           capabilities: [gpu]
+
+  # Lựa chọn 2 — vLLM: thông lượng cao khi có GPU. Ứng viên thay Ollama ở GĐ1 nếu nghẽn (ADR-002).
+  # Nói giao thức tương thích OpenAI → dùng OpenAICompatProvider, KHÔNG cần viết thêm lớp nào.
+  #   Bật:  docker compose --profile local-ai-vllm up -d   +   LOCAL_PROVIDER=vllm
+  # ⚠️ vLLM TẢI MODEL TỪ HUGGING FACE lúc khởi động → lần đầu PHẢI có mạng; sau đó model nằm trong
+  #    volume nên chạy được khi ngắt Internet (YC-MS-02/03). Rà giấy phép model TRƯỚC (YC-PL-01).
+  vllm:
+    profiles: ["local-ai-vllm"]
+    image: vllm/vllm-openai:latest
+    container_name: library-vllm
+    restart: unless-stopped
+    expose:
+      - "8000"
+    command: >
+      --model ${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-8192}
+      --gpu-memory-utilization ${VLLM_GPU_MEM_UTIL:-0.90}
+    environment:
+      - HF_HOME=/models
+      # Chỉ cần khi tải model có kiểm soát truy cập (gated) — vd họ Llama
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      - vllm_models:/models      # YC-MS-02: model bền vững qua khởi động lại
+    networks:
+      - library-net
+    healthcheck:
+      # YC-MS-04: /health là điểm cuối kiểm tra sẵn sàng của vLLM
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s         # nạp model lần đầu có thể mất vài phút
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Lựa chọn 3 — llama.cpp: nhẹ nhất, chạy CPU, không cần GPU. Dùng model GGUF đặt sẵn trong volume
+  # → phù hợp nhất cho kịch bản air-gapped tuyệt đối (không tải gì lúc khởi động).
+  #   Đặt file .gguf vào volume llamacpp_models rồi:
+  #   docker compose --profile local-ai-llamacpp up -d   +   LOCAL_PROVIDER=llamacpp
+  llamacpp:
+    profiles: ["local-ai-llamacpp"]
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: library-llamacpp
+    restart: unless-stopped
+    expose:
+      - "8080"
+    command: >
+      -m /models/${LLAMACPP_GGUF_FILE:-model.gguf}
+      --host 0.0.0.0 --port 8080
+      -c ${LLAMACPP_CTX_SIZE:-8192}
+      -t ${LLAMACPP_THREADS:-8}
+    volumes:
+      - llamacpp_models:/models   # YC-MS-02: đặt file .gguf đã rà giấy phép vào đây
+    networks:
+      - library-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # FastAPI Service - Enhanced API with UI support
   api:
@@ -248,6 +351,10 @@ services:
 
 volumes:
   ollama_data:          # YC-MS-02: lưu model tại chỗ, bền vững qua khởi động lại
+    driver: local
+  vllm_models:          # YC-MS-02: cache model của vLLM (HF_HOME)
+    driver: local
+  llamacpp_models:      # YC-MS-02: chứa file .gguf cho llama.cpp
     driver: local
   n8n_data:
     driver: local
