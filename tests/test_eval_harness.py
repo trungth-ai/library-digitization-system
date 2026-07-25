@@ -146,3 +146,39 @@ def test_thieu_tham_so_bat_buoc_thi_bao_loi():
     from scripts.eval.run_eval import main
     with pytest.raises(SystemExit):
         main([])
+
+
+# --- Kiểm tra sẵn sàng qua CLI (YC-MS-04) ---
+
+def test_health_ma_thoat_1_khi_chua_san_sang(monkeypatch, capsys):
+    """Mã thoát phải dùng được trong script/healthcheck: 1 = chưa sẵn sàng."""
+    monkeypatch.delenv("CLAUDE_API_KEY", raising=False)
+    monkeypatch.delenv("CLOUD_PROVIDER", raising=False)
+    monkeypatch.setenv("MODEL_PROVIDER", "claude")
+    from scripts.eval.run_eval import main
+    assert main(["--health"]) == 1
+    out = capsys.readouterr().out
+    assert "CLAUDE_API_KEY" in out and "đám mây" in out
+
+
+def test_health_bao_cau_hinh_sai_thay_vi_no_ra_ngoai(capsys):
+    """Cấu hình sai (tên công cụ lạ) → in nguyên văn lỗi, KHÔNG để ValueError bay ra."""
+    from scripts.eval.run_eval import main
+    assert main(["--health", "--providers", "cong-cu-la"]) == 1
+    assert "không hợp lệ" in capsys.readouterr().out
+
+
+def test_health_ma_thoat_0_khi_tat_ca_san_sang(monkeypatch, capsys):
+    from scripts.providers.base import ProviderHealth
+    import scripts.providers.factory as factory
+
+    class _San:
+        name, deployment, model, endpoint = "vllm", "local", "m", "http://vllm:8000/v1"
+
+        def health(self):
+            return ProviderHealth(ready=True, detail="sẵn sàng")
+
+    monkeypatch.setattr(factory, "get_provider", lambda kind=None, config=None: _San())
+    from scripts.eval.run_eval import main
+    assert main(["--health", "--providers", "vllm"]) == 0
+    assert "✓" in capsys.readouterr().out

@@ -25,7 +25,7 @@ import json
 import argparse
 from pathlib import Path
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List, Optional
 
 from scripts.eval.harness import run_provider_eval, EvalReport
 from scripts.eval.schemas import get_schema
@@ -116,29 +116,69 @@ def print_provider_list() -> None:
     print("⚠️  Rà giấy phép model TRƯỚC khi tải/dùng — điền docs/LICENSES.md (YC-PL-01/02).")
 
 
+def check_health(provider_kinds: Optional[List[str]] = None) -> int:
+    """
+    Kiểm tra sẵn sàng của công cụ mô hình (YC-MS-04) — chạy TRƯỚC khi đưa tài liệu vào xử lý.
+
+    Trả mã thoát 0 nếu tất cả sẵn sàng, 1 nếu có cái chưa — để dùng được trong script/healthcheck.
+    `provider_kinds=None` → kiểm công cụ đang cấu hình theo MODEL_PROVIDER.
+    """
+    from scripts.providers.factory import get_provider
+
+    kinds = provider_kinds or [None]   # None = theo biến môi trường
+    tat_ca_san_sang = True
+    for kind in kinds:
+        try:
+            provider = get_provider(kind=kind)
+        except ValueError as e:
+            # Cấu hình sai (tên công cụ lạ, thiếu điểm cuối, chốt an toàn chặn) — nêu nguyên văn
+            print(f"  ✗ {kind or '(theo MODEL_PROVIDER)'}: {e}")
+            tat_ca_san_sang = False
+            continue
+
+        health = provider.health()
+        dau = "✓" if health.ready else "✗"
+        che_do = "tại chỗ" if provider.deployment == "local" else "đám mây"
+        print(f"  {dau} {provider.name} ({che_do}) · model={provider.model or '(mặc định)'}"
+              f"{' · ' + provider.endpoint if provider.endpoint else ''}")
+        print(f"      {health.detail}")
+        tat_ca_san_sang = tat_ca_san_sang and health.ready
+    return 0 if tat_ca_san_sang else 1
+
+
 def main(argv=None):
     _force_utf8_stdout()
     ap = argparse.ArgumentParser(description="Harness đo đạc DocuFlow HP (KT-CX/KT-HN)")
     ap.add_argument("--data", help="Thư mục tài liệu (.txt/.pdf)")
     ap.add_argument("--truth", help="File ground_truth.json")
     ap.add_argument("--schema", default="book", help="Lược đồ: book | thesis | cong_van")
-    ap.add_argument("--providers", default="cloud",
+    ap.add_argument("--providers", default=None,
                     help="Danh sách công cụ, phẩy: claude,ollama,vllm... (hoặc bí danh cloud,local)")
     ap.add_argument("--out", default="./eval_out", help="Thư mục xuất kết quả JSON")
     ap.add_argument("--list-providers", action="store_true",
                     help="In danh sách công cụ mô hình khả dụng rồi thoát")
+    ap.add_argument("--health", action="store_true",
+                    help="Kiểm tra sẵn sàng của công cụ (YC-MS-04) rồi thoát; mã thoát 1 nếu chưa sẵn sàng")
     args = ap.parse_args(argv)
 
     if args.list_providers:
         print_provider_list()
         return 0
+
+    if args.health:
+        kinds = [p.strip() for p in args.providers.split(",") if p.strip()] if args.providers else None
+        print("KIỂM TRA SẴN SÀNG CÔNG CỤ MÔ HÌNH (YC-MS-04)")
+        print("-" * 78)
+        return check_health(kinds)
+
     if not args.data or not args.truth:
-        ap.error("cần --data và --truth (hoặc dùng --list-providers)")
+        ap.error("cần --data và --truth (hoặc dùng --list-providers / --health)")
 
     docs = load_documents(args.data)
     truth = load_ground_truth(args.truth)
     schema = get_schema(args.schema)
-    provider_kinds = [p.strip() for p in args.providers.split(",") if p.strip()]
+    # Mặc định giữ nguyên hành vi cũ: đo chế độ đám mây nếu không nêu công cụ
+    provider_kinds = [p.strip() for p in (args.providers or "cloud").split(",") if p.strip()]
 
     from scripts.providers.factory import get_provider  # lazy (tránh cần deps khi chỉ test harness)
 
