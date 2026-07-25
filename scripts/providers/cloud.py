@@ -1,53 +1,55 @@
 #!/usr/bin/env python3
 """
-CloudProvider — nhà cung cấp mô hình đám mây (Claude). YC-MP-02.
+ClaudeProvider — nhà cung cấp mô hình đám mây Anthropic Claude. YC-MP-02.
 
-Mục tiêu: GIỮ NGUYÊN hành vi trích xuất hiện tại. Provider này TÁI SỬ DỤNG trực tiếp
-`scripts.digitize.AIMetadataExtractor` (không sao chép logic prompt/parse) để kết quả giống hệt hệ
-thống cũ trên cùng đầu vào — tiêu chí không hồi quy (KT-KH / KT-CN-04).
+Mục tiêu BẤT BIẾN: GIỮ NGUYÊN hành vi trích xuất hiện tại. Provider này TÁI SỬ DỤNG trực tiếp
+`scripts.digitize.AIMetadataExtractor._ai_extraction` (không sao chép logic prompt/parse) để kết quả
+giống hệt hệ thống đang chạy trên cùng đầu vào — tiêu chí không hồi quy (KT-KH / KT-CN-04).
+
+Vì lý do đó, đây là provider DUY NHẤT ghi đè `_extract_dublin_core`: nó đi đúng đường gọi Claude cũ,
+không đi qua `_complete()` dùng chung. Các nhánh còn lại (lược đồ tổng quát, nhật ký, dự phòng) thừa
+hưởng từ `TextGenProvider` như mọi provider khác.
 
 Ranh giới: provider nhận VĂN BẢN đã trích (ngữ cảnh) + lược đồ, trả về các trường. Việc tách text từ
 PDF và chọn ngữ cảnh (YC-SC-04) do pipeline đảm nhiệm — đúng như `extract()` cũ vẫn làm.
+
+Tên lớp `CloudProvider` được giữ làm bí danh để không phá mã/kiểm thử đang dùng.
 """
 
-import time
 import logging
-from typing import List, Optional
+import time
+from typing import Optional
 
 from scripts.providers.base import (
-    ModelProvider, ExtractionSchema, ExtractionResult, FieldValue, ProviderHealth,
+    DEPLOY_CLOUD, ExtractionResult, FieldValue, ProviderHealth,
 )
+from scripts.providers.textgen import TextGenProvider
 
-logger = logging.getLogger("provider.cloud")
+logger = logging.getLogger("provider.claude")
 
 
-class CloudProvider(ModelProvider):
+class ClaudeProvider(TextGenProvider):
     """Trích xuất metadata bằng Claude, bọc AIMetadataExtractor hiện có."""
 
-    name = "cloud"
+    name = "claude"
+    deployment = DEPLOY_CLOUD
 
     def __init__(self, api_key: Optional[str] = None, config=None, model: Optional[str] = None):
-        # Lazy import để cloud.py import được ở môi trường thiếu pypdf/anthropic
-        from scripts.digitize import AIMetadataExtractor, ProcessingConfig
-        self.config = config or ProcessingConfig()
+        super().__init__(config=config, api_key=api_key)
         if model:
             self.config.claude_model = model
         self.model = self.config.claude_model
         self.version = ""
-        self._extractor = AIMetadataExtractor(self.config, api_key)
+        self.endpoint = "https://api.anthropic.com"
 
-    def extract_fields(self, text: str, schema: ExtractionSchema) -> ExtractionResult:
-        # Đồng bộ loại tài liệu để prompt giữ nguyên như hệ thống cũ
-        self.config.document_type = schema.document_type
-
-        # Lược đồ khác dublin_core (vd công văn) → đường generic schema-driven (giữ nguyên đường cũ cho dublin_core)
-        if schema.code != "dublin_core":
-            return self._extract_generic(text, schema)
-
+    def _extract_dublin_core(self, text: str) -> ExtractionResult:
+        """
+        Sao ĐÚNG nhánh của `AIMetadataExtractor.extract()`:
+          có client → `_ai_extraction` (lỗi thì rơi về basic); không có client → basic.
+        KHÔNG đổi đường này nếu chưa chạy lại kiểm thử không hồi quy.
+        """
         t0 = time.perf_counter()
         used_ai = False
-        # Sao đúng nhánh của AIMetadataExtractor.extract():
-        #   có client -> _ai_extraction (lỗi thì fallback basic); không có client -> basic
         if self._extractor.client:
             try:
                 result = self._extractor._ai_extraction(text)
@@ -58,15 +60,8 @@ class CloudProvider(ModelProvider):
         else:
             result = self._extractor._basic_extraction(text)
 
-        latency_ms = int((time.perf_counter() - t0) * 1000)
         metadata = result.get("metadata", [])
-
-        # YC-MP-06: ghi nhật ký mỗi lần gọi model (provider/model/chế độ/thời gian)
-        logger.info(
-            "model_call provider=%s model=%s ai=%s latency_ms=%d fields=%d",
-            self.name, self.model, used_ai, latency_ms, len(metadata),
-        )
-
+        self._log_call(used_ai, t0, len(metadata), "dublin_core")   # YC-MP-06
         fields = [
             FieldValue(key=m["key"], value=m["value"], language=m.get("language"))
             for m in metadata
@@ -74,7 +69,9 @@ class CloudProvider(ModelProvider):
         return ExtractionResult(fields=fields, raw=result)
 
     def _complete(self, prompt: str) -> str:
-        """Gọi Claude với 1 prompt tự do → trả text (dùng cho generic schema-driven)."""
+        """Gọi Claude với 1 prompt tự do → trả text (dùng cho lược đồ tổng quát)."""
+        if not self._extractor.client:
+            raise RuntimeError("Thiếu CLAUDE_API_KEY → không gọi được Claude")
         resp = self._extractor.client.messages.create(
             model=self.config.claude_model,
             max_tokens=self.config.max_tokens,
@@ -82,33 +79,8 @@ class CloudProvider(ModelProvider):
         )
         return resp.content[0].text
 
-    def _extract_generic(self, text: str, schema: ExtractionSchema) -> ExtractionResult:
-        """Trích xuất theo lược đồ bất kỳ (không phải dublin_core)."""
-        from scripts.providers.prompt import extract_with_schema
-        t0 = time.perf_counter()
-        used_ai = False
-        if not self._extractor.client:
-            logger.warning("CloudProvider thiếu key cho lược đồ '%s' → trả rỗng (không bịa)", schema.code)
-            result = ExtractionResult(fields=[])
-        else:
-            try:
-                result = extract_with_schema(self._complete, text, schema)
-                used_ai = True
-            except Exception as e:  # noqa: BLE001 - không mất dữ liệu (YC-MP-05)
-                logger.warning("Generic extraction lỗi: %s", e)
-                result = ExtractionResult(fields=[])
-        latency_ms = int((time.perf_counter() - t0) * 1000)
-        logger.info(
-            "model_call provider=%s model=%s ai=%s latency_ms=%d fields=%d schema=%s",
-            self.name, self.model, used_ai, latency_ms, len(result.fields), schema.code,
-        )
-        return result
-
-    def embed(self, texts: List[str]) -> List[List[float]]:
-        # SRS YC-RG-02: embedding chạy tại chỗ → CloudProvider không đảm nhiệm
-        raise NotImplementedError(
-            "CloudProvider không hỗ trợ embedding; dùng LocalProvider (YC-RG-02)"
-        )
+    # `embed()` thừa hưởng từ TextGenProvider → ném NotImplementedError.
+    # SRS YC-RG-02: embedding chạy TẠI CHỖ, provider đám mây không đảm nhiệm.
 
     def health(self) -> ProviderHealth:
         ok = self._extractor.client is not None
@@ -116,3 +88,7 @@ class CloudProvider(ModelProvider):
             ready=ok,
             detail="có Claude client" if ok else "thiếu CLAUDE_API_KEY → chạy basic extraction",
         )
+
+
+#: Bí danh tương thích ngược — mã/kiểm thử cũ import `CloudProvider`.
+CloudProvider = ClaudeProvider

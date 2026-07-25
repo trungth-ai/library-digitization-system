@@ -91,7 +91,10 @@ def test_them_provider_moi_chi_can_1_lop(monkeypatch):
     assert res.fields[0].value == "Hello"
     assert p.health().ready is True
     assert p.embed(["a", "b"]) == [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
-    assert p.describe() == {"provider": "dummy", "model": "dummy-1", "version": "0"}
+    # `deployment` mặc định là "cloud" (mặc định an toàn: lớp con chưa khai báo thì bị coi là ra ngoài
+    # → không được nhận tài liệu Nội bộ/Nhạy cảm, YC-DR-03)
+    assert p.describe() == {"provider": "dummy", "deployment": "cloud",
+                           "model": "dummy-1", "version": "0"}
 
 
 def test_to_metadata_list_giu_tuong_thich():

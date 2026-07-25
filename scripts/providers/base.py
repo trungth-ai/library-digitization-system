@@ -37,6 +37,14 @@ SENSITIVITY_PUBLIC = "public"       # Công khai
 SENSITIVITY_INTERNAL = "internal"   # Nội bộ
 SENSITIVITY_SENSITIVE = "sensitive" # Nhạy cảm
 
+# Chế độ triển khai của một provider (YC-DR-03).
+# LƯU Ý QUAN TRỌNG: đây là thuộc tính KHÁC với `name`.
+#   - `name`       = danh tính công cụ ("claude", "ollama", "vllm", "gemini"...) → ghi vào log (YC-MP-06)
+#   - `deployment` = dữ liệu chạy Ở ĐÂU ("cloud" = ra ngoài tổ chức | "local" = trong hạ tầng của trường)
+# Ràng buộc cứng YC-DR-03 chỉ dựa vào `deployment`, KHÔNG dựa vào `name`.
+DEPLOY_CLOUD = "cloud"
+DEPLOY_LOCAL = "local"
+
 
 @dataclass
 class ExtractionSchema:
@@ -100,12 +108,20 @@ class ModelProvider(ABC):
     Thuộc tính `name`/`model`/`version` phục vụ ghi nhật ký mỗi lần gọi model (YC-MP-06).
     """
 
-    #: định danh nhà cung cấp, vd "cloud", "local"
+    #: định danh CÔNG CỤ, vd "claude", "ollama", "vllm", "gemini", "openai"
     name: str = "base"
-    #: tên model đang dùng, vd "claude-sonnet-4", "qwen2.5:7b"
+    #: chế độ triển khai: DEPLOY_CLOUD | DEPLOY_LOCAL — quyết định ràng buộc cứng YC-DR-03.
+    #: Mặc định là CLOUD (mặc định an toàn: lớp con chưa khai báo thì bị coi là "ra ngoài",
+    #: nên KHÔNG được nhận tài liệu Nội bộ/Nhạy cảm — thà từ chối oan hơn để lộ dữ liệu).
+    deployment: str = DEPLOY_CLOUD
+    #: tên model đang dùng cho trích xuất, vd "claude-sonnet-4", "qwen2.5:7b"
     model: str = ""
+    #: model dùng cho embedding (YC-MS-05: tác vụ khác nhau có thể dùng model khác nhau)
+    embed_model: str = ""
     #: phiên bản model nếu có
     version: str = ""
+    #: điểm cuối đang gọi (chỉ host/đường dẫn — TUYỆT ĐỐI không chứa khóa API, YC-BM-03)
+    endpoint: str = ""
 
     @abstractmethod
     def extract_fields(self, text: str, schema: ExtractionSchema) -> ExtractionResult:
@@ -124,4 +140,14 @@ class ModelProvider(ABC):
 
     def describe(self) -> dict:
         """Thông tin nhận dạng provider — nhúng vào log/audit (YC-MP-06, YC-AU-04)."""
-        return {"provider": self.name, "model": self.model, "version": self.version}
+        info = {
+            "provider": self.name,
+            "deployment": self.deployment,
+            "model": self.model,
+            "version": self.version,
+        }
+        if self.embed_model:
+            info["embed_model"] = self.embed_model
+        if self.endpoint:
+            info["endpoint"] = self.endpoint
+        return info

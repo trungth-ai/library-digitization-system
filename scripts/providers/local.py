@@ -1,32 +1,35 @@
 #!/usr/bin/env python3
 """
-LocalProvider — nhà cung cấp mô hình tại chỗ qua Ollama (YC-MP-03, YC-MS).
+OllamaProvider — mô hình tại chỗ chạy qua Ollama (YC-MP-03, YC-MS). ADR-002.
 
-- Gọi Ollama qua HTTP bằng `urllib` (stdlib) → KHÔNG thêm phụ thuộc, chạy được ở môi trường tối giản
-  / air-gapped (phù hợp yêu cầu chạy khi ngắt Internet — YC-MS-03).
-- Tái dùng `_get_unified_prompt` + `_build_metadata` + `_basic_extraction` của AIMetadataExtractor để
-  DÙNG CHUNG một lược đồ prompt/parse với CloudProvider → so sánh độ chính xác công bằng (KT-CX-03).
-- Endpoint Ollama: POST /api/generate (trích xuất), POST /api/embeddings (RAG - GĐ3), GET /api/tags (health).
+**Ollama chỉ là MỘT trong nhiều lựa chọn tại chỗ.** Các lựa chọn còn lại (vLLM, llama.cpp, LM Studio,
+TGI) dùng `OpenAICompatProvider`; xem `scripts/providers/registry.py` để biết bảng công cụ đầy đủ.
+Ollama giữ lớp riêng vì nó có API GỐC (`/api/generate`, `/api/embeddings`) khác chuẩn OpenAI — và đó là
+API ổn định nhất của nó (`format: "json"` buộc model trả JSON hợp lệ, rất hữu ích cho trích xuất).
+
+- Gọi HTTP bằng `urllib` (stdlib) → KHÔNG thêm phụ thuộc, chạy được air-gapped (YC-MS-03).
+- Logic trích xuất/dự phòng/nhật ký nằm ở `TextGenProvider` → dùng CHUNG với mọi provider khác,
+  bảo đảm so sánh độ chính xác giữa các chế độ là công bằng (KT-CX-03).
+- Tên lớp `LocalProvider` được giữ làm bí danh để không phá mã/kiểm thử đang dùng (bổ sung, không viết lại).
 """
 
 import json
-import time
 import logging
-import urllib.request
 import urllib.error
-from typing import List, Optional
+import urllib.request
+from typing import List
 
-from scripts.providers.base import (
-    ModelProvider, ExtractionSchema, ExtractionResult, FieldValue, ProviderHealth,
-)
+from scripts.providers.base import DEPLOY_LOCAL, ProviderHealth
+from scripts.providers.textgen import TextGenProvider
 
-logger = logging.getLogger("provider.local")
+logger = logging.getLogger("provider.ollama")
 
 
-class LocalProvider(ModelProvider):
-    """Trích xuất/embedding bằng mô hình mở chạy tại chỗ (Ollama)."""
+class OllamaProvider(TextGenProvider):
+    """Trích xuất/embedding bằng mô hình mở chạy tại chỗ qua Ollama."""
 
-    name = "local"
+    name = "ollama"
+    deployment = DEPLOY_LOCAL
 
     def __init__(
         self,
@@ -34,15 +37,16 @@ class LocalProvider(ModelProvider):
         model: str = "qwen2.5:7b",
         config=None,
         timeout: int = 120,
+        embed_model: str = "",
     ):
-        from scripts.digitize import ProcessingConfig, AIMetadataExtractor
+        super().__init__(config=config)
         self.base_url = base_url.rstrip("/")
         self.model = model
+        # YC-MS-05: embedding nên dùng model chuyên dụng (vd bge-m3), không dùng model sinh văn bản
+        self.embed_model = embed_model or ""
         self.version = ""
+        self.endpoint = self.base_url
         self.timeout = timeout
-        self.config = config or ProcessingConfig()
-        # Chỉ mượn logic prompt/parse/basic; LocalProvider tự gọi model nên api_key=None
-        self._extractor = AIMetadataExtractor(self.config, api_key=None)
 
     # -- HTTP helpers (urllib, stdlib) -------------------------------------
     def _post_json(self, path: str, payload: dict) -> dict:
@@ -61,79 +65,45 @@ class LocalProvider(ModelProvider):
             "prompt": prompt,
             "stream": False,
             "format": "json",   # Ollama ép model trả JSON hợp lệ
+            "options": {"temperature": 0},
         })
         return out.get("response", "")
 
-    # -- ModelProvider ----------------------------------------------------
-    def extract_fields(self, text: str, schema: ExtractionSchema) -> ExtractionResult:
-        self.config.document_type = schema.document_type
-
-        # Lược đồ khác dublin_core (vd công văn) → generic schema-driven
-        if schema.code != "dublin_core":
-            return self._extract_generic(text, schema)
-
-        t0 = time.perf_counter()
-        used_ai = False
-        try:
-            prompt = self._extractor._get_unified_prompt(text)   # cùng prompt với cloud
-            raw = self._call_generate(prompt)
-            import re
-            cleaned = re.sub(r"```json\s*|\s*```", "", raw.strip())
-            extracted = json.loads(cleaned)
-            result = self._extractor._build_metadata(extracted)  # cùng parser với cloud
-            used_ai = True
-        except Exception as e:  # noqa: BLE001 - không mất dữ liệu, fallback giống pipeline cũ (YC-MP-05)
-            logger.warning("Local extraction lỗi, fallback basic: %s", e)
-            result = self._extractor._basic_extraction(text)
-
-        latency_ms = int((time.perf_counter() - t0) * 1000)
-        metadata = result.get("metadata", [])
-        logger.info(
-            "model_call provider=%s model=%s ai=%s latency_ms=%d fields=%d",
-            self.name, self.model, used_ai, latency_ms, len(metadata),
-        )
-        fields = [
-            FieldValue(key=m["key"], value=m["value"], language=m.get("language"))
-            for m in metadata
-        ]
-        return ExtractionResult(fields=fields, raw=result)
-
+    # -- Điểm mở rộng của TextGenProvider ----------------------------------
     def _complete(self, prompt: str) -> str:
-        """Gọi Ollama với 1 prompt tự do → text (dùng cho generic schema-driven)."""
         return self._call_generate(prompt)
 
-    def _extract_generic(self, text: str, schema: ExtractionSchema) -> ExtractionResult:
-        """Trích xuất theo lược đồ bất kỳ (không phải dublin_core)."""
-        from scripts.providers.prompt import extract_with_schema
-        t0 = time.perf_counter()
-        used_ai = False
-        try:
-            result = extract_with_schema(self._complete, text, schema)
-            used_ai = True
-        except Exception as e:  # noqa: BLE001 - không mất dữ liệu (YC-MP-05)
-            logger.warning("Generic extraction (local) lỗi: %s", e)
-            result = ExtractionResult(fields=[])
-        latency_ms = int((time.perf_counter() - t0) * 1000)
-        logger.info(
-            "model_call provider=%s model=%s ai=%s latency_ms=%d fields=%d schema=%s",
-            self.name, self.model, used_ai, latency_ms, len(result.fields), schema.code,
-        )
-        return result
-
+    # -- Embedding (YC-RG-02) ----------------------------------------------
     def embed(self, texts: List[str]) -> List[List[float]]:
-        """Tạo embedding tại chỗ (YC-RG-02) — dùng cho RAG ở GĐ3."""
+        """Tạo embedding tại chỗ — dùng cho RAG ở GĐ3."""
+        model = self.embed_model or self.model
         vectors: List[List[float]] = []
         for t in texts:
-            out = self._post_json("/api/embeddings", {"model": self.model, "prompt": t})
+            out = self._post_json("/api/embeddings", {"model": model, "prompt": t})
             vectors.append(out.get("embedding", []))
         return vectors
 
+    # -- Sẵn sàng (YC-MS-04) -----------------------------------------------
     def health(self) -> ProviderHealth:
-        """Kiểm tra Ollama sống (YC-MS-04) — GET /api/tags."""
+        """Kiểm tra Ollama sống — GET /api/tags; đồng thời soát model đã tải chưa."""
         try:
             req = urllib.request.Request(f"{self.base_url}/api/tags", method="GET")
             with urllib.request.urlopen(req, timeout=5) as resp:
-                ok = resp.status == 200
-            return ProviderHealth(ready=ok, detail="Ollama sẵn sàng" if ok else "Ollama không phản hồi")
+                if resp.status != 200:
+                    return ProviderHealth(ready=False, detail="Ollama không phản hồi")
+                tags = json.loads(resp.read().decode("utf-8"))
         except Exception as e:  # noqa: BLE001
             return ProviderHealth(ready=False, detail=f"Ollama không phản hồi: {e}")
+
+        names = [m.get("name", "") for m in tags.get("models", [])]
+        if self.model and names and self.model not in names:
+            return ProviderHealth(
+                ready=False,
+                detail=(f"Ollama sống nhưng CHƯA tải model '{self.model}'. "
+                        f"Chạy: ollama pull {self.model}"),
+            )
+        return ProviderHealth(ready=True, detail="Ollama sẵn sàng")
+
+
+#: Bí danh tương thích ngược — mã/kiểm thử cũ import `LocalProvider`.
+LocalProvider = OllamaProvider

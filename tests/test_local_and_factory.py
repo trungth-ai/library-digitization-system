@@ -63,29 +63,38 @@ def test_local_health_khi_khong_co_ollama():
 
 
 # --- Factory (YC-MP-04) ---
+# Lưu ý: `cloud`/`local` là BÍ DANH CHẾ ĐỘ; `name` giờ là tên CÔNG CỤ cụ thể (claude/ollama/...),
+# còn chế độ triển khai nằm ở `deployment`.
 
 def test_factory_chon_cloud(monkeypatch):
     monkeypatch.setenv("MODEL_PROVIDER", "cloud")
     monkeypatch.delenv("CLAUDE_API_KEY", raising=False)
+    monkeypatch.delenv("CLOUD_PROVIDER", raising=False)
     p = get_provider()
     assert isinstance(p, ModelProvider)
-    assert p.name == "cloud"
+    assert p.name == "claude"
+    assert p.deployment == "cloud"
 
 
 def test_factory_chon_local(monkeypatch):
     monkeypatch.setenv("MODEL_PROVIDER", "local")
     monkeypatch.setenv("LOCAL_MODEL", "qwen2.5:7b")
+    monkeypatch.delenv("LOCAL_PROVIDER", raising=False)
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
     p = get_provider()
-    assert p.name == "local"
-    assert p.model == "qwen2.5:7b"
+    assert p.name == "ollama"          # công cụ tại chỗ MẶC ĐỊNH, không phải chế độ
+    assert p.deployment == "local"
+    assert p.model == "qwen2.5:7b"     # tên biến cũ LOCAL_MODEL vẫn có hiệu lực
 
 
 def test_factory_mac_dinh_la_cloud(monkeypatch):
     monkeypatch.delenv("MODEL_PROVIDER", raising=False)
+    monkeypatch.delenv("CLOUD_PROVIDER", raising=False)
     p = get_provider()
-    assert p.name == "cloud"  # mặc định giữ nguyên hành vi hiện tại
+    # mặc định giữ nguyên hành vi hiện tại: Claude trên đám mây
+    assert p.name == "claude" and p.deployment == "cloud"
 
 
 def test_factory_kind_khong_hop_le(monkeypatch):
     with pytest.raises(ValueError):
-        get_provider(kind="vllm-chua-ho-tro")
+        get_provider(kind="cong-cu-khong-ton-tai")

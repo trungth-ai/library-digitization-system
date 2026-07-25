@@ -55,12 +55,17 @@ def test_sensitive_chon_cloud_bi_tu_choi():
 # --- get_routed_provider ---
 def test_routed_provider_public_cloud(monkeypatch):
     monkeypatch.delenv("CLAUDE_API_KEY", raising=False)
+    monkeypatch.delenv("CLOUD_PROVIDER", raising=False)
     provider, mode = get_routed_provider(_schema(SENSITIVITY_PUBLIC))
-    assert mode == MODE_CLOUD and provider.name == "cloud"
+    # `mode` là CHẾ ĐỘ; công cụ đảm nhiệm chế độ đó do cấu hình quyết định (mặc định: Claude)
+    assert mode == MODE_CLOUD
+    assert provider.name == "claude" and provider.deployment == MODE_CLOUD
 
-def test_routed_provider_internal_local():
+def test_routed_provider_internal_local(monkeypatch):
+    monkeypatch.delenv("LOCAL_PROVIDER", raising=False)
     provider, mode = get_routed_provider(_schema(SENSITIVITY_INTERNAL))
-    assert mode == MODE_LOCAL and provider.name == "local"
+    assert mode == MODE_LOCAL
+    assert provider.name == "ollama" and provider.deployment == MODE_LOCAL
 
 def test_routed_provider_sensitive_cloud_bi_tu_choi():
     """Ràng buộc cứng chặn TRƯỚC khi tạo provider."""
