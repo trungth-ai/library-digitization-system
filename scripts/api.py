@@ -26,7 +26,7 @@ import scripts.db as db
 from scripts.sse import job_event_stream
 
 # Module GĐ1-2 + envelope HPU (endpoints MỚI dùng envelope; route cũ giữ nguyên — ADR-003)
-from scripts.core import reports, audit, schema_store
+from scripts.core import reports, audit, schema_store, provider_view
 from scripts.core.responses import success, error as err_envelope
 
 
@@ -400,16 +400,23 @@ async def list_jobs(
     limit:            int            = Query(100, ge=1, le=1000),
     offset:           int            = Query(0, ge=0),
     include_metadata: bool           = Query(False),
+    include_deleted:  bool           = Query(False),
+    needs_review:     Optional[bool] = Query(None),
 ):
     """
     List jobs — đọc từ DB.
     Hỗ trợ filter theo status OCR và dspace_status.
+
+    - `include_deleted=true`: hiện cả tài liệu đã xóa mềm (thùng rác).
+    - `needs_review=true`: chỉ tài liệu cần cán bộ kiểm tra lại (YC-CF-03).
     """
     docs = db.list_documents(
         status=status,
         dspace_status=dspace_status,
         limit=limit,
         offset=offset,
+        include_deleted=include_deleted,
+        needs_review=needs_review,
     )
 
     jobs = []
@@ -424,6 +431,11 @@ async def list_jobs(
             "created_at":           doc["created_at"].isoformat() if doc["created_at"] else None,
             "finished_at":          doc["finished_at"].isoformat() if doc["finished_at"] else None,
             "error":                doc["error_message"],
+            # Trích bằng công cụ/chế độ nào + có cần xem lại (YC-AU-04, YC-CF-03)
+            "extraction_provider":  doc.get("extraction_provider"),
+            "extraction_mode":      doc.get("extraction_mode"),
+            "extraction_model":     doc.get("extraction_model"),
+            "needs_review":         doc.get("needs_review", False),
             "dspace_status":        doc["dspace_status"],
             "dspace_status_label":  doc["dspace_status_label"],
             "dspace_status_color":  doc["dspace_status_color"],
@@ -687,24 +699,53 @@ async def _download_batch_impl(job_ids: List[str]):
 # ---------------------------------------------------------------------
 
 @app.delete("/api/v2/jobs/{job_id}")
-async def delete_job(job_id: str):
-    """Xóa job khỏi DB, Redis và file system"""
+async def delete_job(job_id: str, purge: bool = Query(False), actor: str = Query("api")):
+    """
+    XÓA MỀM job: đặt status='deleted', **giữ nguyên** file PDF/OCR và metadata (chuẩn HPU).
+
+    Vì sao giữ file: bản PDF đã OCR là phần dữ liệu giá trị nhất của hệ thống (xem docs/DEPLOY.md
+    mục sao lưu). Nếu xóa file mà chỉ giữ bản ghi thì "xóa mềm" là ảo — phục hồi ra một tài liệu
+    trỏ vào hư không.
+
+    `purge=true`: xóa VẬT LÝ cả bản ghi và file, KHÔNG phục hồi được. Chỉ dùng cho yêu cầu xóa dữ
+    liệu thật sự (vd dữ liệu cá nhân — YC-PL-06). Ghi audit TRƯỚC khi xóa.
+    """
     doc = db.get_document(job_id)
     if not doc and not redis_client.exists(f"job:{job_id}"):
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Xóa DB (CASCADE xóa luôn metadata_fields + metadata_history)
-    db.delete_document(job_id)
+    if purge:
+        # Ghi bằng chứng trước, vì sau khi xóa thì không còn tài liệu để gắn bản ghi kiểm toán
+        audit.log_action(
+            action=audit.ACTION_DELETE, document_id=job_id, actor=actor,
+            detail={"purge": True, "filename": (doc or {}).get("filename"),
+                    "note": "Xóa vật lý theo yêu cầu — không phục hồi được"},
+        )
+        db.purge_document(job_id)
+        redis_client.delete(f"job:{job_id}")
+        job_dir = BASE_DIR / job_id
+        if job_dir.exists():
+            shutil.rmtree(job_dir)
+        return {"message": "Job purged (đã xóa vật lý, không phục hồi được)", "job_id": job_id,
+                "purged": True}
 
-    # Xóa Redis
-    redis_client.delete(f"job:{job_id}")
+    db.delete_document(job_id)          # xóa mềm: chỉ đổi status
+    redis_client.delete(f"job:{job_id}")   # trạng thái tạm trong Redis — DB là nguồn sự thật
+    audit.log_action(
+        action=audit.ACTION_DELETE, document_id=job_id, actor=actor,
+        detail={"purge": False, "filename": (doc or {}).get("filename")},
+    )
+    return {"message": "Job deleted (xóa mềm — có thể phục hồi)", "job_id": job_id, "purged": False}
 
-    # Xóa file
-    job_dir = BASE_DIR / job_id
-    if job_dir.exists():
-        shutil.rmtree(job_dir)
 
-    return {"message": "Job deleted", "job_id": job_id}
+@app.post("/api/v2/jobs/{job_id}/restore")
+async def restore_job(job_id: str, actor: str = Query("api")):
+    """Phục hồi job đã xóa mềm. Có xóa mềm thì phải có đường về."""
+    if not db.restore_document(job_id):
+        raise HTTPException(status_code=404,
+                            detail="Không tìm thấy job đã xóa mềm với id này")
+    audit.log_action(action="restore", document_id=job_id, actor=actor)
+    return success({"job_id": job_id}, "Đã phục hồi tài liệu")
 
 
 @app.get("/api/v2/stats")
@@ -791,6 +832,45 @@ async def api_list_audit(
     """Kết xuất nhật ký kiểm toán theo bộ lọc thời gian/người/loại (YC-AU-05)."""
     rows = audit.list_audit(actor=actor, action=action, date_from=date_from, date_to=date_to, limit=limit)
     return success(rows, "Nhật ký kiểm toán")
+
+
+# ---------------------------------------------------------------------
+# ROUTES - CÔNG CỤ MÔ HÌNH (YC-MS-08, YC-MP-06) — envelope HPU
+# ---------------------------------------------------------------------
+
+@app.get("/api/v2/providers")
+async def api_providers(check_health: bool = Query(True)):
+    """
+    Công cụ mô hình đang dùng + tình trạng + danh sách lựa chọn (YC-MS-08).
+
+    `check_health=false` để bỏ qua lời gọi kiểm tra sẵn sàng (nhanh hơn khi chỉ cần danh sách).
+    Logic nằm ở `core/provider_view.py` để test được không cần HTTP; endpoint chỉ bọc envelope.
+    """
+    return success(provider_view.build_provider_view(check_health=check_health), "Công cụ mô hình")
+
+
+@app.get("/api/v2/model-calls")
+async def api_model_calls(
+    document_id: Optional[str] = Query(None),
+    provider:    Optional[str] = Query(None),
+    deployment:  Optional[str] = Query(None),
+    limit:       int           = Query(200, ge=1, le=2000),
+    offset:      int           = Query(0, ge=0),
+    summary:     bool          = Query(False),
+):
+    """
+    Nhật ký gọi model — provider/model/thời gian/tài nguyên (YC-MP-06, YC-MS-07).
+    `summary=true` trả bảng gộp theo công cụ để so sánh (số lần gọi, thời gian TB, RAM đỉnh).
+    """
+    rows = db.list_model_calls(document_id=document_id, provider=provider,
+                              deployment=deployment, limit=limit, offset=offset)
+    if summary:
+        return success(provider_view.summarize_model_calls(rows), "Tổng hợp theo công cụ")
+
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+    return success(rows, "Nhật ký gọi model")
 
 
 # ---------------------------------------------------------------------
