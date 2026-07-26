@@ -5,6 +5,62 @@
 
 ---
 
+## ADR-008: Nối pipeline vào lớp provider + xóa mềm + dự phòng chỉ trong cùng chế độ
+**Status:** Accepted · **Date:** 2026-07-26 · **Decided by:** Đội phát triển
+
+**Context:** ADR-004 cố ý hoãn việc nối lớp provider vào pipeline để bảo vệ hệ đang chạy. Hệ quả là
+`docker compose` đổi `MODEL_PROVIDER` **không đổi được hành vi của worker** — worker vẫn gọi thẳng
+`AIMetadataExtractor` (bám Claude). Lớp trừu tượng hóa chỉ dùng được qua `run_eval`. Cùng lúc còn 4
+món nợ: `delete_job` xóa cứng (vi phạm chuẩn HPU), thiếu `updated_at`, chưa đo tài nguyên (YC-MS-07),
+chưa có giao diện xem công cụ đang dùng (YC-MS-08). Chủ sản phẩm xác nhận sẽ khởi tạo lại dữ liệu nên
+cho phép đổi schema.
+
+**Decision:**
+1. **Tiêm, không viết lại:** `DigitizationPipeline(metadata_extractor=...)` nhận bộ trích metadata bất
+   kỳ có `extract(pdf_path) -> Dict`. `ProviderMetadataExtractor` (`core/extraction.py`) đi qua lược
+   đồ (DB) → ngữ cảnh theo `context_strategy` → định tuyến độ nhạy cảm → lớp chất lượng → truy vết.
+   Dublin Core giữ ĐÚNG 10 trang/6000 ký tự của hệ cũ, có test chốt (KT-KH).
+2. **Van lùi `USE_PROVIDER_LAYER=0`** đưa worker về đường cũ mà không cần build lại image. Đây là van
+   vận hành, không phải cờ tính năng dài hạn.
+3. **Dự phòng chéo công cụ CHỈ trong cùng chế độ triển khai.** vLLM chết → Ollama: được. Ollama chết →
+   Claude: **không bao giờ**, kể cả tài liệu Công khai. Một container chết không được phép âm thầm đổi
+   nơi dữ liệu đi qua; nếu vượt chế độ thì YC-DR-03 chỉ đúng lúc bình thường và sai đúng lúc bất
+   thường. Không cấu hình dự phòng thì KHÔNG tốn lần gọi health nào.
+4. **Xóa mềm giữ cả file:** `delete_document` đổi `status='deleted'`, PDF/OCR và metadata **giữ nguyên**
+   (bản PDF đã OCR là phần dữ liệu giá trị nhất). Xóa vật lý tách thành `purge_document` +
+   `DELETE ...?purge=true`, ghi audit TRƯỚC khi xóa. Có `restore_document` — xóa mềm mà không có đường
+   về thì chỉ là hình thức.
+5. **`needs_review` là cờ RIÊNG, không phải một `status`:** tài liệu có thể `completed` (OCR xong) mà
+   vẫn cần cán bộ kiểm tra. Gộp vào `status` sẽ khiến cán bộ tưởng tài liệu lỗi và OCR lại vô ích.
+6. **Bảng `model_calls`** ghi provider/model/latency/RAM/GPU/dự phòng mỗi lần gọi (YC-MP-06 truy vấn
+   được + YC-MS-07). Đo RAM bằng `/proc/self/status` → `getrusage` → None, KHÔNG thêm `psutil`; GPU chỉ
+   khi bật `METRICS_GPU`. Trường chưa đo được để **None, không bịa 0**.
+7. **`SensitivityViolation` không bị nuốt:** `DigitizationPipeline.process` bắt riêng và re-raise, vì
+   "hệ thống từ chối vì bảo mật" khác hẳn "tài liệu lỗi" và người vận hành phải phân biệt được.
+8. **Logic hiển thị tách khỏi `api.py`** (`core/provider_view.py`) để test được không cần FastAPI —
+   nơi này quyết định việc không lộ khóa API, phải có test.
+
+**Rationale:** (1) Lớp trừu tượng hóa chỉ có giá trị khi đường xử lý thật đi qua nó; (2) mọi thay đổi
+đều có van lùi hoặc kiểm thử chốt, nên rủi ro cho hệ đang chạy vẫn thấp; (3) hai nguyên tắc "không mất
+tài liệu" và "ràng buộc cứng độ nhạy cảm" xung đột ở nhánh lỗi — giải bằng cách: mọi lỗi khác đều xử lý
+tiếp + đánh dấu xem lại, **chỉ** vi phạm độ nhạy cảm mới được làm job thất bại.
+
+**Consequences:** ✅ Đổi `MODEL_PROVIDER` giờ đổi thật hành vi worker. ✅ Mỗi tài liệu biết được trích
+bằng công cụ/model nào (`documents.extraction_*`, `model_calls`, `audit_log`). ✅ 198 pytest + **39
+kiểm chứng trên PostgreSQL 17 thật** + 23 kiểm chứng chuỗi trích xuất ghi DB thật. ✅ UI build exit 0.
+⚠️ **Cần chạy `database/migrations/001_*.sql`** trên DB đã tồn tại — `init.sql` KHÔNG chạy lại khi
+volume đã có (đã kiểm: áp 2 lần không lỗi, dữ liệu cũ nguyên vẹn).
+⚠️ `metadata.json` xuất ra có thêm khối `extraction` (thêm khóa, không đổi khóa cũ).
+⚠️ Nợ mới: chưa có nút "phục hồi"/thùng rác trên UI (API đã có), chưa có trang duyệt tài liệu
+`needs_review` (đã có cờ + bộ lọc API).
+
+**Alternatives:** (a) Sửa thẳng `AIMetadataExtractor` để gọi provider — trộn hai trách nhiệm, mất
+đường lùi, bị loại; (b) dự phòng vượt chế độ khi tài liệu Công khai — làm ràng buộc cứng thành "mềm
+khi có sự cố", bị loại; (c) xóa mềm nhưng vẫn xóa file — phục hồi ra tài liệu trỏ vào hư không, bị loại;
+(d) thêm `psutil` để đo RAM — thêm phụ thuộc vào đường air-gapped (ADR-006), bị loại.
+
+---
+
 ## ADR-007: Bảng đăng ký nhiều công cụ mô hình — tách `name` (công cụ) khỏi `deployment` (chế độ)
 **Status:** Accepted · **Date:** 2026-07-25 · **Decided by:** Đội phát triển
 

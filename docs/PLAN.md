@@ -4,64 +4,87 @@
 > **Phạm vi hẹp: chỉ việc của sprint hiện tại.** Tiến độ tổng thể xem `docs/STATUS.md`; lộ trình dài hạn
 > xem `docs/ROADMAP.md`; quyết định kiến trúc ghi ở `docs/DECISIONS.md`.
 
-**Cập nhật:** 25/07/2026 · **Giai đoạn:** GĐ 0 (hạn hồ sơ **30/7/2026** — còn 5 ngày)
+**Cập nhật:** 26/07/2026 · **Giai đoạn:** GĐ 0 → GĐ 1 (hạn hồ sơ **30/7/2026** — còn 4 ngày)
 
 ---
 
-## Sprint hiện tại: 0A/0B mở rộng — đa công cụ mô hình ✅ ĐÃ XONG
+## Sprint vừa xong: đa công cụ mô hình (ADR-007) ✅
 
-**Mục tiêu:** gỡ nốt phần khóa nhà cung cấp còn sót trong lớp trừu tượng hóa, để "không khóa vào một
-nhà cung cấp" là điều kiểm chứng được chứ không phải lời tuyên bố.
+| Việc | Kiểm chứng |
+|---|---|
+| Tách `name` (công cụ) khỏi `deployment` (chế độ) | 213 pytest |
+| `TextGenProvider`: thêm công cụ mới = hiện thực một hàm `_complete` | test dựng công cụ mới bằng 5 dòng |
+| Bảng đăng ký 18 công cụ (6 tại chỗ / 12 đám mây, có Kimi + Qwen) | `run_eval --list-providers` |
+| vLLM + llama.cpp vào compose (profile riêng, không mở cổng) | `docker compose config` |
+| Hai chốt an toàn cho YC-DR-03 | test từ chối cấu hình rò rỉ |
 
-| Việc | Trạng thái | Kiểm chứng |
-|---|---|---|
-| Tách `name` (công cụ) khỏi `deployment` (chế độ) — ADR-007 | ✅ | 167 pytest |
-| `TextGenProvider`: thêm công cụ mới = hiện thực một hàm `_complete` | ✅ | test dựng công cụ mới bằng 5 dòng |
-| `OpenAICompatProvider` + `AzureOpenAIProvider` + `GeminiProvider` | ✅ | 95 test tầng provider |
-| Bảng đăng ký 18 công cụ (6 tại chỗ / 12 đám mây) | ✅ | `run_eval --list-providers` |
-| vLLM + llama.cpp vào compose (profile riêng, không mở cổng) | ✅ | `docker compose config` |
-| Hai chốt an toàn cho YC-DR-03 (điểm cuối nội bộ + `LOCAL_PROVIDER`) | ✅ | test từ chối cấu hình rò rỉ |
-| Kimi (Moonshot) + Qwen (DashScope) | ✅ | mỗi cái một dòng registry |
+## Sprint vừa xong: nối pipeline + trả nợ chuẩn HPU (ADR-008) ✅
 
-**DoD đã đạt:** đổi công cụ chỉ bằng biến môi trường; không hồi quy đường Claude (KT-KH); mọi test chạy
-được khi ngắt mạng; tài liệu + ADR cập nhật.
+| Việc | Kiểm chứng |
+|---|---|
+| Worker trích metadata **qua lớp provider** (định tuyến + tin cậy + nhật ký) | 31 pytest + 23 kiểm chứng PG thật |
+| Van lùi `USE_PROVIDER_LAYER=0` về đường cũ | pytest |
+| Dự phòng chéo công cụ **chỉ trong cùng chế độ** | pytest (gồm ca từ chối vượt chế độ) |
+| **Xóa mềm** giữ cả file + `restore` + `purge` tách riêng có audit | 39 kiểm chứng PG thật |
+| `updated_at` + trigger cho `documents`/`metadata_fields` | PG thật |
+| **YC-MS-07** đo thời gian/RAM/GPU + bảng `model_calls` | PG thật |
+| **YC-MS-08** trang `/cong-cu` + `/api/v2/providers` | UI build exit 0 + 15 pytest |
+| `/bao-cao` dùng API thật, bỏ dữ liệu mẫu | UI build exit 0 |
+| Migration 001 cho DB đã tồn tại | áp 2 lần không lỗi, dữ liệu cũ nguyên vẹn |
+
+**Nợ kỹ thuật đã trả:** `delete_job` hard delete → xóa mềm · thiếu `updated_at` · `utcnow()` deprecated ·
+đoạn code chết trong `update_metadata` · sidebar toàn `href="#"` · `redis` import cứng làm worker không
+test được · `src/core/responses.py` trong tài liệu là đường dẫn không tồn tại.
 
 ---
 
-## Sprint kế tiếp (đề xuất): số liệu thật cho hồ sơ ⏳ CẦN MÁY CHỦ
+## Đường găng tới hạn 30/7 ⏳ CẦN MÁY CHỦ
 
-Đây là **đường găng** tới hạn 30/7, và phần lớn nằm ở môi trường thật chứ không ở code.
+Phần lớn KHÔNG phải việc code.
 
 | # | Việc | Ai | Chặn bởi |
 |---|---|---|---|
-| 1 | Deploy lên server theo `docs/DEPLOY.md` | 👤 người phụ trách | — |
+| 1 | Deploy theo `docs/DEPLOY.md` — **chạy migration 001 trước** | 👤 người phụ trách | — |
 | 2 | Tải model đã rà giấy phép, bật một công cụ tại chỗ | 👤 | (1) + `docs/LICENSES.md` mục 1 |
 | 3 | Chuẩn bị BD-01 (30–50 công văn) + đáp án chuẩn | 👤 | — |
-| 4 | Chạy `run_eval --providers claude,ollama` → bảng so sánh 2 chế độ | 👤 chạy, 🤖 đọc | (2)(3) |
+| 4 | `run_eval --providers claude,ollama` → bảng so sánh 2 chế độ | 👤 chạy, 🤖 đọc | (2)(3) |
 | 5 | **Quay video ngắt Internet vẫn xử lý trọn 1 tài liệu** (KT-BM-01) | 👤 | (2) |
 | 6 | Quét cổng từ ngoài chứng minh không mở cổng model (KT-BM-03) | 👤 | (1) |
 | 7 | Hoàn tất bảng giấy phép + ý kiến pháp lý (YC-PL-04/06) | 👤 + pháp chế | — |
 
-> ⚠️ Việc 5 và 6 là **bằng chứng cốt lõi** cho lập luận bảo mật của hồ sơ — không thay thế được bằng
-> mô tả kỹ thuật. Việc 7 phải xong **trước khi ký Bản cam kết**.
+> ⚠️ Việc 5 và 6 là **bằng chứng cốt lõi** cho lập luận bảo mật — không thay được bằng mô tả kỹ thuật.
+> Việc 7 phải xong **trước khi ký Bản cam kết**.
 >
-> 💡 Cho việc 5, `llamacpp` là lựa chọn thuyết phục nhất: model là file `.gguf` đặt sẵn, container không
-> gọi ra ngoài lúc khởi động. `vllm` cần mạng ở lần đầu để tải model.
+> 💡 Việc 5: dùng `llamacpp` (model là file `.gguf` đặt sẵn, container không gọi ra ngoài lúc khởi động).
+
+### Kiểm tra sau khi deploy (thứ tự này)
+```bash
+# 1. Migration (BẮT BUỘC nếu volume postgres_data đã tồn tại)
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d library_digitization \
+    < database/migrations/001_provider_layer_and_soft_delete.sql
+# 2. Công cụ đã sẵn sàng chưa
+docker compose exec api python -m scripts.eval.run_eval --health
+# 3. Log worker phải có dòng "Lớp provider BẬT — công cụ ..."
+docker compose logs worker | grep "Lớp provider"
+# 4. Xử lý 1 tài liệu thử → mở /cong-cu xem có lượt gọi model, và:
+docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
+    -c "SELECT provider, deployment, latency_ms, rss_mb, n_fields FROM model_calls ORDER BY id DESC LIMIT 5;"
+```
 
 ---
 
-## Việc code còn nợ (chưa xếp sprint — xem `docs/STATUS.md` mục 3)
+## Việc code còn nợ (chưa xếp sprint)
 
-Không cái nào chặn hạn 30/7, nhưng cần xếp sớm sau đó:
-
-- **GĐ1 — wire `worker.py`** dùng `router.get_routed_provider` + `quality` + `audit` thay cho gọi
-  `AIMetadataExtractor` trực tiếp. Phải có regression (KT-KH), tách commit nhỏ. *(ADR-004 cố ý hoãn)*
-- **Chính sách dự phòng chéo công cụ** (vLLM sập → Ollama?) — cần quyết định nghiệp vụ trước khi code.
-- **YC-MS-07** đo tài nguyên (thời gian/RAM/GPU) mỗi lần gọi model — chưa có.
-- **YC-MS-08** giao diện quản trị hiện công cụ/model + tình trạng — hiện chỉ có ở mức CLI.
-- **Chuẩn HPU còn nợ:** `delete_job` đang **hard delete** (vi phạm quy tắc soft delete), thiếu
-  `updated_at` cho `documents`.
-- **Nối UI ↔ API thật** — `/bao-cao` và `/luoc-do` vẫn dùng dữ liệu mẫu.
+- **UI:** trang duyệt tài liệu `needs_review` (tô màu trường điểm thấp bằng `ConfidenceBadge`) và
+  thùng rác/phục hồi. API đã sẵn: `GET /api/v2/jobs?needs_review=true`,
+  `POST /api/v2/jobs/{id}/restore`, `DELETE /api/v2/jobs/{id}?purge=true`.
+- **`/luoc-do`** vẫn dùng dữ liệu mẫu — nối vào `/api/v2/schemas`.
+- **GĐ3 RAG:** bật `pgvector`; dùng `embed()` của provider tại chỗ với model embedding chuyên dụng
+  (`<TÊN>_EMBED_MODEL`, vd `bge-m3` — YC-MS-05); truy hồi kết hợp; dẫn nguồn bắt buộc.
+- **`metadata_history`** hiện ít được ghi vì `update_metadata` dùng DELETE+INSERT nên trigger
+  `AFTER UPDATE` không kích hoạt (đã ghi chú trong `init.sql`). Muốn có lịch sử đầy đủ thì chuyển sang
+  câu `UPDATE`, hoặc ghi lịch sử ở tầng ứng dụng.
+- **Chuẩn hóa `NEXT_PUBLIC` build-args** cho UI image (xem `docs/DEPLOY.md` mục 4).
 
 ## Định nghĩa "Hoàn thành" (mọi sprint)
 - [ ] Không phá endpoint/UI đang chạy (KT-KH pass)

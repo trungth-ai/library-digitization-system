@@ -126,6 +126,17 @@ services:
       - OPENAI_COMPAT_MODEL=${OPENAI_COMPAT_MODEL:-}
       - OPENAI_COMPAT_API_KEY=${OPENAI_COMPAT_API_KEY:-}
       - OPENAI_COMPAT_DEPLOYMENT=${OPENAI_COMPAT_DEPLOYMENT:-cloud}
+      # -- Pipeline trích xuất qua lớp provider (ADR-008) --
+      # USE_PROVIDER_LAYER=0 là van lùi về đường cũ, không cần build lại image
+      - USE_PROVIDER_LAYER=${USE_PROVIDER_LAYER:-1}
+      # Dự phòng chỉ trong cùng chế độ — KHÔNG bao giờ tại chỗ → đám mây
+      - LOCAL_FALLBACK_PROVIDERS=${LOCAL_FALLBACK_PROVIDERS:-}
+      - CLOUD_FALLBACK_PROVIDERS=${CLOUD_FALLBACK_PROVIDERS:-}
+      - LOW_CONFIDENCE_THRESHOLD=${LOW_CONFIDENCE_THRESHOLD:-0.5}
+      - CONTEXT_FULL_MAX_PAGES=${CONTEXT_FULL_MAX_PAGES:-30}
+      - CONTEXT_FULL_MAX_CHARS=${CONTEXT_FULL_MAX_CHARS:-20000}
+      - METRICS_GPU=${METRICS_GPU:-0}
+      - ALLOW_PUBLIC_LOCAL_ENDPOINT=${ALLOW_PUBLIC_LOCAL_ENDPOINT:-}
     volumes:
       - ./scripts:/app/scripts
       - ./configs:/app/configs
@@ -272,6 +283,39 @@ services:
       - REDIS_HOST=redis
       - DSPACE_API_URL=${DSPACE_API_URL}
       - DSPACE_API_TOKEN=${DSPACE_API_TOKEN}
+      # ⚠️ PHẢI GIỮ ĐỒNG BỘ với service `worker`: endpoint /api/v2/providers đọc cấu hình từ CHÍNH
+      # container này để hiển thị trên trang quản trị (YC-MS-08). Lệch nhau thì trang quản trị sẽ
+      # báo công cụ khác với công cụ worker đang thật sự dùng — sai lệch nguy hiểm hơn là không có.
+      - MODEL_PROVIDER=${MODEL_PROVIDER:-cloud}
+      - CLOUD_PROVIDER=${CLOUD_PROVIDER:-claude}
+      - LOCAL_PROVIDER=${LOCAL_PROVIDER:-ollama}
+      - OLLAMA_URL=http://ollama:11434
+      - LOCAL_MODEL=${LOCAL_MODEL:-qwen2.5:7b}
+      - VLLM_BASE_URL=${VLLM_BASE_URL:-http://vllm:8000/v1}
+      - VLLM_MODEL=${VLLM_MODEL:-}
+      - LLAMACPP_BASE_URL=${LLAMACPP_BASE_URL:-http://llamacpp:8080/v1}
+      - LLAMACPP_MODEL=${LLAMACPP_MODEL:-local-model}
+      - CLOUD_MODEL=${CLOUD_MODEL:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - TOGETHER_API_KEY=${TOGETHER_API_KEY:-}
+      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY:-}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
+      - AZURE_OPENAI_BASE_URL=${AZURE_OPENAI_BASE_URL:-}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
+      - AZURE_OPENAI_MODEL=${AZURE_OPENAI_MODEL:-}
+      - OPENAI_COMPAT_BASE_URL=${OPENAI_COMPAT_BASE_URL:-}
+      - OPENAI_COMPAT_MODEL=${OPENAI_COMPAT_MODEL:-}
+      - OPENAI_COMPAT_API_KEY=${OPENAI_COMPAT_API_KEY:-}
+      - OPENAI_COMPAT_DEPLOYMENT=${OPENAI_COMPAT_DEPLOYMENT:-cloud}
+      - USE_PROVIDER_LAYER=${USE_PROVIDER_LAYER:-1}
+      - LOCAL_FALLBACK_PROVIDERS=${LOCAL_FALLBACK_PROVIDERS:-}
+      - CLOUD_FALLBACK_PROVIDERS=${CLOUD_FALLBACK_PROVIDERS:-}
+      - ALLOW_PUBLIC_LOCAL_ENDPOINT=${ALLOW_PUBLIC_LOCAL_ENDPOINT:-}
     volumes:
       - ./api:/app/api
       - ./scripts:/app/scripts
@@ -301,7 +345,12 @@ services:
       - NEXT_PUBLIC_DSPACE_URL=${DSPACE_BASE_URL}
       
       # OCR API config
+      # NEXT_PUBLIC_* bị nhúng lúc BUILD và lộ ra client → giá trị runtime này chỉ có tác dụng
+      # phía server (xem docs/DEPLOY.md mục 4).
       - NEXT_PUBLIC_OCR_API_URL=http://api:8000
+      # Đường gọi TỪ SERVER (server component / route handler) — đi mạng nội bộ Docker, tường minh
+      # và không phụ thuộc giá trị công khai ở trên.
+      - OCR_API_INTERNAL_URL=http://api:8000
       
       # Claude API (for metadata extraction)
       - CLAUDE_API_KEY=${CLAUDE_API_KEY}

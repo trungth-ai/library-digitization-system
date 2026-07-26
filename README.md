@@ -26,7 +26,7 @@ Chạy lẻ khi phát triển:
 uvicorn scripts.api:app --reload --port 8000
 python -m scripts.worker
 cd ui && npm run dev
-python -m pytest tests/ -q          # 167 test, không cần DB/mạng
+python -m pytest tests/ -q          # 213 test, không cần DB/mạng
 ```
 
 ## Chọn công cụ mô hình

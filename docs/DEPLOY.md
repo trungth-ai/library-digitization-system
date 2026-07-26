@@ -38,8 +38,30 @@ curl http://localhost:8000/health       # API: {"status":"ok",...}
 curl http://localhost:3000/api/health   # UI:  {"status":"ok","service":"ui"}
 ```
 - PostgreSQL tự chạy `database/init.sql` khi khởi tạo volume LẦN ĐẦU (tạo bảng documents, job_statuses,
-  metadata_fields, audit_log, extraction_schemas... + seed lookup).
-- Nếu volume `postgres_data` đã tồn tại từ trước, init.sql KHÔNG chạy lại → phải migrate thủ công.
+  metadata_fields, audit_log, extraction_schemas, model_calls... + seed lookup).
+- Nếu volume `postgres_data` đã tồn tại từ trước, init.sql KHÔNG chạy lại → **phải chạy migration**.
+
+### ⚠️ Migration BẮT BUỘC cho DB đã tồn tại
+
+Bản nâng cấp này thêm cột/bảng mới (`documents.updated_at`, `needs_review`, `extraction_*`,
+`metadata_fields.confidence`, bảng `model_calls`, trạng thái `deleted`). Trên máy chủ đã chạy, volume
+`postgres_data` đã có → `init.sql` không chạy lại → code mới sẽ lỗi *"column does not exist"* nếu bỏ
+qua bước này:
+
+```bash
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d library_digitization \
+    < database/migrations/001_provider_layer_and_soft_delete.sql
+```
+
+Migration idempotent (chạy lại nhiều lần không sao) và không xóa dữ liệu — đã kiểm chứng: áp 2 lần
+liên tiếp không lỗi, tài liệu + metadata cũ nguyên vẹn, `updated_at` được điền theo `created_at`.
+
+Kiểm tra sau khi chạy:
+```bash
+docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization -c \
+  "SELECT count(*) FROM information_schema.columns WHERE table_name='documents' AND column_name IN ('updated_at','needs_review');"
+# Kỳ vọng: 2
+```
 
 ## 4. ⚠️ Lưu ý build-time cho UI (NEXT_PUBLIC_*)
 Biến `NEXT_PUBLIC_*` được nhúng vào bundle **lúc build**, không phải runtime. `docker-compose.yml` hiện
@@ -112,12 +134,17 @@ docker compose exec postgres pg_dump -U "$POSTGRES_USER" -F c library_digitizati
 ```
 
 ## 7. Trạng thái tích hợp
-- ✅ Chạy được: postgres + redis + api (gồm endpoints reports/audit/schemas) + worker (pipeline hiện tại) + ui.
+- ✅ Chạy được: postgres + redis + api (gồm endpoints reports/audit/schemas/providers) + worker + ui.
 - ✅ Lớp provider đa công cụ (18 lựa chọn) — đổi bằng cấu hình, không sửa mã.
-- ⏳ Chưa wire: worker CHƯA dùng router+quality+audit (vẫn trích như cũ) — sẽ tích hợp có regression (ADR-004).
-  **Hệ quả khi deploy:** đổi `MODEL_PROVIDER` hiện chưa đổi hành vi của worker đang chạy; muốn đo thì
-  dùng `run_eval` (mục 5) cho tới khi wire xong.
+- ✅ **Worker đã dùng lớp provider** (ADR-008): định tuyến theo độ nhạy cảm + điểm tin cậy + nhật ký
+  gọi model. Đổi `MODEL_PROVIDER`/`LOCAL_PROVIDER` giờ đổi thật hành vi xử lý tài liệu.
+  Van lùi: `USE_PROVIDER_LAYER=0` → về đường cũ bám Claude, không cần build lại image.
+- ✅ Xóa mềm: nút xóa chỉ đặt `status='deleted'`, giữ file + metadata. Xóa vật lý phải gọi rõ
+  `DELETE /api/v2/jobs/{id}?purge=true`.
+- ✅ Trang **Công cụ mô hình** (`/cong-cu`) hiện công cụ/model đang dùng + tình trạng + số liệu tài nguyên.
 - ⏳ RAG (GĐ3): cần model embedding tại chỗ (vd `bge-m3`) + `pgvector` (chưa bật).
+- ⏳ UI chưa có: thùng rác/nút phục hồi, trang duyệt riêng tài liệu `needs_review` (API đã sẵn:
+  `GET /api/v2/jobs?needs_review=true`, `POST /api/v2/jobs/{id}/restore`).
 
 Xem thêm: `docs/STATUS.md` (tiến độ), `docs/PLAN.md` (sprint đang chạy),
 `docs/LOCAL_MODE.md` (chọn công cụ + chọn model), `docs/EVAL.md` (đo số liệu).

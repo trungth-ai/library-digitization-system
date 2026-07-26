@@ -1,6 +1,6 @@
 # DocuFlow HP — Trạng thái nâng cấp & Bàn giao
 
-> Cập nhật: 25/07/2026. Repo: `github.com/trungth-ai/library-digitization-system`.
+> Cập nhật: 26/07/2026. Repo: `github.com/trungth-ai/library-digitization-system`.
 > Số commit mới nhất: xem `git log --oneline`. Tài liệu này để kỹ sư tiếp quản (YC-VH-01) nắm nhanh:
 > đã làm gì, cách kiểm chứng, còn gì — và **bắt đầu lần nâng cấp tiếp theo từ mục 4**.
 
@@ -13,6 +13,12 @@
 | 0 | Model serving tại chỗ: Ollama + **vLLM** + **llama.cpp** (3 profile riêng) | `docker-compose.yml` | `docs/LOCAL_MODE.md` |
 | 0 | Harness đo đạc nhiều công cụ (`--providers claude,ollama,vllm`) | `scripts/eval/` | pytest + smoke CLI |
 | 1 | Định tuyến độ nhạy cảm (ràng buộc cứng) | `scripts/providers/router.py` | pytest |
+| 1 | **Worker dùng lớp provider** (ADR-008) — định tuyến + tin cậy + nhật ký gọi model; van lùi `USE_PROVIDER_LAYER=0` | `scripts/core/extraction.py`, `worker.py` | 31 pytest + PG thật |
+| 1 | **Dự phòng chéo công cụ** cùng chế độ (không bao giờ tại chỗ → đám mây) | `scripts/providers/fallback.py` | pytest |
+| 1 | **YC-MS-07** đo tài nguyên (thời gian/RAM/GPU) + bảng `model_calls` | `scripts/core/metrics.py`, `db.py` | PG thật |
+| 1 | **YC-MS-08** trang quản trị công cụ/model + tình trạng | `/cong-cu`, `/api/v2/providers` | UI build + pytest |
+| — | **Chuẩn HPU: xóa mềm** (giữ file), `updated_at` + trigger, `purge` tách riêng có audit | `db.py`, `init.sql`, migration 001 | 39 kiểm chứng PG thật |
+| — | Nối `/bao-cao` vào API thật (bỏ dữ liệu mẫu) | `ui/src/app/bao-cao` | UI build exit 0 |
 | 1 | Điểm tin cậy + chống ảo giác | `scripts/core/quality.py` | pytest |
 | 2 | Audit log bất biến | `scripts/core/audit.py` + bảng `audit_log` | verify PostgreSQL |
 | 2 | Báo cáo (chế độ / tỉ lệ sửa / throughput) | `scripts/core/reports.py` | verify psycopg2 + PG |
@@ -22,23 +28,27 @@
 | 3 | Chia đoạn theo cấu trúc (RAG) | `scripts/core/chunking.py` | pytest |
 | — | **Deploy hardening** (font system, /api/health, .dockerignore, healthcheck, next.config, install.sh) | nhiều | **UI build exit 0 (không TLS flag)** |
 
-**167 pytest PASS · 5 lần verify PostgreSQL 17 · 1 verify UI preview · UI build sạch.** Không hồi quy, không đụng pipeline production.
+**213 pytest PASS · 62 kiểm chứng trên PostgreSQL 17 thật (schema mới + schema cũ đã migrate) · UI build exit 0.**
+Không hồi quy đường Claude (KT-KH có test chốt). ⚠️ Lần này **CÓ thay đổi pipeline** (ADR-008) —
+van lùi `USE_PROVIDER_LAYER=0`; DB đã tồn tại **phải chạy `database/migrations/001_*.sql`**.
 
 ## 2. Cách kiểm chứng
 ```bash
-python -m pytest tests/ -q                 # 167 passed (không cần DB/mạng)
+python -m pytest tests/ -q                 # 213 passed (không cần DB/mạng)
 python -m scripts.eval.run_eval --list-providers   # bảng công cụ mô hình khả dụng
 python -m scripts.eval.run_eval --health           # kiểm tra sẵn sàng (YC-MS-04)
 cd ui && npm run build                     # UI build (KHÔNG cần TLS flag sau khi bỏ Google font)
-# Verify DB (Windows, không cần Docker): initdb → Start-Process postgres.exe → psql -f database/init.sql
-#   → psql/python verify (mẫu script ở scratchpad các phiên trước)
+# Verify DB thật (Windows, không cần Docker):
+#   initdb -D <dir> -U postgres --auth-local=trust && pg_ctl -D <dir> -o "-p 55432" start
+#   createdb -p 55432 -U postgres library_digitization
+#   psql -p 55432 -U postgres -d library_digitization -f database/init.sql
+#   → rồi chạy kiểm chứng tầng db.py + chuỗi trích xuất (xem docs/DECISIONS.md ADR-008)
 ```
 
 ## 3. Còn lại — cần MÔI TRƯỜNG THẬT
 | Việc | Cần gì | Ai |
 |---|---|---|
-| Wire router+quality+audit vào `worker` (chế độ tại chỗ dùng trong vận hành) | server (redis+postgres) | 🤖 code, verify server |
-| Nối UI với API thật + trang upload/duyệt/jobs theo design HPU | backend chạy + trình duyệt | 🤖 verify preview |
+| Trang thùng rác/phục hồi + trang duyệt tài liệu `needs_review` trên UI (API đã có) | trình duyệt | 🤖 |
 | YC-RG embedding + tra cứu (GĐ3) | model embedding tại chỗ (vd `bge-m3`) + `pgvector` | 🤖 structure, số liệu cần env |
 | Số liệu đo GĐ0 (KT-CX/KT-HN) cho hồ sơ | server + ≥1 công cụ tại chỗ + BD-01 + đáp án chuẩn | 👤 bạn |
 | **Chọn công cụ tại chỗ cho GĐ1 bằng số liệu** (ollama vs vllm vs llamacpp) | server + `run_eval --providers` | 👤 bạn chạy, 🤖 đọc kết quả |
@@ -48,8 +58,11 @@ cd ui && npm run build                     # UI build (KHÔNG cần TLS flag sau
 Thứ tự đề xuất (bắt đầu từ đây):
 
 1. **[Ưu tiên hồ sơ]** Deploy lên server theo `docs/DEPLOY.md` → chạy `docs/EVAL.md` lấy bảng so sánh 2 chế độ; rà giấy phép (`docs/LICENSES.md`); quay video ngắt mạng.
-2. **Tích hợp pipeline (GĐ1 vận hành):** wire `worker.py` gọi `router.get_routed_provider` + `quality.extract_with_quality` + `audit.log_action` thay cho `AIMetadataExtractor` trực tiếp. LÀM CÓ regression (KT-KH) + tách commit nhỏ. Định tuyến theo `schema.sensitivity` (mặc định an toàn).
-3. **Nối UI ↔ API:** thay mock ở `/bao-cao`, `/luoc-do` bằng gọi endpoints `/api/v2/reports/*`, `/api/v2/schemas`, `/api/v2/audit`. Thêm màn upload + duyệt metadata (tô màu confidence dùng `ConfidenceBadge`).
+2. ~~Tích hợp pipeline~~ **ĐÃ XONG** (ADR-008). Khi deploy: chạy migration 001 trước, theo dõi log
+   worker xem dòng "Lớp provider BẬT", rồi xử lý 1 tài liệu thử và kiểm `/cong-cu` + `model_calls`.
+3. **UI còn nợ:** trang duyệt tài liệu `needs_review` (dùng `ConfidenceBadge` tô màu trường điểm thấp)
+   + thùng rác/phục hồi. API đã sẵn: `GET /api/v2/jobs?needs_review=true`,
+   `POST /api/v2/jobs/{id}/restore`. `/luoc-do` vẫn còn dữ liệu mẫu.
 4. **GĐ3 RAG:** bật `pgvector`; `embed()` của provider tại chỗ + bảng vector; truy hồi kết hợp (vector + toàn văn); dẫn nguồn bắt buộc (dùng offset từ `chunking.py`); phân quyền kết quả. Đặt `<TÊN>_EMBED_MODEL` để dùng model embedding chuyên dụng thay vì model sinh văn bản (YC-MS-05).
 5. **Chuẩn hóa NEXT_PUBLIC build-args** cho UI image (xem `docs/DEPLOY.md` mục 4) khi deploy thật.
 
@@ -60,7 +73,7 @@ Thứ tự đề xuất (bắt đầu từ đây):
 - `docs/PRODUCT.md` — mô tả sản phẩm + kiến trúc hai chế độ + RAG.
 - `docs/REQUIREMENTS.md` — bảng yêu cầu YC-* + chuẩn HPU.
 - `docs/ROADMAP.md` — lộ trình chia sprint (GĐ0-3).
-- `docs/DECISIONS.md` — ADR-001..007 (quyết định kiến trúc).
+- `docs/DECISIONS.md` — ADR-001..008 (quyết định kiến trúc).
 - `docs/DEPLOY.md` — hướng dẫn triển khai + checklist.
 - `docs/LOCAL_MODE.md` — chọn/bật công cụ mô hình (Ollama, vLLM, llama.cpp...) + kiểm chứng ngắt mạng.
 - `docs/EVAL.md` — đo số liệu 2 chế độ cho hồ sơ.
