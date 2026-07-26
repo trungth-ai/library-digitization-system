@@ -40,6 +40,7 @@ export default function LuocDoPage() {
   return (
     <PageShell
       title="Quản trị lược đồ trích xuất"
+      activeKey="schemas"
       action={
         <button className="rounded-lg bg-hpu-primary hover:bg-hpu-primary-hover text-white text-sm font-medium px-4 py-2">
           + Tạo lược đồ mới

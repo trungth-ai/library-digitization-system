@@ -1,140 +1,184 @@
-// Trang DEMO báo cáo (dữ liệu mẫu) — minh họa design system HPU + các báo cáo GĐ2.
-// Dùng để xem/kiểm chứng giao diện; khi tích hợp sẽ thay mock bằng API /reports.
+// Trang BÁO CÁO & THỐNG KÊ — dữ liệu THẬT từ FastAPI (trước đây là dữ liệu mẫu).
+// Server component: lấy dữ liệu phía server nên không cần NEXT_PUBLIC_* lúc build (xem docs/DEPLOY.md mục 4).
+//
+// Nguyên tắc: KHÔNG hiển thị con số bịa. Backend chưa chạy → hiện lý do; chưa có dữ liệu → nói rõ
+// "chưa có", không vẽ bảng rỗng trông như đã đo.
 
-import { PageShell, StatCard } from "@/components/hpu/HpuLayout";
-import { StatusBadge, ConfidenceBadge } from "@/components/hpu/Badges";
+import { ErrorBox, PageShell, StatCard } from "@/components/hpu/HpuLayout";
+import { fetchApi } from "@/lib/api";
 import { formatNumber, formatPercent } from "@/lib/format";
 
-// ---- Dữ liệu mẫu (mock) ----
-const STATS = { total: 1284, completed: 1102, processing: 47, failed: 12 };
+export const dynamic = "force-dynamic";
 
-// Báo cáo theo CHẾ ĐỘ xử lý (YC-DR-06), không theo công cụ: mỗi chế độ có thể do nhiều công cụ
-// đảm nhiệm (đám mây: Claude/OpenAI/Gemini...; tại chỗ: Ollama/vLLM/llama.cpp...) — xem ADR-007.
-const BY_MODE = [
-  { mode: "Đám mây", code: "cloud", docs: 812, ratio: 0.66 },
-  { mode: "Tại chỗ", code: "local", docs: 418, ratio: 0.34 },
-];
-
-const FIELD_EDITS = [
-  { field: "dc.title", edits: 143, docs: 121 },
-  { field: "dc.contributor.author", edits: 98, docs: 74 },
-  { field: "dc.date.issued", edits: 56, docs: 52 },
-  { field: "dc.subject", edits: 40, docs: 33 },
-];
-
-// Demo duyệt metadata 1 công văn — có trường điểm thấp (nghi bịa)
-const REVIEW = {
-  filename: "CV_123_QD-DHQLCN.pdf",
-  mode: "local",
-  fields: [
-    { key: "so_hieu", value: "123/QĐ-ĐHQLCN", confidence: 0.95 },
-    { key: "co_quan_ban_hanh", value: "Trường ĐH Quản lý và Công nghệ Hải Phòng", confidence: 0.9 },
-    { key: "ngay_ban_hanh", value: "15/03/2024", confidence: 0.72 },
-    { key: "nguoi_ky", value: "TS. Nguyễn Văn A", confidence: 0.45 },
-  ],
-};
-
-function Card({ title, children }) {
+function Card({ title, subtitle, children }) {
   return (
     <section className="bg-white rounded-xl border border-gray-200 p-4">
-      <h2 className="text-base font-semibold text-gray-800 mb-3">{title}</h2>
-      {children}
+      <h2 className="text-base font-semibold text-gray-800">{title}</h2>
+      {subtitle && <p className="text-xs text-gray-500 mt-0.5">{subtitle}</p>}
+      <div className="mt-3">{children}</div>
     </section>
   );
 }
 
-export default function BaoCaoPage() {
+function Empty({ children }) {
+  return <p className="text-sm text-gray-500">{children}</p>;
+}
+
+const MODE_LABEL = { cloud: "Đám mây", local: "Tại chỗ" };
+
+export default async function BaoCaoPage() {
+  // Gọi song song — trang không phải chờ tuần tự 4 lượt
+  const [stats, byMode, fieldEdits, throughput] = await Promise.all([
+    fetchApi("/api/v2/stats"),
+    fetchApi("/api/v2/reports/by-mode"),
+    fetchApi("/api/v2/reports/field-edits"),
+    fetchApi("/api/v2/reports/throughput"),
+  ]);
+
+  const ocr = stats.data?.ocr || {};
+  const modeRows = byMode.data || [];
+  const editRows = fieldEdits.data || [];
+  const dayRows = (throughput.data || []).slice(0, 7); // 7 ngày gần nhất là đủ để thấy xu hướng
+
+  const firstError = [stats, byMode, fieldEdits, throughput].find((r) => !r.ok);
+  const totalByMode = modeRows.reduce((sum, r) => sum + Number(r.so_tai_lieu || 0), 0);
+
   return (
     <PageShell
       title="Báo cáo & Thống kê"
+      activeKey="reports"
       action={
-        <button className="rounded-lg bg-hpu-primary hover:bg-hpu-primary-hover text-white text-sm font-medium px-4 py-2">
-          Xuất Excel
-        </button>
+        <a
+          href="/cong-cu"
+          className="rounded-lg border border-gray-300 bg-white hover:bg-gray-50 text-sm font-medium px-4 py-2 text-gray-700"
+        >
+          Công cụ mô hình →
+        </a>
       }
     >
-      {/* Stat cards */}
+      {firstError && <ErrorBox message={firstError.error} />}
+
+      {/* Tổng quan trạng thái OCR */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-5">
-        <StatCard label="Tổng tài liệu" value={STATS.total} tone="primary" />
-        <StatCard label="Hoàn thành" value={STATS.completed} tone="success" />
-        <StatCard label="Đang xử lý" value={STATS.processing} tone="warning" />
-        <StatCard label="Thất bại" value={STATS.failed} tone="danger" />
+        <StatCard label="Tổng tài liệu" value={ocr.total ?? 0} tone="primary" />
+        <StatCard label="Hoàn thành" value={ocr.completed ?? 0} tone="success" />
+        <StatCard
+          label="Đang xử lý"
+          value={(ocr.queued ?? 0) + (ocr.ocr ?? 0) + (ocr.extracting ?? 0) + (ocr.exporting ?? 0)}
+          tone="warning"
+        />
+        <StatCard label="Thất bại" value={ocr.failed ?? 0} tone="danger" />
       </div>
 
       <div className="grid lg:grid-cols-2 gap-4 mb-5">
-        {/* YC-DR-06: theo chế độ */}
-        <Card title="Xử lý theo chế độ (YC-DR-06)">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-gray-500 border-b border-gray-100">
-                <th className="py-2 font-medium">Chế độ</th>
-                <th className="py-2 font-medium text-right">Số tài liệu</th>
-                <th className="py-2 font-medium text-right">Tỉ lệ</th>
-              </tr>
-            </thead>
-            <tbody>
-              {BY_MODE.map((r) => (
-                <tr key={r.code} className="border-b border-gray-50">
-                  <td className="py-2 text-gray-800">{r.mode}</td>
-                  <td className="py-2 text-right tabular-nums">{formatNumber(r.docs)}</td>
-                  <td className="py-2 text-right tabular-nums">{formatPercent(r.ratio)}</td>
+        {/* YC-DR-06: theo chế độ xử lý */}
+        <Card
+          title="Xử lý theo chế độ (YC-DR-06)"
+          subtitle="Mỗi chế độ có thể do nhiều công cụ đảm nhiệm — xem trang Công cụ mô hình."
+        >
+          {modeRows.length ? (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-gray-500 border-b border-gray-100">
+                  <th className="py-2 font-medium">Chế độ</th>
+                  <th className="py-2 font-medium text-right">Số tài liệu</th>
+                  <th className="py-2 font-medium text-right">Tỉ lệ</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {modeRows.map((r) => (
+                  <tr key={r.mode} className="border-b border-gray-50">
+                    <td className="py-2 text-gray-800">{MODE_LABEL[r.mode] || r.mode}</td>
+                    <td className="py-2 text-right tabular-nums">
+                      {formatNumber(Number(r.so_tai_lieu || 0))}
+                    </td>
+                    <td className="py-2 text-right tabular-nums">
+                      {totalByMode ? formatPercent(Number(r.so_tai_lieu || 0) / totalByMode) : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <Empty>
+              Chưa có tài liệu nào được xử lý qua lớp provider. Số liệu xuất hiện sau khi worker chạy
+              với <code>USE_PROVIDER_LAYER=1</code>.
+            </Empty>
+          )}
         </Card>
 
         {/* YC-CF-07: trường bị sửa nhiều nhất */}
-        <Card title="Trường bị sửa nhiều nhất (YC-CF-07)">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-gray-500 border-b border-gray-100">
-                <th className="py-2 font-medium">Trường</th>
-                <th className="py-2 font-medium text-right">Số lần sửa</th>
-                <th className="py-2 font-medium text-right">Số tài liệu</th>
-              </tr>
-            </thead>
-            <tbody>
-              {FIELD_EDITS.map((r) => (
-                <tr key={r.field} className="border-b border-gray-50">
-                  <td className="py-2 text-gray-800 font-mono text-xs">{r.field}</td>
-                  <td className="py-2 text-right tabular-nums">{formatNumber(r.edits)}</td>
-                  <td className="py-2 text-right tabular-nums">{formatNumber(r.docs)}</td>
+        <Card
+          title="Trường bị sửa nhiều nhất (YC-CF-07)"
+          subtitle="Trường hay bị sửa là chỉ dấu lược đồ hoặc model cần cải thiện."
+        >
+          {editRows.length ? (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-gray-500 border-b border-gray-100">
+                  <th className="py-2 font-medium">Trường</th>
+                  <th className="py-2 font-medium text-right">Số lần sửa</th>
+                  <th className="py-2 font-medium text-right">Số tài liệu</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {editRows.slice(0, 10).map((r) => (
+                  <tr key={r.field_key} className="border-b border-gray-50">
+                    <td className="py-2 text-gray-800 font-mono text-xs">{r.field_key}</td>
+                    <td className="py-2 text-right tabular-nums">
+                      {formatNumber(Number(r.so_lan_sua || 0))}
+                    </td>
+                    <td className="py-2 text-right tabular-nums">
+                      {formatNumber(Number(r.so_tai_lieu || 0))}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <Empty>Chưa có lượt hiệu chỉnh metadata nào được ghi nhận.</Empty>
+          )}
         </Card>
       </div>
 
-      {/* YC-CF-04: duyệt metadata với điểm tin cậy tô màu */}
-      <Card title="Duyệt metadata — điểm tin cậy (YC-CF-04)">
-        <div className="flex items-center gap-2 mb-3 text-sm text-gray-500">
-          <span className="font-mono text-xs text-gray-700">{REVIEW.filename}</span>
-          <StatusBadge code="completed" label="Hoàn thành" />
-          <span>· chế độ:</span><StatusBadge code="processing" label="Tại chỗ" />
-        </div>
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="text-left text-gray-500 border-b border-gray-100">
-              <th className="py-2 font-medium">Trường</th>
-              <th className="py-2 font-medium">Giá trị trích xuất</th>
-              <th className="py-2 font-medium text-right">Tin cậy</th>
-            </tr>
-          </thead>
-          <tbody>
-            {REVIEW.fields.map((f) => (
-              <tr key={f.key} className="border-b border-gray-50">
-                <td className="py-2 text-gray-700 font-mono text-xs align-top w-48">{f.key}</td>
-                <td className="py-2 text-gray-900">{f.value}</td>
-                <td className="py-2 text-right"><ConfidenceBadge value={f.confidence} /></td>
+      {/* Throughput theo ngày */}
+      <Card title="Thông lượng 7 ngày gần nhất" subtitle="Số tài liệu tạo mới và kết quả xử lý theo ngày.">
+        {dayRows.length ? (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-gray-500 border-b border-gray-100">
+                <th className="py-2 font-medium">Ngày</th>
+                <th className="py-2 font-medium text-right">Tổng</th>
+                <th className="py-2 font-medium text-right">Hoàn thành</th>
+                <th className="py-2 font-medium text-right">Thất bại</th>
+                <th className="py-2 font-medium text-right">Tỉ lệ thành công</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-        <p className="text-xs text-gray-500 mt-3">
-          Trường điểm thấp (đỏ) được tô màu để cán bộ tập trung kiểm tra — chống giá trị bịa (YC-CF-05).
-        </p>
+            </thead>
+            <tbody>
+              {dayRows.map((r) => {
+                const total = Number(r.tong || 0);
+                const done = Number(r.hoan_thanh || 0);
+                return (
+                  <tr key={r.ngay} className="border-b border-gray-50">
+                    <td className="py-2 text-gray-800">{r.ngay}</td>
+                    <td className="py-2 text-right tabular-nums">{formatNumber(total)}</td>
+                    <td className="py-2 text-right tabular-nums text-hpu-success">
+                      {formatNumber(done)}
+                    </td>
+                    <td className="py-2 text-right tabular-nums text-hpu-danger">
+                      {formatNumber(Number(r.that_bai || 0))}
+                    </td>
+                    <td className="py-2 text-right tabular-nums">
+                      {total ? formatPercent(done / total) : "—"}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        ) : (
+          <Empty>Chưa có tài liệu nào trong khoảng thời gian này.</Empty>
+        )}
       </Card>
     </PageShell>
   );
