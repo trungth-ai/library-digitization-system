@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { apiBase } from '@/lib/api';
 
 export async function GET(req) {
   try {
@@ -6,7 +7,9 @@ export async function GET(req) {
     const status = searchParams.get('status');
     const includeMetadata = searchParams.get('include_metadata');
     
-    const ocrApiUrl = process.env.NEXT_PUBLIC_OCR_API_URL;
+    // Route handler chạy PHÍA SERVER → gọi qua mạng nội bộ Docker (OCR_API_INTERNAL_URL).
+    // Không dùng NEXT_PUBLIC_* ở đây: biến đó là URL cho TRÌNH DUYỆT và bị nhúng lúc build.
+    const ocrApiUrl = apiBase();
     
     // Build query params
     const params = new URLSearchParams();

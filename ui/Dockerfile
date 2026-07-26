@@ -61,6 +61,19 @@ COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_ENV=production
 
+# ⚠️ NEXT_PUBLIC_* được NHÚNG VÀO BUNDLE lúc BUILD, không đọc lúc chạy. Đặt chúng ở `environment`
+# của docker-compose là VÔ TÁC DỤNG với mã phía client (chỉ server-side thấy được). Vì vậy phải
+# nhận qua build-arg — nếu không, trình duyệt sẽ gọi vào URL sai và các lời gọi client (SSE, fetch
+# trực tiếp) thất bại im lặng.
+#
+# Giá trị phải là URL mà TRÌNH DUYỆT truy cập được (qua Caddy), không phải tên service Docker.
+ARG NEXT_PUBLIC_OCR_API_URL=http://localhost:8000
+ARG NEXT_PUBLIC_DSPACE_URL=https://lib.hpu.edu.vn
+ARG NEXT_PUBLIC_SITE_URL=http://localhost:3000
+ENV NEXT_PUBLIC_OCR_API_URL=${NEXT_PUBLIC_OCR_API_URL}
+ENV NEXT_PUBLIC_DSPACE_URL=${NEXT_PUBLIC_DSPACE_URL}
+ENV NEXT_PUBLIC_SITE_URL=${NEXT_PUBLIC_SITE_URL}
+
 RUN npm run build
 
 # =============================================================================

@@ -1,9 +1,12 @@
 import { NextResponse } from 'next/server';
+import { apiBase } from '@/lib/api';
 
 export async function DELETE(req, { params }) {
   try {
     const { jobId } = await params;
-    const ocrApiUrl = process.env.NEXT_PUBLIC_OCR_API_URL;
+    // Route handler chạy PHÍA SERVER → gọi qua mạng nội bộ Docker (OCR_API_INTERNAL_URL).
+    // Không dùng NEXT_PUBLIC_* ở đây: biến đó là URL cho TRÌNH DUYỆT và bị nhúng lúc build.
+    const ocrApiUrl = apiBase();
 
     console.log(`Deleting job: ${jobId}`);
 

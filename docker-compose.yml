@@ -6,7 +6,7 @@ services:
     container_name: library-n8n
     restart: unless-stopped
     ports:
-      - "5678:5678"
+      - "${BIND_ADDR:-127.0.0.1}:${N8N_PORT:-5678}:5678"
     environment:
       - N8N_BASIC_AUTH_ACTIVE=true
       - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
@@ -20,7 +20,7 @@ services:
       - GENERIC_TIMEZONE=${TIMEZONE:-Asia/Ho_Chi_Minh}
       - EXECUTIONS_PROCESS=main
       - EXECUTIONS_MODE=regular
-      - LIBRARY_API_URL=${LIBRARY_API_URL}
+      - LIBRARY_API_URL=${LIBRARY_API_URL:-http://api:8000}
       - CLAUDE_API_KEY=${CLAUDE_API_KEY}
       - DSPACE_API_URL=${DSPACE_API_URL:-https://lib.hpu.edu.vn/server}
       - DSPACE_API_TOKEN=${DSPACE_API_TOKEN}
@@ -55,7 +55,9 @@ services:
     networks:
       - library-net
     ports:
-      - "5432:5432"
+      # KHÔNG mở PostgreSQL ra ngoài: chỉ loopback, và đổi cổng để không đâm vào PostgreSQL
+      # có thể đã chạy sẵn trên máy chủ. Trong mạng Docker các service vẫn dùng postgres:5432.
+      - "${BIND_ADDR:-127.0.0.1}:${POSTGRES_HOST_PORT:-5433}:5432"
 
   # Redis for Queue Management
   redis:
@@ -68,7 +70,7 @@ services:
     networks:
       - library-net
     ports:
-      - "6379:6379"
+      - "${BIND_ADDR:-127.0.0.1}:${REDIS_HOST_PORT:-6380}:6379"
 
   # Processing Worker (Python with GPU support)
   worker:
@@ -145,15 +147,22 @@ services:
       - library-net
     depends_on:
       - redis
+    # TÀI NGUYÊN: đặt qua .env để KHỚP VỚI MÁY CHỦ THẬT, không cứng trong file.
+    # Giá trị cũ (2 worker × 10 CPU giới hạn / 8 CPU dự trữ = 20/16 CPU) làm Docker TỪ CHỐI khởi động
+    # trên máy 4 CPU: "Range of CPUs is from 0.01 to 4.00".
+    #
+    # Mặc định dưới đây an toàn cho máy 4 CPU / 8GB: 1 worker, giới hạn 2 CPU, KHÔNG dự trữ cứng.
+    # Vì sao bỏ `reservations`: Docker phải giữ sẵn phần CPU đó, nên đặt cao là cách nhanh nhất làm
+    # deploy fail; OCR chạy theo đợt nên giới hạn trần là đủ.
+    #   Máy 8 CPU/16GB:  WORKER_REPLICAS=2  WORKER_CPUS=3  WORKER_MEMORY=6G
+    #   Máy 16 CPU/32GB: WORKER_REPLICAS=3  WORKER_CPUS=4  WORKER_MEMORY=8G
+    # Quy tắc: WORKER_REPLICAS × WORKER_CPUS phải NHỎ HƠN tổng số CPU (chừa cho api/ui/postgres).
     deploy:
-      replicas: 2
+      replicas: ${WORKER_REPLICAS:-1}
       resources:
         limits:
-          cpus: "10"        # 10 logical cores/worker
-          memory: "12G"     # 12GB/worker (an toàn)
-        reservations:
-          cpus: "8"         # Đảm bảo tối thiểu
-          memory: "8G"
+          cpus: "${WORKER_CPUS:-2}"
+          memory: "${WORKER_MEMORY:-3G}"
 
   # ===================================================================
   # MODEL SERVING TẠI CHỖ (YC-MS) — BA lựa chọn, mỗi lựa chọn một profile RIÊNG.
@@ -272,7 +281,8 @@ services:
     container_name: library-api
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      # Caddy (network_mode: host) gọi được qua localhost; không phơi trực tiếp ra Internet
+      - "${BIND_ADDR:-127.0.0.1}:${API_PORT:-8000}:8000"
     environment:
       - DIGITIZE_DATA_DIR=/data/digitization/jobs
       - CLAUDE_API_KEY=${CLAUDE_API_KEY}
@@ -336,20 +346,28 @@ services:
     build:
       context: ./ui
       dockerfile: Dockerfile
+      # NEXT_PUBLIC_* PHẢI truyền lúc BUILD (xem ui/Dockerfile). PUBLIC_BASE_URL là URL mà TRÌNH
+      # DUYỆT dùng — qua Caddy, vd https://sohoa.hpu.edu.vn. Đổi giá trị này thì phải build lại UI:
+      #   docker compose up -d --build ui
+      args:
+        NEXT_PUBLIC_OCR_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_DSPACE_URL: ${DSPACE_BASE_URL:-https://lib.hpu.edu.vn}
+        NEXT_PUBLIC_SITE_URL: ${PUBLIC_BASE_URL:-http://localhost:3200}
     container_name: library-ui
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      # ⚠️ KHÔNG dùng 3000: chat.hpu.edu.vn đã chiếm cổng đó trên máy chủ trung tâm
+      - "${BIND_ADDR:-127.0.0.1}:${UI_PORT:-3200}:3000"
     environment:
       # DSpace config
       - NEXT_PUBLIC_DSPACE_URL=${DSPACE_BASE_URL}
       
       # OCR API config
-      # NEXT_PUBLIC_* bị nhúng lúc BUILD và lộ ra client → giá trị runtime này chỉ có tác dụng
-      # phía server (xem docs/DEPLOY.md mục 4).
-      - NEXT_PUBLIC_OCR_API_URL=http://api:8000
-      # Đường gọi TỪ SERVER (server component / route handler) — đi mạng nội bộ Docker, tường minh
-      # và không phụ thuộc giá trị công khai ở trên.
+      # Giá trị này chỉ có tác dụng phía SERVER (bản nhúng vào client đã cố định lúc build ở trên).
+      # Đặt đúng URL công khai để hai bên nhất quán.
+      - NEXT_PUBLIC_OCR_API_URL=${PUBLIC_API_URL:-http://localhost:8000}
+      # Đường gọi TỪ SERVER (server component / route handler) — đi mạng nội bộ Docker, nhanh hơn
+      # và không phụ thuộc DNS/TLS bên ngoài.
       - OCR_API_INTERNAL_URL=http://api:8000
       
       # Claude API (for metadata extraction)
@@ -374,7 +392,7 @@ services:
     container_name: library-grafana
     restart: unless-stopped
     ports:
-      - "3001:3000"  # Changed to 3001 to avoid conflict with UI
+      - "${BIND_ADDR:-127.0.0.1}:${GRAFANA_PORT:-3201}:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-changeme}
@@ -390,11 +408,14 @@ services:
 
   # File Browser (Optional - for managing processed files)
   filebrowser:
+    # Trình quản lý file TÙY CHỌN — trước đây chạy mặc định và chiếm cổng 8080 của máy chủ.
+    # Bật khi cần:  docker compose --profile extras up -d filebrowser
+    profiles: ["extras"]
     image: filebrowser/filebrowser:latest
     container_name: library-filebrowser
     restart: unless-stopped
     ports:
-      - "8080:80"
+      - "${BIND_ADDR:-127.0.0.1}:${FILEBROWSER_PORT:-8081}:80"
     volumes:
       - ${DIGITIZE_DATA_DIR}:/srv
       - filebrowser_data:/database

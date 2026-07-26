@@ -3,6 +3,65 @@
 > Triển khai bằng Docker Compose (YC-VH-03: một lệnh). Đã rà deploy-readiness (commit `3c1de6c`):
 > UI build không phụ thuộc Google Fonts, có `/api/health`, `.dockerignore` chặn secret, healthcheck sửa.
 
+## 0. ⚠️ Máy chủ trung tâm HPU — khớp cấu hình TRƯỚC khi `up`
+
+Máy chủ đang chạy Caddy làm reverse proxy chung cho nhiều ứng dụng của trường. Ba thứ phải khớp,
+nếu không `docker compose up` sẽ **fail** hoặc **làm chết ứng dụng khác**:
+
+| Vấn đề | Triệu chứng | Cách khớp |
+|---|---|---|
+| **CPU vượt máy chủ** | `Error response from daemon: Range of CPUs is from 0.01 to 4.00` | `WORKER_REPLICAS × WORKER_CPUS` < tổng CPU. Máy 4 CPU: `WORKER_REPLICAS=1`, `WORKER_CPUS=2` |
+| **Cổng 3000 đã bị chiếm** | UI không lên, hoặc `chat.hpu.edu.vn` chết | `UI_PORT=3200` (mặc định mới). **KHÔNG dùng 3000** |
+| **Thiếu `LIBRARY_API_URL`** | `WARN The "LIBRARY_API_URL" variable is not set` | Đã có mặc định; copy lại `.env.example` để hết cảnh báo |
+
+Cổng đã dùng trên máy chủ (theo Caddyfile): `3000` chat · `3003` hr · `3100` crm · `3955/3975/3976/3978/3979/3983` đào tạo · `5000` syllabus · `8100` mkt · `8181` decuong · `8800` mcp-lib.
+
+Mặc định của compose sau khi sửa: **UI 3200, API 8000, PostgreSQL 5433, Redis 6380**, tất cả chỉ mở
+trên `127.0.0.1` (Caddy chạy `network_mode: host` nên vẫn gọi được `localhost`). Muốn truy cập trực
+tiếp từ máy khác khi gỡ lỗi: `BIND_ADDR=0.0.0.0`.
+
+### Block Caddy cần thêm vào Caddyfile trung tâm
+
+```caddyfile
+sohoa.hpu.edu.vn {
+    import tls_hpu
+    encode zstd gzip
+    request_body { max_size 512MB }
+
+    handle /ocr-api/* {
+        uri strip_prefix /ocr-api
+        reverse_proxy localhost:8000 {
+            import proxy_headers
+            import proxy_timeout
+            flush_interval -1        # SSE tiến độ OCR: không được buffer
+        }
+    }
+    handle {
+        reverse_proxy localhost:3200 {
+            import proxy_headers
+            import proxy_timeout
+        }
+    }
+}
+```
+
+Backend đi theo **đường dẫn `/ocr-api`** trên cùng hostname, không dùng subdomain riêng: chứng chỉ
+`hpu.edu.vn` là wildcard một cấp nên `api.sohoa.hpu.edu.vn` sẽ không khớp.
+
+Áp dụng (kiểm cú pháp TRƯỚC khi reload — Caddy này đang phục vụ nhiều ứng dụng):
+```bash
+docker exec caddy caddy validate --config /etc/caddy/Caddyfile
+docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+```
+
+Trong `.env` của app phải khớp tên miền:
+```env
+PUBLIC_BASE_URL=https://sohoa.hpu.edu.vn
+PUBLIC_API_URL=https://sohoa.hpu.edu.vn/ocr-api
+```
+Đổi hai biến này thì **phải build lại UI** (`docker compose up -d --build ui`) — Next.js nhúng
+`NEXT_PUBLIC_*` vào bundle lúc build, restart không có tác dụng.
+
 ## 1. Yêu cầu
 - Docker + Docker Compose trên server.
 - (Tùy chọn) Một công cụ mô hình tại chỗ — Ollama, vLLM hoặc llama.cpp, mỗi cái một profile riêng
