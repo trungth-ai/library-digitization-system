@@ -61,6 +61,31 @@ def resolve_mode(schema: ExtractionSchema, requested_mode: Optional[str] = None)
     return MODE_LOCAL
 
 
+def assert_mode_matches(provider, mode: str, schema_code: str = "") -> None:
+    """
+    PHÒNG VỆ NHIỀU LỚP (YC-DR-03): chế độ tại chỗ mà công cụ được cấu hình lại là dịch vụ đám mây thì
+    ràng buộc cứng đã bị vô hiệu hóa qua đường cấu hình → DỪNG, không xử lý. Chiều ngược lại (chế độ
+    đám mây nhưng dùng công cụ tại chỗ) là an toàn hơn yêu cầu nên vẫn cho chạy.
+
+    Tách thành hàm riêng để mọi đường vào lớp model đều kiểm cùng một chỗ — `get_routed_provider`
+    và cả đường có dự phòng chéo công cụ (`core/extraction.py`).
+    """
+    if mode == MODE_LOCAL and provider.deployment != MODE_LOCAL:
+        logger.error(
+            "TỪ CHỐI: lược đồ '%s' cần chế độ TẠI CHỖ nhưng công cụ đang dùng là '%s' — một công cụ "
+            "ĐÁM MÂY. Cấu hình này làm vô hiệu ràng buộc cứng YC-DR-03.", schema_code, provider.name,
+        )
+        raise SensitivityViolation(
+            f"Cấu hình sai: chế độ tại chỗ đang trỏ tới công cụ đám mây '{provider.name}'. "
+            f"Sửa LOCAL_PROVIDER về một công cụ chạy trong hạ tầng của Nhà trường "
+            f"(ollama | vllm | llamacpp | lmstudio | tgi) trước khi xử lý tài liệu nhạy cảm."
+        )
+
+    if mode == MODE_CLOUD and provider.deployment == MODE_LOCAL:
+        logger.info("Chế độ đám mây đang dùng công cụ tại chỗ '%s' — an toàn hơn yêu cầu, cho phép.",
+                    provider.name)
+
+
 def get_routed_provider(schema: ExtractionSchema,
                         requested_mode: Optional[str] = None,
                         config=None) -> Tuple[object, str]:
@@ -74,24 +99,7 @@ def get_routed_provider(schema: ExtractionSchema,
     mode = resolve_mode(schema, requested_mode)
     provider = get_provider(kind=mode, config=config)
 
-    # PHÒNG VỆ NHIỀU LỚP (YC-DR-03): chế độ tại chỗ mà công cụ được cấu hình lại là dịch vụ đám mây thì
-    # ràng buộc cứng đã bị vô hiệu hóa qua đường cấu hình → DỪNG, không xử lý. Chiều ngược lại (chế độ
-    # đám mây nhưng dùng công cụ tại chỗ) là an toàn hơn yêu cầu nên vẫn cho chạy.
-    if mode == MODE_LOCAL and provider.deployment != MODE_LOCAL:
-        logger.error(
-            "TỪ CHỐI: lược đồ '%s' (nhạy cảm=%s) cần chế độ TẠI CHỖ nhưng LOCAL_PROVIDER đang là "
-            "'%s' — một công cụ ĐÁM MÂY. Cấu hình này làm vô hiệu ràng buộc cứng YC-DR-03.",
-            schema.code, schema.sensitivity, provider.name,
-        )
-        raise SensitivityViolation(
-            f"Cấu hình sai: chế độ tại chỗ đang trỏ tới công cụ đám mây '{provider.name}'. "
-            f"Sửa LOCAL_PROVIDER về một công cụ chạy trong hạ tầng của Nhà trường "
-            f"(ollama | vllm | llamacpp | lmstudio | tgi) trước khi xử lý tài liệu nhạy cảm."
-        )
-
-    if mode == MODE_CLOUD and provider.deployment == MODE_LOCAL:
-        logger.info("Chế độ đám mây đang dùng công cụ tại chỗ '%s' — an toàn hơn yêu cầu, cho phép.",
-                    provider.name)
+    assert_mode_matches(provider, mode, schema.code)
 
     logger.info("Định tuyến lược đồ '%s' (nhạy cảm=%s) → chế độ %s, công cụ %s",
                 schema.code, schema.sensitivity, mode, provider.name)

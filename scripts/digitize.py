@@ -22,6 +22,10 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+# Chỉ import lớp ngoại lệ (không kéo theo phụ thuộc nào) để phân biệt được "từ chối vì độ nhạy cảm"
+# với "lỗi xử lý" trong pipeline. `scripts.core.exceptions` là module thuần, an toàn khi import sớm.
+from scripts.core.exceptions import SensitivityViolation
+
 # Lazy import (chuyển vào trong hàm) cho pypdf & anthropic: giúp module import được ở môi trường
 # tối giản (chưa cài 2 gói này) — phục vụ test tầng logic build_metadata và lớp provider.
 # Hành vi runtime KHÔNG đổi: import thực hiện ngay trước khi dùng, khi deps có mặt.
@@ -657,19 +661,30 @@ class JSONExporter:
 # PIPELINE
 # =========================
 class DigitizationPipeline:
-    def __init__(self, 
+    def __init__(self,
                  config: Optional[ProcessingConfig] = None,
-                 claude_api_key: Optional[str] = None):
-        """Initialize pipeline"""
+                 claude_api_key: Optional[str] = None,
+                 metadata_extractor=None):
+        """
+        Initialize pipeline.
+
+        `metadata_extractor`: tiêm bộ trích metadata khác vào (bất kỳ đối tượng có
+        `extract(pdf_path) -> Dict`). Worker truyền `ProviderMetadataExtractor` để đi qua lớp
+        trừu tượng hóa mô hình — định tuyến theo độ nhạy cảm, điểm tin cậy, nhật ký gọi model.
+        Không truyền = giữ nguyên đường cũ bám Claude (dùng cho CLI và để lùi nhanh khi cần).
+        """
         self.config = config or ProcessingConfig()
         api_key = claude_api_key or os.getenv("CLAUDE_API_KEY")
-        
+
         self.pdfa = PDFAConverter(self.config)
-        self.metadata_extractor = AIMetadataExtractor(self.config, api_key)
+        self.metadata_extractor = metadata_extractor or AIMetadataExtractor(self.config, api_key)
         self.exporter = JSONExporter()
-        
+
         mode = "Two-pass" if self.config.enable_two_pass else "Single-pass"
-        if api_key:
+        if metadata_extractor is not None:
+            logger.info(f"Pipeline initialized with provider layer "
+                        f"({type(metadata_extractor).__name__}, {self.config.document_type}, {mode})")
+        elif api_key:
             logger.info(f"Pipeline initialized with AI ({self.config.document_type}, {mode})")
         else:
             logger.warning(f"Pipeline initialized WITHOUT AI ({mode})")
@@ -736,16 +751,27 @@ class DigitizationPipeline:
             logger.info(f"Processing completed in {duration:.1f}s")
             logger.info(f"Size: {input_size:.1f}KB → {output_size:.1f}KB ({size_change:+.1f}%)")
             
+        except SensitivityViolation as e:
+            # YC-DR-03: ràng buộc cứng KHÔNG được nuốt vào summary như một lỗi xử lý thông thường.
+            # Nếu gộp vào nhánh Exception bên dưới, nó sẽ thành RuntimeError chung và người vận hành
+            # không phân biệt được "tài liệu lỗi" với "hệ thống từ chối vì lý do bảo mật".
+            # Vẫn ghi results file để còn dấu vết, rồi để ngoại lệ nổi lên cho worker/CLI xử lý.
+            logger.error(f"TỪ CHỐI theo ràng buộc độ nhạy cảm (YC-DR-03): {e}")
+            results["summary"] = {"status": "denied", "error": str(e)}
+            with open(results_file, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            raise
+
         except Exception as e:
             logger.error(f"Processing failed: {e}", exc_info=True)
             results["summary"] = {
                 "status": "failed",
                 "error": str(e)
             }
-        
+
         with open(results_file, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
-        
+
         return results
 
 # =========================

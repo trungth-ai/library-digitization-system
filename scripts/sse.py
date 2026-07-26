@@ -18,8 +18,6 @@ import asyncio
 import logging
 from typing import AsyncGenerator
 
-import redis.asyncio as aioredis
-
 logger = logging.getLogger("sse")
 
 REDIS_HOST  = __import__("os").getenv("REDIS_HOST", "redis")
@@ -50,6 +48,10 @@ async def job_event_stream(job_id: str | None = None) -> AsyncGenerator[str, Non
     Tự động đóng stream khi job đạt terminal status
     (completed / failed / cancelled) nếu đang stream 1 job.
     """
+    # Lazy import (cùng lý do ADR-005): module này được worker import để dùng `publish_job_event`,
+    # nên bắt buộc phải import được ở môi trường chưa cài redis để kiểm thử tầng logic.
+    import redis.asyncio as aioredis
+
     redis_client = aioredis.Redis(
         host=REDIS_HOST,
         port=REDIS_PORT,

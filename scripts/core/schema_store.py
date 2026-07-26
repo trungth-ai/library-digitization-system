@@ -98,6 +98,29 @@ def load_schema(code: str) -> Optional[ExtractionSchema]:
     return rows_to_schema(dict(srow), [dict(r) for r in frows])
 
 
+def load_schema_for_document_type(document_type: str) -> Optional[ExtractionSchema]:
+    """
+    Nạp lược đồ theo LOẠI TÀI LIỆU (không phải theo code) — đường mà pipeline dùng: worker chỉ biết
+    `document_type` do người upload chọn, còn dùng lược đồ nào là cấu hình của quản trị viên (YC-SC).
+
+    Nhiều lược đồ cùng loại tài liệu → lấy cái tạo trước (ổn định qua các lần chạy, không phụ thuộc
+    thứ tự bảng). Trả None nếu chưa cấu hình lược đồ nào cho loại này.
+    """
+    import psycopg2.extras
+    import scripts.db as db
+    sql = """
+        SELECT code FROM extraction_schemas
+        WHERE document_type = %s AND is_active = TRUE
+        ORDER BY created_at ASC, code ASC
+        LIMIT 1
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (document_type,))
+            row = cur.fetchone()
+    return load_schema(row["code"]) if row else None
+
+
 def list_schemas() -> List[Dict]:
     """Danh sách lược đồ đang active (cho UI chọn)."""
     import psycopg2.extras
