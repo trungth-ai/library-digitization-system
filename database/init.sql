@@ -68,7 +68,15 @@ CREATE TABLE IF NOT EXISTS documents (
     pdf_path               TEXT,
     error_message          TEXT,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),  -- chuẩn HPU: mọi bảng có updated_at
     finished_at            TIMESTAMPTZ,
+
+    -- Trích xuất bằng model nào, chế độ nào (YC-AU-04, YC-DR-06) — điền khi worker chạy xong
+    extraction_provider    VARCHAR(50),   -- claude | ollama | vllm | ...
+    extraction_mode        VARCHAR(20),   -- cloud | local
+    extraction_model       VARCHAR(150),
+    needs_review           BOOLEAN     NOT NULL DEFAULT FALSE,  -- YC-CF-03: cần cán bộ xử lý tay
+    review_note            TEXT,          -- lý do cần xem lại (lỗi hợp lệ, điểm tin cậy thấp)
 
     -- DSpace tracking
     dspace_status          VARCHAR(50) NOT NULL DEFAULT 'pending'
@@ -85,6 +93,26 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE INDEX IF NOT EXISTS idx_documents_status         ON documents(status);
 CREATE INDEX IF NOT EXISTS idx_documents_dspace_status  ON documents(dspace_status);
 CREATE INDEX IF NOT EXISTS idx_documents_created_at     ON documents(created_at DESC);
+-- Danh sách mặc định loại tài liệu đã xóa mềm → index riêng cho truy vấn phổ biến nhất
+CREATE INDEX IF NOT EXISTS idx_documents_not_deleted    ON documents(created_at DESC)
+    WHERE status <> 'deleted';
+CREATE INDEX IF NOT EXISTS idx_documents_needs_review   ON documents(needs_review)
+    WHERE needs_review;
+
+-- =====================================================================
+-- 4b. TRIGGER: tự cập nhật updated_at (chuẩn HPU — không phụ thuộc app nhớ set)
+-- =====================================================================
+CREATE OR REPLACE FUNCTION touch_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_documents_touch ON documents;
+CREATE TRIGGER trg_documents_touch BEFORE UPDATE ON documents
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 
 -- =====================================================================
 -- 5. METADATA FIELDS (metadata Dublin Core, hỗ trợ multi-value)
@@ -100,10 +128,22 @@ CREATE TABLE IF NOT EXISTS metadata_fields (
     key         VARCHAR(100) NOT NULL,   -- vd: dc.title, dc.contributor.author
     value       TEXT         NOT NULL,
     language    VARCHAR(20),             -- vd: vi_VN, en_US, hoặc NULL
-    CONSTRAINT uq_metadata_doc_key_value UNIQUE (document_id, key, value)
+    -- YC-CF-01: điểm tin cậy 0.000–1.000; NULL = chưa tính (dữ liệu cũ trước khi bật lớp provider)
+    confidence  NUMERIC(4,3),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_metadata_doc_key_value UNIQUE (document_id, key, value),
+    CONSTRAINT ck_metadata_confidence CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1))
 );
 
 CREATE INDEX IF NOT EXISTS idx_metadata_document_id ON metadata_fields(document_id);
+-- YC-CF-04: UI cần lọc nhanh trường điểm thấp để cán bộ tập trung kiểm tra
+CREATE INDEX IF NOT EXISTS idx_metadata_low_conf    ON metadata_fields(document_id)
+    WHERE confidence IS NOT NULL AND confidence < 0.5;
+
+DROP TRIGGER IF EXISTS trg_metadata_touch ON metadata_fields;
+CREATE TRIGGER trg_metadata_touch BEFORE UPDATE ON metadata_fields
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 
 -- =====================================================================
 -- 6. METADATA HISTORY (lịch sử hiệu chỉnh metadata)
@@ -251,6 +291,41 @@ INSERT INTO schema_fields (schema_code, key, label, required, data_type, languag
 ON CONFLICT (schema_code, key) DO NOTHING;
 
 -- =====================================================================
+-- 7d. NHẬT KÝ GỌI MODEL (YC-MP-06 bền vững + YC-MS-07 tài nguyên)
+--   Trước đây mỗi lần gọi model chỉ ghi ra log file → không truy vấn được, không dựng báo cáo được.
+--   Bảng này cho phép trả lời: tài liệu này do công cụ/model nào trích, mất bao lâu, tốn bao nhiêu RAM,
+--   có phải dự phòng không. Là nguồn số liệu cho so sánh công cụ (KT-HN) mà không cần chạy lại harness.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS model_calls (
+    id            BIGSERIAL PRIMARY KEY,
+    document_id   TEXT,                    -- không đặt khóa ngoại: nhật ký sống độc lập với tài liệu
+    provider      VARCHAR(50)  NOT NULL,   -- claude | ollama | vllm | gemini | ...
+    deployment    VARCHAR(20)  NOT NULL,   -- cloud | local (YC-DR-06)
+    model         VARCHAR(150),
+    model_version VARCHAR(100),
+    schema_code   VARCHAR(50),
+    used_ai       BOOLEAN      NOT NULL DEFAULT TRUE,  -- FALSE = rơi về basic extraction
+    attempts      INTEGER      NOT NULL DEFAULT 1,     -- YC-CF-03 số lần thử
+    latency_ms    INTEGER,
+    rss_mb        NUMERIC(10,1),           -- YC-MS-07 bộ nhớ tiến trình sau lời gọi
+    gpu_mem_mb    NUMERIC(10,1),           -- YC-MS-07 chỉ có khi bật METRICS_GPU và có nvidia-smi
+    n_fields      INTEGER      NOT NULL DEFAULT 0,
+    fallback_from VARCHAR(50),             -- công cụ đã lỗi trước khi chuyển sang công cụ này
+    error         TEXT,
+    status        VARCHAR(20)  NOT NULL DEFAULT 'success',  -- success | fallback | failed
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_calls_document ON model_calls(document_id);
+CREATE INDEX IF NOT EXISTS idx_model_calls_created  ON model_calls(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_model_calls_provider ON model_calls(provider, deployment);
+
+DROP TRIGGER IF EXISTS trg_model_calls_touch ON model_calls;
+CREATE TRIGGER trg_model_calls_touch BEFORE UPDATE ON model_calls
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- =====================================================================
 -- 8. SEED DATA cho các bảng lookup
 --    Bắt buộc: các giá trị mặc định app dùng phải tồn tại trước khi
 --    documents insert (book, queued, pending).
@@ -274,7 +349,10 @@ INSERT INTO job_statuses (code, label, progress_value, is_terminal, color, sort_
     ('exporting',  'Đang xuất',      80,  FALSE, '#f59e0b', 4),
     ('completed',  'Hoàn thành',     100, TRUE,  '#10b981', 5),
     ('failed',     'Thất bại',       0,   TRUE,  '#ef4444', 6),
-    ('cancelled',  'Đã hủy',         0,   TRUE,  '#9ca3af', 7)
+    ('cancelled',  'Đã hủy',         0,   TRUE,  '#9ca3af', 7),
+    -- XÓA MỀM (chuẩn HPU: KHÔNG hard delete). Tài liệu ở trạng thái này bị ẩn khỏi danh sách và
+    -- thống kê, nhưng dữ liệu + nhật ký kiểm toán vẫn còn để truy được trách nhiệm (YC-AU).
+    ('deleted',    'Đã xóa',         0,   TRUE,  '#9ca3af', 8)
 ON CONFLICT (code) DO NOTHING;
 
 -- 8.3 Trạng thái upload DSpace (khớp api.py: pending|uploading|uploaded|upload_failed)

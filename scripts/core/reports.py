@@ -86,13 +86,14 @@ def report_action_summary(date_from: Optional[str] = None, date_to: Optional[str
 def report_throughput(date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict]:
     """Số tài liệu tạo theo ngày + số hoàn thành/thất bại (throughput OCR)."""
     params: list = []
+    # Loại tài liệu đã xóa mềm để nhất quán với get_stats() — thông lượng phải phản ánh việc thật
     sql = f"""
         SELECT to_char(created_at, 'YYYY-MM-DD') AS ngay,
                COUNT(*)                                   AS tong,
                COUNT(*) FILTER (WHERE status = 'completed') AS hoan_thanh,
                COUNT(*) FILTER (WHERE status = 'failed')    AS that_bai
         FROM documents
-        WHERE 1=1{_date_clause('created_at', date_from, date_to, params)}
+        WHERE status <> 'deleted'{_date_clause('created_at', date_from, date_to, params)}
         GROUP BY ngay
         ORDER BY ngay DESC
     """

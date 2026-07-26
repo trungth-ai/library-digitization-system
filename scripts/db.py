@@ -172,7 +172,14 @@ def get_document(job_id: str) -> Optional[Dict]:
             d.pdf_path,
             d.error_message,
             d.created_at,
+            d.updated_at,
             d.finished_at,
+            -- Trích xuất bằng công cụ/chế độ nào (YC-AU-04, YC-DR-06)
+            d.extraction_provider,
+            d.extraction_mode,
+            d.extraction_model,
+            d.needs_review,
+            d.review_note,
             -- DSpace fields
             d.dspace_status,
             ds.label            AS dspace_status_label,
@@ -203,10 +210,16 @@ def list_documents(
     dspace_status: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
+    include_deleted: bool = False,
+    needs_review: Optional[bool] = None,
 ) -> List[Dict]:
     """
     Liệt kê documents, tùy chọn lọc theo status OCR và/hoặc dspace_status.
     Sắp xếp mới nhất trước.
+
+    - `include_deleted=False` (mặc định): ẩn tài liệu đã xóa mềm. Xóa mềm chỉ có ý nghĩa nếu danh
+      sách mặc định không hiện chúng nữa.
+    - `needs_review=True`: chỉ lấy tài liệu cần cán bộ xem lại (YC-CF-03).
     """
     conditions = []
     params = []
@@ -214,10 +227,17 @@ def list_documents(
     if status:
         conditions.append("d.status = %s")
         params.append(status)
+    elif not include_deleted:
+        # Chỉ ẩn khi KHÔNG lọc status cụ thể — gọi status='deleted' vẫn xem được thùng rác
+        conditions.append("d.status <> 'deleted'")
 
     if dspace_status:
         conditions.append("d.dspace_status = %s")
         params.append(dspace_status)
+
+    if needs_review is not None:
+        conditions.append("d.needs_review = %s")
+        params.append(needs_review)
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
@@ -234,7 +254,13 @@ def list_documents(
             d.progress,
             d.error_message,
             d.created_at,
+            d.updated_at,
             d.finished_at,
+            -- Trích xuất bằng công cụ/chế độ nào (YC-AU-04, YC-DR-06)
+            d.extraction_provider,
+            d.extraction_mode,
+            d.extraction_model,
+            d.needs_review,
             -- DSpace fields
             d.dspace_status,
             ds.label            AS dspace_status_label,
@@ -265,37 +291,62 @@ def list_documents(
 
 def delete_document(job_id: str) -> bool:
     """
-    Xóa document và toàn bộ metadata liên quan (CASCADE).
-    Trả về True nếu xóa thành công, False nếu không tìm thấy.
+    XÓA MỀM một document: đặt status='deleted' (chuẩn HPU — KHÔNG hard delete).
+
+    Dữ liệu, metadata và nhật ký kiểm toán được GIỮ LẠI để còn truy được trách nhiệm (YC-AU);
+    tài liệu chỉ bị ẩn khỏi danh sách và thống kê. Muốn xóa vật lý (vd theo yêu cầu pháp lý về dữ
+    liệu cá nhân) thì phải là một thao tác riêng, có phê duyệt — không đi qua hàm này.
+
+    Trả về True nếu có tài liệu bị chuyển sang 'deleted', False nếu không tìm thấy hoặc đã xóa trước đó.
     """
-    sql = "DELETE FROM documents WHERE id = %s"
+    sql = """
+        UPDATE documents
+        SET status = 'deleted'
+        WHERE id = %s AND status <> 'deleted'
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (job_id,))
             deleted = cur.rowcount > 0
 
-    logger.debug(f"Deleted document: {job_id} → {deleted}")
+    logger.info(f"Soft-deleted document: {job_id} → {deleted}")
     return deleted
+
+
+def restore_document(job_id: str, status: str = "completed") -> bool:
+    """
+    Phục hồi tài liệu đã xóa mềm. Có xóa mềm thì phải có đường về, nếu không thì
+    "không hard delete" chỉ là hình thức.
+    """
+    sql = "UPDATE documents SET status = %s WHERE id = %s AND status = 'deleted'"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (status, job_id))
+            restored = cur.rowcount > 0
+
+    logger.info(f"Restored document: {job_id} → {restored}")
+    return restored
 
 
 def get_stats() -> Dict:
     """
     Thống kê số lượng job theo trạng thái OCR và DSpace.
     """
-    # OCR stats
+    # OCR stats — LOẠI tài liệu đã xóa mềm khỏi mọi con số, kể cả 'total'
     ocr_sql = """
         SELECT js.code, js.label, js.color, COUNT(d.id) AS count
         FROM job_statuses js
         LEFT JOIN documents d ON d.status = js.code
+        WHERE js.code <> 'deleted'
         GROUP BY js.code, js.label, js.color, js.sort_order
         ORDER BY js.sort_order
     """
 
-    # DSpace stats
+    # DSpace stats — cũng bỏ tài liệu đã xóa để hai bảng thống kê nhất quán
     dspace_sql = """
         SELECT ds.code, ds.label, ds.color, COUNT(d.id) AS count
         FROM dspace_upload_statuses ds
-        LEFT JOIN documents d ON d.dspace_status = ds.code
+        LEFT JOIN documents d ON d.dspace_status = ds.code AND d.status <> 'deleted'
         GROUP BY ds.code, ds.label, ds.color, ds.sort_order
         ORDER BY ds.sort_order
     """
@@ -337,13 +388,14 @@ def save_metadata(job_id: str, metadata_list: List[Dict]) -> None:
 
     # ON CONFLICT DO NOTHING: safe when pipeline returns duplicate key+value pairs
     insert_sql = """
-        INSERT INTO metadata_fields (document_id, key, value, language)
+        INSERT INTO metadata_fields (document_id, key, value, language, confidence)
         VALUES %s
         ON CONFLICT (document_id, key, value) DO NOTHING
     """
 
+    # confidence (YC-CF-01) chỉ có khi trích qua lớp provider; đường cũ không có → NULL
     rows = [
-        (job_id, item["key"], item["value"], item.get("language"))
+        (job_id, item["key"], item["value"], item.get("language"), item.get("confidence"))
         for item in metadata_list
         if item.get("key") and item.get("value")
     ]
@@ -386,8 +438,9 @@ def get_metadata(job_id: str) -> Optional[Dict]:
             if not cur.fetchone():
                 return None
 
+        # confidence đi kèm để UI tô màu trường điểm thấp (YC-CF-04)
         sql = """
-            SELECT key, value, language
+            SELECT key, value, language, confidence
             FROM metadata_fields
             WHERE document_id = %s
             ORDER BY id
@@ -396,31 +449,36 @@ def get_metadata(job_id: str) -> Optional[Dict]:
             cur.execute(sql, (job_id,))
             rows = cur.fetchall()
 
-    return {"metadata": [dict(r) for r in rows]}
+    # NUMERIC của Postgres về Python là Decimal → JSON không serialize được; đổi sang float
+    metadata = []
+    for r in rows:
+        item = dict(r)
+        if item.get("confidence") is not None:
+            item["confidence"] = float(item["confidence"])
+        metadata.append(item)
+    return {"metadata": metadata}
 
 
 def update_metadata(job_id: str, metadata_list: List[Dict]) -> int:
     """
-    Cập nhật metadata do thủ thư hiệu chỉnh.
-    Dùng DELETE + INSERT để xử lý đúng multi-value fields
-    (vd: nhiều dc.contributor.author).
-    Trigger sẽ tự ghi vào metadata_history khi value thay đổi.
+    Cập nhật metadata do cán bộ hiệu chỉnh. Dùng DELETE + INSERT để xử lý đúng multi-value fields
+    (vd nhiều dc.contributor.author). Trigger ghi metadata_history khi value thay đổi.
+
+    ĐIỂM TIN CẬY: mọi trường đi qua đường này được đặt **confidence = 1.0** — cán bộ đã xem và xác
+    nhận cả biểu mẫu, nên giá trị là do con người quyết định, không còn là phỏng đoán của model
+    ("con người giữ quyền quyết định"). Điểm gốc của model không được giữ lại per-field; muốn truy
+    thì xem `audit_log` (old→new) và `model_calls` (công cụ/model đã dùng).
 
     Trả về số field đã lưu.
     """
-    return save_metadata.__wrapped__(job_id, metadata_list) if hasattr(save_metadata, '__wrapped__') else _update_metadata_impl(job_id, metadata_list)
-
-
-def _update_metadata_impl(job_id: str, metadata_list: List[Dict]) -> int:
-    """Implementation thực của update_metadata"""
     delete_sql = "DELETE FROM metadata_fields WHERE document_id = %s"
     insert_sql = """
-        INSERT INTO metadata_fields (document_id, key, value, language)
+        INSERT INTO metadata_fields (document_id, key, value, language, confidence)
         VALUES %s
     """
 
     rows = [
-        (job_id, item["key"], item["value"], item.get("language"))
+        (job_id, item["key"], item["value"], item.get("language"), 1.0)
         for item in metadata_list
         if item.get("key") and item.get("value")
     ]
@@ -436,10 +494,6 @@ def _update_metadata_impl(job_id: str, metadata_list: List[Dict]) -> int:
 
     logger.info(f"Updated {len(rows)} metadata fields for job {job_id}")
     return len(rows)
-
-
-# Gán lại update_metadata về implementation thực
-update_metadata = _update_metadata_impl
 
 
 def get_metadata_history(job_id: str) -> List[Dict]:
@@ -668,3 +722,143 @@ def get_dspace_upload_statuses() -> List[Dict]:
             cur.execute(sql)
             rows = cur.fetchall()
     return [dict(r) for r in rows]
+
+# =============================================================
+# TRÍCH XUẤT: công cụ đã dùng + nhật ký gọi model
+# (YC-MP-06 nhật ký bền vững, YC-MS-07 tài nguyên, YC-AU-04 truy vết)
+# =============================================================
+
+def set_extraction_info(
+    job_id: str,
+    provider: Optional[str] = None,
+    mode: Optional[str] = None,
+    model: Optional[str] = None,
+    needs_review: Optional[bool] = None,
+    review_note: Optional[str] = None,
+) -> None:
+    """
+    Ghi lại tài liệu này được trích bằng công cụ/chế độ/model nào, và có cần cán bộ xem lại không.
+
+    Tách khỏi update_document_status vì hai việc khác nhau: status là vòng đời xử lý, còn đây là
+    truy vết model (YC-AU-04). Tham số None = giữ nguyên giá trị cũ.
+    """
+    sql = """
+        UPDATE documents
+        SET extraction_provider = COALESCE(%(provider)s, extraction_provider),
+            extraction_mode     = COALESCE(%(mode)s,     extraction_mode),
+            extraction_model    = COALESCE(%(model)s,    extraction_model),
+            needs_review        = COALESCE(%(needs_review)s, needs_review),
+            review_note         = COALESCE(%(review_note)s,  review_note)
+        WHERE id = %(job_id)s
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {
+                "job_id": job_id, "provider": provider, "mode": mode, "model": model,
+                "needs_review": needs_review, "review_note": review_note,
+            })
+
+    logger.debug(f"Extraction info saved: {job_id} → {provider}/{mode}/{model}")
+
+
+def log_model_call(
+    provider: str,
+    deployment: str,
+    document_id: Optional[str] = None,
+    model: Optional[str] = None,
+    model_version: Optional[str] = None,
+    schema_code: Optional[str] = None,
+    used_ai: bool = True,
+    attempts: int = 1,
+    latency_ms: Optional[int] = None,
+    rss_mb: Optional[float] = None,
+    gpu_mem_mb: Optional[float] = None,
+    n_fields: int = 0,
+    fallback_from: Optional[str] = None,
+    error: Optional[str] = None,
+    status: str = "success",
+) -> None:
+    """
+    Ghi một lần gọi model (YC-MP-06). KHÔNG ném lỗi ra ngoài: nhật ký hỏng không được làm gãy
+    việc số hóa của cán bộ — cùng nguyên tắc với audit.log_action.
+    """
+    sql = """
+        INSERT INTO model_calls
+            (document_id, provider, deployment, model, model_version, schema_code,
+             used_ai, attempts, latency_ms, rss_mb, gpu_mem_mb, n_fields,
+             fallback_from, error, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (
+                    document_id, provider, deployment, model, model_version, schema_code,
+                    used_ai, attempts, latency_ms, rss_mb, gpu_mem_mb, n_fields,
+                    fallback_from, error, status,
+                ))
+    except Exception as e:  # noqa: BLE001 - nhật ký không được chặn nghiệp vụ chính
+        logger.error(f"Ghi model_calls thất bại (provider={provider}, doc={document_id}): {e}")
+
+
+def list_model_calls(
+    document_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    deployment: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> List[Dict]:
+    """Nhật ký gọi model, mới nhất trước (YC-MP-06 truy vấn được)."""
+    conditions, params = [], []
+    if document_id:
+        conditions.append("document_id = %s"); params.append(document_id)
+    if provider:
+        conditions.append("provider = %s"); params.append(provider)
+    if deployment:
+        conditions.append("deployment = %s"); params.append(deployment)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    sql = f"""
+        SELECT id, document_id, provider, deployment, model, model_version, schema_code,
+               used_ai, attempts, latency_ms, rss_mb, gpu_mem_mb, n_fields,
+               fallback_from, error, status, created_at
+        FROM model_calls
+        {where}
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s OFFSET %s
+    """
+    params.extend([limit, offset])
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    # NUMERIC → Decimal; đổi sang float để JSON serialize được
+    out = []
+    for r in rows:
+        item = dict(r)
+        for k in ("rss_mb", "gpu_mem_mb"):
+            if item.get(k) is not None:
+                item[k] = float(item[k])
+        out.append(item)
+    return out
+
+
+def purge_document(job_id: str) -> bool:
+    """
+    XÓA VẬT LÝ một document (CASCADE xóa metadata + history). Chỉ dùng cho yêu cầu xóa dữ liệu thật
+    sự — vd yêu cầu pháp lý về dữ liệu cá nhân (YC-PL-06).
+
+    KHÁC `delete_document` (xóa mềm): hàm này KHÔNG thể phục hồi. Vì vậy nó không phải hành vi mặc
+    định của nút "Xóa" trên giao diện, và nơi gọi phải ghi audit trước khi gọi — sau khi xóa thì
+    không còn tài liệu để gắn bản ghi kiểm toán vào nữa.
+    """
+    sql = "DELETE FROM documents WHERE id = %s"
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (job_id,))
+            purged = cur.rowcount > 0
+
+    logger.warning(f"PURGED (xóa vật lý) document: {job_id} → {purged}")
+    return purged
