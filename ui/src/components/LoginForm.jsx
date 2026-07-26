@@ -10,15 +10,17 @@ export default function LoginForm({ dspaceUrl }) {
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
+  const [errorDetail, setErrorDetail] = useState("");
   const [success, setSuccess] = useState("");
 
   const handleLogin = async (e) => {
     e.preventDefault();
     setError("");
+    setErrorDetail("");
     setSuccess("");
 
     if (!email || !password) {
-      setError("Please enter email and password");
+      setError("Vui lòng nhập email và mật khẩu");
       return;
     }
 
@@ -33,8 +35,10 @@ export default function LoginForm({ dspaceUrl }) {
       });
 
       if (!res.ok) {
-        const error = await res.json();
-        setError(error.error ?? "Login failed");
+        const payload = await res.json();
+        setError(payload.error ?? "Đăng nhập thất bại");
+        // Giữ lại phản hồi gốc của DSpace: đây là thứ phân biệt "sai mật khẩu" với "REST API chết"
+        setErrorDetail(payload.detail || "");
         setIsLoading(false);
         return;
       }
@@ -50,18 +54,18 @@ export default function LoginForm({ dspaceUrl }) {
       const statusData = await statusRes.json();
 
       if (statusData.authenticated) {
-        setSuccess(`Welcome, ${statusData.fullname}!`);
+        setSuccess(`Xin chào, ${statusData.fullname}!`);
         
         // ✨ IMPORTANT: Refresh to trigger SSR
         setTimeout(() => {
           router.refresh();
         }, 500);
       } else {
-        setError("Authentication failed");
+        setError("DSpace nhận đăng nhập nhưng phiên không hợp lệ — thử lại hoặc xóa cookie.");
         setIsLoading(false);
       }
     } catch (err) {
-      setError(`Login error: ${err.message}`);
+      setError(`Lỗi khi đăng nhập: ${err.message}`);
       setIsLoading(false);
     }
   };
@@ -70,13 +74,13 @@ export default function LoginForm({ dspaceUrl }) {
     <div className="bg-white rounded-xl shadow-lg p-6 mb-8">
       <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
         <LogIn className="w-5 h-5" />
-        Login to DSpace
+        Đăng nhập DSpace
       </h2>
 
       {/* Success Message */}
       {success && (
         <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-lg text-green-700 text-sm">
-          {success} - Redirecting...
+          {success} — đang chuyển trang...
         </div>
       )}
 
@@ -84,13 +88,21 @@ export default function LoginForm({ dspaceUrl }) {
       {error && (
         <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
           {error}
+          {errorDetail && (
+            <div className="mt-2 pt-2 border-t border-red-200 text-xs text-red-600 font-mono break-all">
+              Phản hồi từ DSpace: {errorDetail}
+            </div>
+          )}
         </div>
       )}
 
       <form onSubmit={handleLogin} className="space-y-4">
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
           <p className="text-sm text-blue-800">
-            <span className="font-semibold">Server:</span> {dspaceUrl}
+            <span className="font-semibold">Máy chủ:</span> {dspaceUrl}
+          </p>
+          <p className="text-xs text-blue-700 mt-1">
+            Dùng tài khoản DSpace của bạn trên máy chủ thư viện — hệ thống này không có tài khoản riêng.
           </p>
         </div>
 
@@ -102,7 +114,7 @@ export default function LoginForm({ dspaceUrl }) {
             type="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            placeholder="admin@dspace.org"
+            placeholder="ten.ban@hpu.edu.vn"
             disabled={isLoading}
             className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
             required
@@ -111,7 +123,7 @@ export default function LoginForm({ dspaceUrl }) {
 
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">
-            Password
+            Mật khẩu
           </label>
           <input
             type="password"
@@ -132,10 +144,10 @@ export default function LoginForm({ dspaceUrl }) {
           {isLoading ? (
             <>
               <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-              Logging in...
+              Đang đăng nhập...
             </>
           ) : (
-            "Login"
+            "Đăng nhập"
           )}
         </button>
       </form>
