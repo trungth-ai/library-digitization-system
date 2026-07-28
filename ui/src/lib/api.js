@@ -16,6 +16,23 @@ export function apiBase() {
 }
 
 /**
+ * Địa chỉ để server component TỰ GỌI route handler của chính Next.js.
+ *
+ * PHẢI là địa chỉ NỘI BỘ CỦA CHÍNH CONTAINER, KHÔNG phải URL công khai. Nếu dùng URL công khai
+ * (vd https://sohoa.hpu.edu.vn) thì lời gọi phải đi ra Internet → qua Caddy → quay lại container;
+ * mạng bridge của Docker thường không cho đường vòng đó nên fetch treo/lỗi, và trang tưởng người
+ * dùng CHƯA đăng nhập → hiện lại form đăng nhập mãi dù đăng nhập đã thành công.
+ *
+ * Dùng 127.0.0.1 thay cho "localhost": Node 18+ ưu tiên IPv6 (::1) trong khi Next bind 0.0.0.0,
+ * nên "localhost" có thể lỗi ECONNREFUSED bên trong container.
+ */
+export function siteBase() {
+  return (
+    process.env.SITE_INTERNAL_URL || `http://127.0.0.1:${process.env.PORT || 3000}`
+  ).replace(/\/+$/, "");
+}
+
+/**
  * Gọi API, luôn lấy dữ liệu mới (trang quản trị không được cache trạng thái cũ).
  * Trả về { ok, data, error } — KHÔNG ném lỗi, để trang còn dựng được và hiện thông báo
  * tiếng Việt thay vì trắng màn hình khi backend chưa chạy.

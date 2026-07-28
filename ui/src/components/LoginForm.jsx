@@ -55,11 +55,15 @@ export default function LoginForm({ dspaceUrl }) {
 
       if (statusData.authenticated) {
         setSuccess(`Xin chào, ${statusData.fullname}!`);
-        
-        // ✨ IMPORTANT: Refresh to trigger SSR
+
+        // Bỏ trạng thái "đang tải" NGAY: trước đây thiếu dòng này nên nút kẹt ở "Đang đăng nhập..."
+        // vĩnh viễn, và nếu bước dựng lại trang phía server thất bại thì người dùng không bấm lại được.
+        setIsLoading(false);
+
+        // Dựng lại trang phía server để nó thấy cookie phiên và hiện giao diện làm việc
         setTimeout(() => {
           router.refresh();
-        }, 500);
+        }, 300);
       } else {
         setError("DSpace nhận đăng nhập nhưng phiên không hợp lệ — thử lại hoặc xóa cookie.");
         setIsLoading(false);

@@ -2,9 +2,15 @@ import { headers } from "next/headers";
 import LoginForm from "@/components/LoginForm";
 import Header from "@/components/Header";
 import PageClient from "./page-client";
+import { siteBase } from "@/lib/api";
 
 const DSPACE_URL = process.env.NEXT_PUBLIC_DSPACE_URL;
-const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000";
+
+// ⚠️ TUYỆT ĐỐI KHÔNG dùng NEXT_PUBLIC_SITE_URL ở đây. Trang này chạy PHÍA SERVER và tự gọi route
+// handler của chính nó, nên phải đi bằng địa chỉ nội bộ container (SITE_INTERNAL_URL). Dùng URL công
+// khai sẽ bắt lời gọi đi ra Internet rồi quay lại — Docker thường chặn đường vòng đó, khiến kiểm tra
+// phiên luôn thất bại và người dùng bị kẹt ở form đăng nhập dù đã đăng nhập đúng.
+const SITE_URL = siteBase();
 
 /**
  * Check DSpace session server-side
