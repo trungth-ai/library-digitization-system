@@ -750,9 +750,23 @@ async def restore_job(job_id: str, actor: str = Query("api")):
 
 @app.get("/api/v2/stats")
 async def get_stats():
-    """Thống kê từ DB"""
+    """
+    Thống kê từ DB + tình trạng hàng đợi + SỐ WORKER ĐANG SỐNG.
+
+    `workers_alive` đếm khóa nhịp tim (TTL 60s) mà worker ghi mỗi vòng lặp. Có con số này thì giao
+    diện phân biệt được "đang xử lý, chờ chút" với "KHÔNG có worker nào chạy, đợi mãi cũng vô ích" —
+    trước đây hai trường hợp đó trông giống nhau y hệt.
+    """
     stats = db.get_stats()
     stats["queue_length"] = redis_client.llen(REDIS_QUEUE)
+
+    try:
+        # Keyspace nhỏ (một khóa/worker) nên scan rẻ; dùng scan_iter để không chặn Redis
+        stats["workers_alive"] = sum(1 for _ in redis_client.scan_iter("worker:heartbeat:*", count=100))
+    except Exception as e:  # noqa: BLE001 - Redis lỗi không được làm sập trang thống kê
+        logger.warning("Không đếm được worker đang sống: %s", e)
+        stats["workers_alive"] = None      # None = KHÔNG BIẾT, khác hẳn 0 = không có worker nào
+
     return stats
 
 

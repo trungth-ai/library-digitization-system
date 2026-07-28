@@ -3,7 +3,9 @@
 import React, { useState, useEffect, useRef } from "react";
 import { X, Save, Upload, RotateCcw, Plus, Trash2, ChevronDown, Pencil } from "lucide-react";
 
-const OCR_API_URL = process.env.NEXT_PUBLIC_OCR_API_URL;
+// Client gọi qua proxy same-origin của Next (/api/ocr/...) — KHÔNG dùng URL tuyệt đối tới
+// FastAPI: trình duyệt không chắc tới được địa chỉ đó, và URL http:// trên trang https sẽ bị
+// chặn vì mixed content. Đây là nguyên nhân lỗi "Failed to fetch" khi lưu collection.
 
 // ─── Dublin Core catalog ─────────────────────────────────────────────────────
 const DC_CATALOG = [
@@ -56,7 +58,7 @@ export default function MetadataSidePanel({ job, onClose, onSaved, onPush }) {
     if (!job) return;
     const load = async () => {
       try {
-        const res  = await fetch(`${OCR_API_URL}/api/v2/jobs/${job.job_id}/metadata`);
+        const res  = await fetch(`/api/ocr/jobs/${job.job_id}/metadata`);
         if (!res.ok) throw new Error();
         const data = await res.json();
         setFields(data.metadata || []);
@@ -86,7 +88,7 @@ export default function MetadataSidePanel({ job, onClose, onSaved, onPush }) {
   const handleSave = async () => {
     setSaving(true); setSaveMsg(null);
     try {
-      const res = await fetch(`${OCR_API_URL}/api/v2/jobs/${job.job_id}/metadata`, {
+      const res = await fetch(`/api/ocr/jobs/${job.job_id}/metadata`, {
         method: "PUT", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ metadata: fields }),
       });

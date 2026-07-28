@@ -7,7 +7,9 @@ import ReadyForDSpaceTable from "@/components/ReadyForDSpaceTable";
 import MetadataSidePanel from "@/components/MetadataSidePanel";
 import { useOCRJobs } from "@/hooks/useOCRJobs";
 
-const OCR_API_URL = process.env.NEXT_PUBLIC_OCR_API_URL;
+// Client gọi qua proxy same-origin của Next (/api/ocr/...) — KHÔNG dùng URL tuyệt đối tới
+// FastAPI: trình duyệt không chắc tới được địa chỉ đó, và URL http:// trên trang https sẽ bị
+// chặn vì mixed content. Đây là nguyên nhân lỗi "Failed to fetch" khi lưu collection.
 const DSPACE_URL  = process.env.NEXT_PUBLIC_DSPACE_URL;
 
 export default function PageClient({ session, initialCollections = [] }) {
@@ -61,7 +63,7 @@ export default function PageClient({ session, initialCollections = [] }) {
     if (!jobId || !collectionName) return;
     try {
       // Lay metadata hien tai
-      const res = await fetch(`${OCR_API_URL}/api/v2/jobs/${jobId}/metadata`);
+      const res = await fetch(`/api/ocr/jobs/${jobId}/metadata`);
       if (!res.ok) return;
       const data = await res.json();
       const fields = data.metadata || [];
@@ -77,7 +79,7 @@ export default function PageClient({ session, initialCollections = [] }) {
         updated = [...fields, { key: "dc.department", value: collectionName, language: "en_US" }];
       }
 
-      await fetch(`${OCR_API_URL}/api/v2/jobs/${jobId}/metadata`, {
+      await fetch(`/api/ocr/jobs/${jobId}/metadata`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ metadata: updated }),
@@ -129,7 +131,7 @@ export default function PageClient({ session, initialCollections = [] }) {
       // Fetch metadata tat ca jobs song song
       const metaResults = await Promise.allSettled(
         selectedJobs.map(async job => {
-          const res  = await fetch(`${OCR_API_URL}/api/v2/jobs/${job.job_id}/metadata`);
+          const res  = await fetch(`/api/ocr/jobs/${job.job_id}/metadata`);
           const data = res.ok ? await res.json() : { metadata: [] };
           const title = data.metadata?.find(m => m.key === "dc.title")?.value || job.filename;
           return {
@@ -197,7 +199,7 @@ export default function PageClient({ session, initialCollections = [] }) {
       await updateDSpaceStatus(job.job_id, "uploading").catch(() => {});
 
       // Lay metadata moi nhat tu DB
-      const metaRes  = await fetch(`${OCR_API_URL}/api/v2/jobs/${job.job_id}/metadata`);
+      const metaRes  = await fetch(`/api/ocr/jobs/${job.job_id}/metadata`);
       const metaData = metaRes.ok ? await metaRes.json() : { metadata: [] };
 
       // Tao item

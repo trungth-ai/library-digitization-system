@@ -23,6 +23,7 @@ import os
 from typing import Dict, List, Optional
 
 from scripts.core import metrics
+from scripts.core.exceptions import SensitivityViolation
 from scripts.providers.base import ExtractionResult, ExtractionSchema
 
 logger = logging.getLogger("core.extraction")
@@ -112,10 +113,20 @@ class ProviderMetadataExtractor:
         schema = resolve_schema(getattr(self.config, "document_type", "book"))
 
         # Ràng buộc cứng YC-DR-03: vi phạm thì PHẢI dừng, không được "cứ xử lý tạm".
-        # Ngoại lệ SensitivityViolation cố ý bay ra ngoài để worker cho job thất bại có mô tả.
+        # SensitivityViolation cố ý bay ra ngoài để worker cho job thất bại có mô tả.
         mode = router.resolve_mode(schema, self.requested_mode)
-        provider, fallback_from = fallback.select_provider(mode, config=self.config)
-        router.assert_mode_matches(provider, mode, schema.code)
+
+        # Chọn công cụ: lỗi CẤU HÌNH (thiếu gói, thiếu điểm cuối, tên công cụ lạ) KHÔNG được làm job
+        # thất bại. Tài liệu đã OCR xong rồi; cứ lưu phần trích được (dù rỗng) và đánh dấu cần xem lại
+        # để cán bộ xử lý tay — mất chất lượng còn hơn mất tài liệu (YC-MP-05).
+        try:
+            provider, fallback_from = fallback.select_provider(mode, config=self.config)
+            router.assert_mode_matches(provider, mode, schema.code)
+        except SensitivityViolation:
+            raise                      # ràng buộc cứng: phải dừng
+        except Exception as e:         # noqa: BLE001
+            logger.error("Không chọn được công cụ mô hình cho chế độ '%s': %s", mode, e)
+            return self._degraded_result(schema, mode, f"Không dùng được công cụ mô hình: {e}")
 
         text = select_context(pdf_path, schema)
 
@@ -155,6 +166,22 @@ class ProviderMetadataExtractor:
         self._persist(schema)
 
         return {"metadata": metadata, "extraction": dict(self.last_run)}
+
+    def _degraded_result(self, schema: ExtractionSchema, mode: str, reason: str) -> Dict:
+        """
+        Kết quả khi KHÔNG gọi được model: rỗng nhưng hợp lệ, có đánh dấu cần xem lại và ghi truy vết.
+        Dùng cho lỗi cấu hình — tài liệu vẫn đi tiếp trong quy trình, cán bộ nhập tay phần metadata.
+        """
+        self.last_run = {
+            "provider": "(không dùng được)", "deployment": mode, "mode": mode,
+            "model": "", "model_version": "", "schema_code": schema.code,
+            "sensitivity": schema.sensitivity, "attempts": 0, "errors": [reason],
+            "low_confidence_fields": [], "needs_review": True, "review_note": reason,
+            "fallback_from": None, "n_fields": 0, "error": reason,
+            "latency_ms": None, "rss_mb": None, "gpu_mem_mb": None,
+        }
+        self._persist(schema)
+        return {"metadata": [], "extraction": dict(self.last_run)}
 
     # -- Các bước con -----------------------------------------------------
     def _run_extraction(self, provider, text: str, schema: ExtractionSchema, quality):

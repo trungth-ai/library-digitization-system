@@ -2,7 +2,9 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 
-const OCR_API_URL = process.env.NEXT_PUBLIC_OCR_API_URL;
+// Client gọi qua proxy same-origin của Next (/api/ocr/...) — KHÔNG dùng URL tuyệt đối tới
+// FastAPI: trình duyệt không chắc tới được địa chỉ đó, và URL http:// trên trang https sẽ bị
+// chặn vì mixed content. Đây là nguyên nhân lỗi "Failed to fetch" khi lưu collection.
 
 export function useOCRJobs() {
   const [jobs, setJobs]       = useState([]);
@@ -47,7 +49,7 @@ export function useOCRJobs() {
       esRef.current.close();
     }
 
-    const es = new EventSource(`${OCR_API_URL}/api/v2/jobs/stream`);
+    const es = new EventSource('/api/ocr/stream');
     esRef.current = es;
 
     es.addEventListener('job_update', (e) => {
@@ -164,7 +166,7 @@ export function useOCRJobs() {
   // ---------------------------------------------------------------
 
   const saveDSpaceCollection = async (jobId, collectionId, collectionName, communityName = '') => {
-    const res = await fetch(`${OCR_API_URL}/api/v2/jobs/${jobId}/dspace-collection`, {
+    const res = await fetch(`/api/ocr/jobs/${jobId}/dspace-collection`, {
       method:  'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -186,7 +188,7 @@ export function useOCRJobs() {
   };
 
   const updateDSpaceStatus = async (jobId, dspaceStatus, { itemId, handle, error } = {}) => {
-    const res = await fetch(`${OCR_API_URL}/api/v2/jobs/${jobId}/dspace-status`, {
+    const res = await fetch(`/api/ocr/jobs/${jobId}/dspace-status`, {
       method:  'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -214,7 +216,7 @@ export function useOCRJobs() {
   };
 
   const resetDSpaceUpload = async (jobId) => {
-    const res = await fetch(`${OCR_API_URL}/api/v2/jobs/${jobId}/dspace-reset`, {
+    const res = await fetch(`/api/ocr/jobs/${jobId}/dspace-reset`, {
       method: 'POST',
     });
     if (!res.ok) {

@@ -62,6 +62,23 @@ PUBLIC_API_URL=https://sohoa.hpu.edu.vn/ocr-api
 Đổi hai biến này thì **phải build lại UI** (`docker compose up -d --build ui`) — Next.js nhúng
 `NEXT_PUBLIC_*` vào bundle lúc build, restart không có tác dụng.
 
+### Khắc phục sự cố thường gặp
+
+| Triệu chứng | Nguyên nhân | Cách sửa |
+|---|---|---|
+| Tài liệu treo mãi ở **"Chờ xử lý / Queued 10%"** | **Không có worker nào chạy.** `docker compose up -d --build ui` chỉ khởi động `ui` + `api` + `redis` — **worker KHÔNG nằm trong chuỗi phụ thuộc đó** | `docker compose up -d --build` (không kèm tên service) |
+| Vẫn treo, worker có chạy | Worker không nối được PostgreSQL | `docker compose logs worker \| grep "Chưa nối được PostgreSQL"` |
+| **"Failed to fetch"** khi lưu collection | Trình duyệt không tới được API. Đã sửa: mọi lời gọi từ client giờ đi qua proxy same-origin `/api/ocr/*` | `docker compose up -d --build ui` |
+| Thanh tiến độ không nhích | SSE bị đệm ở proxy | Caddy phải có `flush_interval -1` (xem block ở mục 0) |
+| Đăng nhập được nhưng quay lại form | `NEXT_PUBLIC_SITE_URL` bị dùng cho self-fetch | Đã sửa — dùng `SITE_INTERNAL_URL` |
+
+Kiểm nhanh có worker đang sống hay không:
+```bash
+curl -s http://127.0.0.1:8000/api/v2/stats | python3 -m json.tool | grep -E "queue_length|workers_alive"
+```
+`workers_alive: 0` kèm `queue_length > 0` nghĩa là **hàng đợi có việc mà không ai xử lý** — kiểm ngay
+`docker compose ps worker`.
+
 ## 1. Yêu cầu
 - Docker + Docker Compose trên server.
 - (Tùy chọn) Một công cụ mô hình tại chỗ — Ollama, vLLM hoặc llama.cpp, mỗi cái một profile riêng

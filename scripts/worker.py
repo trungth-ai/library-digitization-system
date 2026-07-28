@@ -38,6 +38,8 @@ REDIS_HOST  = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT  = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB    = int(os.getenv("REDIS_DB", "0"))
 REDIS_QUEUE = os.getenv("REDIS_QUEUE", "digitization_jobs")
+# Tiền tố khóa nhịp tim; API đếm số khóa này để biết có worker nào sống không
+WORKER_HEARTBEAT_PREFIX = "worker:heartbeat:"
 
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 
@@ -58,6 +60,9 @@ class DigitizationWorker:
         PostgreSQL thật — cùng lý do với ADR-005 (lazy import để test được tầng logic). Vận hành
         thật gọi `DigitizationWorker()` như trước, hành vi không đổi.
         """
+        # Mỗi replica một id riêng để đếm được số worker đang sống
+        self.worker_id = os.getenv("HOSTNAME") or f"pid-{os.getpid()}"
+
         if redis_client is not None:
             self.redis = redis_client
         else:
@@ -68,16 +73,17 @@ class DigitizationWorker:
                 db=REDIS_DB,
                 decode_responses=True
             )
-        logger.info(f"Worker initialized. Redis: {REDIS_HOST}:{REDIS_PORT}")
+        logger.info(f"Worker initialized. Redis: {REDIS_HOST}:{REDIS_PORT}, queue={REDIS_QUEUE}")
 
         if init_db:
-            # Worker là single process → pool nhỏ là đủ
-            db.init_pool(min_conn=1, max_conn=3)
-            logger.info("DB pool initialized")
+            self._init_db_with_retry()
 
         if USE_PROVIDER_LAYER:
-            from scripts.providers.factory import get_provider
             try:
+                # Import BÊN TRONG try: nếu lớp provider có vấn đề (thiếu gói, cấu hình lạ) thì worker
+                # vẫn phải khởi động và tiêu thụ hàng đợi — job sẽ lỗi có mô tả, còn hơn cả worker
+                # chết khiến MỌI tài liệu treo ở trạng thái "Chờ xử lý" mà không ai biết vì sao.
+                from scripts.providers.factory import get_provider
                 provider = get_provider()
                 health = provider.health()
                 logger.info(
@@ -96,12 +102,55 @@ class DigitizationWorker:
         else:
             logger.warning("Lớp provider TẮT và không có Claude API key — chỉ có basic extraction")
 
+    def _init_db_with_retry(self, max_wait: int = 30) -> None:
+        """
+        Mở connection pool, THỬ LẠI cho tới khi được.
+
+        VÌ SAO: `docker compose` không đợi PostgreSQL sẵn sàng mới chạy worker. Trước đây
+        `init_pool` lỗi là worker chết ngay, `restart: unless-stopped` cho nó chết lại vòng vòng —
+        và triệu chứng ở giao diện chỉ là tài liệu treo mãi ở "Chờ xử lý", không hề nói vì sao.
+        Thử lại thì container còn sống, log nêu rõ đang đợi cái gì.
+        """
+        delay, attempt = 1, 0
+        while True:
+            attempt += 1
+            try:
+                # Worker là single process → pool nhỏ là đủ
+                db.init_pool(min_conn=1, max_conn=3)
+                logger.info("DB pool initialized (lần thử %d)", attempt)
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    "Chưa nối được PostgreSQL (lần %d): %s — thử lại sau %ds. "
+                    "Kiểm tra service postgres đã chạy và POSTGRES_* có đúng chưa.",
+                    attempt, e, delay,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, max_wait)
+
+    def _beat(self):
+        """
+        Ghi nhịp tim vào Redis (TTL 60s) để API/giao diện biết CÓ worker đang sống.
+
+        VÌ SAO CẦN: khi không có worker nào chạy, tài liệu chỉ nằm im ở "Chờ xử lý" và giao diện
+        không nói gì cả — người dùng đợi mãi mà không biết là đang đợi vô ích. Có nhịp tim thì
+        giao diện báo được "không có worker nào đang chạy" thay vì im lặng.
+        Khóa hết hạn tự động nên worker đã tắt sẽ tự biến mất, không cần dọn.
+        """
+        try:
+            self.redis.setex(f"{WORKER_HEARTBEAT_PREFIX}{self.worker_id}", 60,
+                             datetime.now(timezone.utc).isoformat())
+        except Exception as e:  # noqa: BLE001 - nhịp tim hỏng không được làm dừng việc xử lý
+            logger.debug("Không ghi được nhịp tim: %s", e)
+
     def run(self):
-        logger.info("Worker started. Waiting for jobs...")
+        logger.info("Worker started (id=%s). Waiting for jobs on queue '%s'...",
+                    self.worker_id, REDIS_QUEUE)
 
         try:
             while True:
                 try:
+                    self._beat()
                     job = self.redis.blpop(REDIS_QUEUE, timeout=5)
 
                     if not job:

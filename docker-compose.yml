@@ -146,7 +146,11 @@ services:
     networks:
       - library-net
     depends_on:
+      # Worker cần CẢ HAI: Redis để lấy việc, PostgreSQL để ghi trạng thái. Trước đây chỉ khai `redis`
+      # nên worker khởi động trước PostgreSQL, mở pool thất bại rồi chết vòng vòng — tài liệu treo ở
+      # "Chờ xử lý" mà không có dấu hiệu gì. Nay có thêm `postgres` + worker tự thử lại (xem worker.py).
       - redis
+      - postgres
     # TÀI NGUYÊN: đặt qua .env để KHỚP VỚI MÁY CHỦ THẬT, không cứng trong file.
     # Giá trị cũ (2 worker × 10 CPU giới hạn / 8 CPU dự trữ = 20/16 CPU) làm Docker TỪ CHỐI khởi động
     # trên máy 4 CPU: "Range of CPUs is from 0.01 to 4.00".
