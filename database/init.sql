@@ -78,6 +78,11 @@ CREATE TABLE IF NOT EXISTS documents (
     needs_review           BOOLEAN     NOT NULL DEFAULT FALSE,  -- YC-CF-03: cần cán bộ xử lý tay
     review_note            TEXT,          -- lý do cần xem lại (lỗi hợp lệ, điểm tin cậy thấp)
 
+    -- Thời gian xử lý (theo dõi vận hành + YC-HN). `finished_at - created_at` KHÔNG dùng được vì
+    -- gồm cả thời gian nằm chờ trong hàng đợi; hai cột dưới đây đo đúng phần worker thực sự làm.
+    duration_ms            INTEGER,       -- tổng thời gian worker xử lý tài liệu này
+    stage_timings          JSONB,         -- {"ocr": 41230, "extract": 1820, "export": 260} (ms)
+
     -- DSpace tracking
     dspace_status          VARCHAR(50) NOT NULL DEFAULT 'pending'
                                REFERENCES dspace_upload_statuses(code),
@@ -323,6 +328,39 @@ CREATE INDEX IF NOT EXISTS idx_model_calls_provider ON model_calls(provider, dep
 
 DROP TRIGGER IF EXISTS trg_model_calls_touch ON model_calls;
 CREATE TRIGGER trg_model_calls_touch BEFORE UPDATE ON model_calls
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- =====================================================================
+-- 7e. SỰ KIỆN HỆ THỐNG — lỗi & trạng thái kết nối (theo dõi vận hành)
+--   KHÁC `audit_log`: audit ghi thao tác NGHIỆP VỤ của con người và bất biến; bảng này ghi sự cố
+--   HẠ TẦNG (mất Redis/PostgreSQL, lỗi vòng lặp worker, công cụ mô hình không dùng được).
+--   Trộn hai loại vào một bảng sẽ làm nhật ký kiểm toán bị nhiễu bởi sự cố kỹ thuật.
+--
+--   VÌ SAO CẦN: trước đây lỗi chỉ nằm trong log container. Muốn biết "hôm qua worker có mất kết nối
+--   Redis lần nào không" thì phải đọc log thủ công, mà log container bị cắt vòng.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS system_events (
+    id          BIGSERIAL PRIMARY KEY,
+    source      VARCHAR(50)  NOT NULL,          -- worker | api | ui
+    instance    VARCHAR(150),                   -- id/hostname của tiến trình (phân biệt replica)
+    kind        VARCHAR(50)  NOT NULL,          -- redis_down|redis_up|db_down|db_up|worker_error|...
+    level       VARCHAR(20)  NOT NULL DEFAULT 'error',   -- info | warning | error
+    message     TEXT         NOT NULL,
+    detail      TEXT,                           -- traceback hoặc thông tin thêm
+    document_id TEXT,                           -- tài liệu liên quan (nếu có)
+    status      VARCHAR(20)  NOT NULL DEFAULT 'new',     -- new | resolved (vd Redis nối lại được)
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_events_created ON system_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_system_events_level   ON system_events(level, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_system_events_kind    ON system_events(kind);
+CREATE INDEX IF NOT EXISTS idx_system_events_open    ON system_events(kind)
+    WHERE status = 'new';
+
+DROP TRIGGER IF EXISTS trg_system_events_touch ON system_events;
+CREATE TRIGGER trg_system_events_touch BEFORE UPDATE ON system_events
     FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 
 -- =====================================================================

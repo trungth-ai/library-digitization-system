@@ -1,6 +1,6 @@
 # DocuFlow HP — Trạng thái nâng cấp & Bàn giao
 
-> Cập nhật: 26/07/2026. Repo: `github.com/trungth-ai/library-digitization-system`.
+> Cập nhật: 29/07/2026. Repo: `github.com/trungth-ai/library-digitization-system`.
 > Số commit mới nhất: xem `git log --oneline`. Tài liệu này để kỹ sư tiếp quản (YC-VH-01) nắm nhanh:
 > đã làm gì, cách kiểm chứng, còn gì — và **bắt đầu lần nâng cấp tiếp theo từ mục 4**.
 
@@ -19,6 +19,8 @@
 | 1 | **YC-MS-08** trang quản trị công cụ/model + tình trạng | `/cong-cu`, `/api/v2/providers` | UI build + pytest |
 | — | **Chuẩn HPU: xóa mềm** (giữ file), `updated_at` + trigger, `purge` tách riêng có audit | `db.py`, `init.sql`, migration 001 | 39 kiểm chứng PG thật |
 | — | Nối `/bao-cao` vào API thật (bỏ dữ liệu mẫu) | `ui/src/app/bao-cao` | UI build exit 0 |
+| — | **Theo dõi vận hành** (ADR-009): sửa lỗi Redis TimeoutError, bảng `system_events`, đo thời gian xử lý p50/p95, `/api/v2/health/detailed`, trang `/cong-cu` | `worker.py`, `db.py`, `api.py`, `ui/src/app/cong-cu` | 11 pytest + 21 PG thật + 17 Next thật |
+| — | Client gọi API qua proxy same-origin (hết "Failed to fetch") + hiện lý do lỗi đẩy DSpace | `ui/src/app/api/ocr/*`, `page-client.jsx` | 17 kiểm chứng Next thật |
 | 1 | Điểm tin cậy + chống ảo giác | `scripts/core/quality.py` | pytest |
 | 2 | Audit log bất biến | `scripts/core/audit.py` + bảng `audit_log` | verify PostgreSQL |
 | 2 | Báo cáo (chế độ / tỉ lệ sửa / throughput) | `scripts/core/reports.py` | verify psycopg2 + PG |
@@ -28,13 +30,14 @@
 | 3 | Chia đoạn theo cấu trúc (RAG) | `scripts/core/chunking.py` | pytest |
 | — | **Deploy hardening** (font system, /api/health, .dockerignore, healthcheck, next.config, install.sh) | nhiều | **UI build exit 0 (không TLS flag)** |
 
-**213 pytest PASS · 62 kiểm chứng trên PostgreSQL 17 thật (schema mới + schema cũ đã migrate) · UI build exit 0.**
+**224 pytest PASS · 83 kiểm chứng trên PostgreSQL 17 thật · 34 kiểm chứng route/trang trên Next server thật · UI build exit 0.**
 Không hồi quy đường Claude (KT-KH có test chốt). ⚠️ Lần này **CÓ thay đổi pipeline** (ADR-008) —
-van lùi `USE_PROVIDER_LAYER=0`; DB đã tồn tại **phải chạy `database/migrations/001_*.sql`**.
+van lùi `USE_PROVIDER_LAYER=0`; DB đã tồn tại **phải chạy cả `001_*.sql` và `002_monitoring.sql`**
+trong `database/migrations/`.
 
 ## 2. Cách kiểm chứng
 ```bash
-python -m pytest tests/ -q                 # 213 passed (không cần DB/mạng)
+python -m pytest tests/ -q                 # 224 passed (không cần DB/mạng)
 python -m scripts.eval.run_eval --list-providers   # bảng công cụ mô hình khả dụng
 python -m scripts.eval.run_eval --health           # kiểm tra sẵn sàng (YC-MS-04)
 cd ui && npm run build                     # UI build (KHÔNG cần TLS flag sau khi bỏ Google font)
@@ -73,7 +76,7 @@ Thứ tự đề xuất (bắt đầu từ đây):
 - `docs/PRODUCT.md` — mô tả sản phẩm + kiến trúc hai chế độ + RAG.
 - `docs/REQUIREMENTS.md` — bảng yêu cầu YC-* + chuẩn HPU.
 - `docs/ROADMAP.md` — lộ trình chia sprint (GĐ0-3).
-- `docs/DECISIONS.md` — ADR-001..008 (quyết định kiến trúc).
+- `docs/DECISIONS.md` — ADR-001..009 (quyết định kiến trúc).
 - `docs/DEPLOY.md` — hướng dẫn triển khai + checklist.
 - `docs/LOCAL_MODE.md` — chọn/bật công cụ mô hình (Ollama, vLLM, llama.cpp...) + kiểm chứng ngắt mạng.
 - `docs/EVAL.md` — đo số liệu 2 chế độ cho hồ sơ.

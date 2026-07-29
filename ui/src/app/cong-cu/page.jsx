@@ -55,17 +55,102 @@ function ReadyBadge({ ready }) {
   );
 }
 
+/** Đổi ms sang chuỗi người đọc được: 41230 → "41,2 giây". Dấu "—" = CHƯA ĐO ĐƯỢC, không phải 0. */
+function ms(value) {
+  if (value === null || value === undefined) return "—";
+  if (value < 1000) return `${value} ms`;
+  if (value < 60000) return `${(value / 1000).toFixed(1).replace(".", ",")} giây`;
+  return `${Math.floor(value / 60000)} phút ${Math.round((value % 60000) / 1000)} giây`;
+}
+
+const LEVEL_STYLE = {
+  error: "bg-hpu-danger-light text-hpu-danger",
+  warning: "bg-hpu-warning-light text-hpu-warning",
+  info: "bg-gray-100 text-gray-600",
+};
+
 export default async function CongCuPage() {
-  const providers = await fetchApi("/api/v2/providers");
-  const calls = await fetchApi("/api/v2/model-calls?summary=true&limit=2000");
+  // Gọi song song — trang theo dõi không nên chờ tuần tự 5 lượt
+  const [providers, calls, health, events, timing] = await Promise.all([
+    fetchApi("/api/v2/providers"),
+    fetchApi("/api/v2/model-calls?summary=true&limit=2000"),
+    fetchApi("/api/v2/health/detailed"),
+    fetchApi("/api/v2/system-events?since_hours=168&limit=20"),
+    fetchApi("/api/v2/reports/processing-time?since_hours=24"),
+  ]);
 
   const view = providers.data || {};
   const current = view.current || null;
   const summary = calls.data || { by_provider: [], total_calls: 0 };
+  const components = health.data?.components || {};
+  const systemEvents = events.data || [];
+  const perf = timing.data || {};
+  const openErrors = systemEvents.filter((e) => e.level === "error" && e.status === "new");
 
   return (
-    <PageShell title="Công cụ mô hình" activeKey="tools">
+    <PageShell title="Công cụ mô hình & Theo dõi vận hành" activeKey="tools">
       {!providers.ok && <ErrorBox message={providers.error} />}
+
+      {/* ── TÌNH TRẠNG TỪNG THÀNH PHẦN ───────────────────────────────
+          Khi hệ thống "im lặng", câu hỏi thật là CÁI NÀO đang hỏng. Một chữ "ok" chung không
+          trả lời được, nên hiện từng thành phần kèm lý do bằng tiếng Việt. */}
+      <div className="mb-5">
+        <h2 className="text-base font-semibold text-gray-800 mb-2">Tình trạng hệ thống</h2>
+        {!health.ok ? (
+          <ErrorBox title="Không đọc được tình trạng hệ thống" message={health.error} />
+        ) : (
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            {[
+              ["redis", "Redis (hàng đợi)"],
+              ["postgres", "PostgreSQL"],
+              ["worker", "Worker xử lý"],
+              ["model_provider", "Công cụ mô hình"],
+            ].map(([key, label]) => {
+              const c = components[key] || {};
+              return (
+                <div
+                  key={key}
+                  className={`rounded-xl border p-3 ${
+                    c.ready
+                      ? "bg-white border-gray-200"
+                      : "bg-hpu-danger-light border-hpu-danger/30"
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`w-2 h-2 rounded-full shrink-0 ${
+                        c.ready ? "bg-hpu-success" : "bg-hpu-danger"
+                      }`}
+                    />
+                    <span className="text-sm font-medium text-gray-800">{label}</span>
+                  </div>
+                  <p
+                    className={`text-xs mt-1 ${c.ready ? "text-gray-500" : "text-hpu-danger"}`}
+                  >
+                    {c.detail || "—"}
+                  </p>
+                  {key === "redis" && c.queue_length !== null && c.queue_length !== undefined && (
+                    <p className="text-xs text-gray-500 mt-1">
+                      Hàng đợi: <strong>{formatNumber(c.queue_length)}</strong> tài liệu
+                    </p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* ── THỜI GIAN XỬ LÝ ─────────────────────────────────────────
+          p50 nói "thường mất bao lâu", p95 nói "trường hợp xấu tới đâu". Chỉ xem trung bình thì
+          một tài liệu 500 trang sẽ che mất thực tế của phần lớn tài liệu. */}
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-5">
+        <StatCard label="Tài liệu đã đo (24h)" value={perf.so_tai_lieu ?? 0} />
+        <StatCard label="Thường mất (p50)" value={ms(perf.p50_ms)} tone="success" />
+        <StatCard label="Chậm nhất 5% (p95)" value={ms(perf.p95_ms)} tone="warning" />
+        <StatCard label="Trung bình" value={ms(perf.tb_ms)} />
+        <StatCard label="Lâu nhất" value={ms(perf.max_ms)} tone="danger" />
+      </div>
 
       {/* Công cụ đang dùng */}
       {current?.error ? (
@@ -237,6 +322,79 @@ export default async function CongCuPage() {
           ⚠️ Rà giấy phép model TRƯỚC khi tải về/sử dụng — xem <code>docs/LICENSES.md</code> (YC-PL-01/02).
         </p>
       </Card>
+
+      {/* ── SỰ KIỆN & LỖI HẠ TẦNG ───────────────────────────────────
+          Trước đây lỗi chỉ nằm trong log container — mà log bị cắt vòng, nên "hôm qua worker có mất
+          kết nối Redis lần nào không" là câu không trả lời được. Bảng này lưu trong DB nên tra được. */}
+      <div className="mt-4">
+        <Card
+          title={`Sự kiện hệ thống 7 ngày qua (${systemEvents.length})`}
+          subtitle="Mất/nối lại kết nối, lỗi worker, tài liệu xử lý thất bại. Khác nhật ký kiểm toán: đây là sự cố hạ tầng."
+        >
+          {openErrors.length > 0 && (
+            <div className="mb-3 rounded-lg bg-hpu-danger-light border border-hpu-danger/30 p-3 text-sm text-hpu-danger">
+              <strong>{openErrors.length} lỗi chưa khắc phục</strong> — xem danh sách bên dưới.
+            </div>
+          )}
+
+          {systemEvents.length ? (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-gray-500 border-b border-gray-100">
+                    <th className="py-2 font-medium">Thời điểm</th>
+                    <th className="py-2 font-medium">Mức</th>
+                    <th className="py-2 font-medium">Loại</th>
+                    <th className="py-2 font-medium">Nội dung</th>
+                    <th className="py-2 font-medium">Nguồn</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {systemEvents.map((e) => (
+                    <tr key={e.id} className="border-b border-gray-50 align-top">
+                      <td className="py-2 text-gray-500 whitespace-nowrap text-xs">
+                        {new Date(e.created_at).toLocaleString("vi-VN")}
+                      </td>
+                      <td className="py-2">
+                        <span
+                          className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${
+                            LEVEL_STYLE[e.level] || LEVEL_STYLE.info
+                          }`}
+                        >
+                          {e.level}
+                        </span>
+                        {e.status === "resolved" && (
+                          <span className="ml-1 text-xs text-hpu-success">đã khắc phục</span>
+                        )}
+                      </td>
+                      <td className="py-2 font-mono text-xs text-gray-600">{e.kind}</td>
+                      <td className="py-2 text-gray-800 max-w-md break-words">
+                        {e.message}
+                        {e.detail && (
+                          <span
+                            className="block text-xs text-gray-400 mt-0.5 line-clamp-2"
+                            title={e.detail}
+                          >
+                            {e.detail}
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-2 text-xs text-gray-500 whitespace-nowrap">
+                        {e.source}
+                        {e.instance && <span className="block text-gray-400">{e.instance}</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="text-sm text-gray-500">
+              Không có sự kiện nào trong 7 ngày qua — hệ thống chạy êm.
+            </p>
+          )}
+        </Card>
+      </div>
     </PageShell>
   );
 }

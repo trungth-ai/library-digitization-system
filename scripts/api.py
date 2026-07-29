@@ -889,6 +889,105 @@ async def api_model_calls(
 
 
 # ---------------------------------------------------------------------
+# ROUTES - THEO DÕI VẬN HÀNH (trạng thái kết nối, lỗi, thời gian xử lý)
+# ---------------------------------------------------------------------
+
+@app.get("/api/v2/health/detailed")
+async def api_health_detailed():
+    """
+    Tình trạng TỪNG thành phần, thay vì một chữ "ok" chung.
+
+    Vì sao cần: `/health` cũ chỉ kiểm Redis. Khi hệ thống "im lặng" thì câu hỏi thật là *cái nào*
+    đang hỏng — Redis, PostgreSQL, worker, hay công cụ mô hình. Mỗi thành phần trả `ready` + `detail`
+    bằng tiếng Việt để người vận hành đọc được ngay, không phải suy từ mã lỗi.
+    """
+    components = {}
+
+    # Redis + hàng đợi
+    try:
+        redis_client.ping()
+        queue_len = redis_client.llen(REDIS_QUEUE)
+        workers = sum(1 for _ in redis_client.scan_iter("worker:heartbeat:*", count=100))
+        components["redis"] = {"ready": True, "detail": "Kết nối bình thường",
+                               "queue_length": queue_len, "workers_alive": workers}
+    except Exception as e:  # noqa: BLE001
+        components["redis"] = {"ready": False, "detail": f"Không nối được Redis: {e}",
+                               "queue_length": None, "workers_alive": None}
+
+    # PostgreSQL
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        components["postgres"] = {"ready": True, "detail": "Kết nối bình thường"}
+    except Exception as e:  # noqa: BLE001
+        components["postgres"] = {"ready": False, "detail": f"Không nối được PostgreSQL: {e}"}
+
+    # Công cụ mô hình đang cấu hình
+    try:
+        from scripts.providers.factory import get_provider
+        provider = get_provider()
+        h = provider.health()
+        components["model_provider"] = {
+            "ready": h.ready, "detail": h.detail,
+            "provider": provider.name, "deployment": provider.deployment, "model": provider.model,
+        }
+    except Exception as e:  # noqa: BLE001
+        components["model_provider"] = {"ready": False, "detail": f"Cấu hình không dùng được: {e}"}
+
+    # Worker: có nhịp tim nào không, và hàng đợi có bị ứ không
+    redis_info = components["redis"]
+    workers_alive = redis_info.get("workers_alive")
+    queue_length = redis_info.get("queue_length")
+    if workers_alive is None:
+        components["worker"] = {"ready": False, "detail": "Không đọc được Redis nên chưa rõ"}
+    elif workers_alive == 0:
+        components["worker"] = {
+            "ready": False,
+            "detail": ("KHÔNG có worker nào đang chạy"
+                       + (f" — {queue_length} tài liệu đang chờ vô ích. "
+                          "Chạy `docker compose up -d --build` (KHÔNG kèm tên service)."
+                          if queue_length else ".")),
+        }
+    else:
+        components["worker"] = {"ready": True,
+                                "detail": f"{workers_alive} worker đang chạy"}
+
+    all_ready = all(c.get("ready") for c in components.values())
+    return success(
+        {"ready": all_ready, "components": components},
+        "Hệ thống bình thường" if all_ready else "Có thành phần chưa sẵn sàng",
+    )
+
+
+@app.get("/api/v2/system-events")
+async def api_system_events(
+    level:       Optional[str] = Query(None, description="info | warning | error"),
+    kind:        Optional[str] = Query(None),
+    status:      Optional[str] = Query(None, description="new | resolved"),
+    since_hours: Optional[int] = Query(None, ge=1, le=720),
+    limit:       int           = Query(100, ge=1, le=1000),
+):
+    """Sự kiện hạ tầng: mất/nối lại kết nối, lỗi vòng lặp worker, job thất bại (theo dõi vận hành)."""
+    rows = db.list_system_events(level=level, kind=kind, status=status,
+                                since_hours=since_hours, limit=limit)
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+    return success(rows, "Sự kiện hệ thống")
+
+
+@app.get("/api/v2/reports/processing-time")
+async def api_processing_time(since_hours: int = Query(24, ge=1, le=720)):
+    """
+    Thời gian xử lý tài liệu (YC-HN). Trả p50/p95 chứ không chỉ trung bình: một tài liệu 500 trang
+    kéo trung bình lên và che mất thực tế của phần lớn tài liệu.
+    """
+    return success(db.processing_time_summary(since_hours=since_hours),
+                   f"Thời gian xử lý {since_hours} giờ gần nhất")
+
+
+# ---------------------------------------------------------------------
 # GLOBAL ERROR HANDLER
 # ---------------------------------------------------------------------
 

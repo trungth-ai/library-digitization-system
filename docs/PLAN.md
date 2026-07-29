@@ -4,7 +4,7 @@
 > **Phạm vi hẹp: chỉ việc của sprint hiện tại.** Tiến độ tổng thể xem `docs/STATUS.md`; lộ trình dài hạn
 > xem `docs/ROADMAP.md`; quyết định kiến trúc ghi ở `docs/DECISIONS.md`.
 
-**Cập nhật:** 26/07/2026 · **Giai đoạn:** GĐ 0 → GĐ 1 (hạn hồ sơ **30/7/2026** — còn 4 ngày)
+**Cập nhật:** 29/07/2026 · **Giai đoạn:** GĐ 0 → GĐ 1 (hạn hồ sơ **30/7/2026** — còn 1 ngày)
 
 ---
 
@@ -35,6 +35,19 @@
 **Nợ kỹ thuật đã trả:** `delete_job` hard delete → xóa mềm · thiếu `updated_at` · `utcnow()` deprecated ·
 đoạn code chết trong `update_metadata` · sidebar toàn `href="#"` · `redis` import cứng làm worker không
 test được · `src/core/responses.py` trong tài liệu là đường dẫn không tồn tại.
+
+## Sprint vừa xong: chạy được trên máy chủ thật + theo dõi vận hành (ADR-009) ✅
+
+| Việc | Kiểm chứng |
+|---|---|
+| Vừa máy chủ 4 CPU, hết xung đột cổng với Caddy trung tâm | `docker compose` chạy được |
+| Client gọi API qua proxy same-origin (hết "Failed to fetch") | 17 kiểm chứng Next server thật |
+| **Sửa lỗi `redis.exceptions.TimeoutError`** — BLPOP hết giờ không phải lỗi | 11 pytest |
+| Nhịp tim worker → giao diện báo được "không có worker nào chạy" | pytest |
+| Worker tự thử lại khi PostgreSQL chưa sẵn sàng (thay vì chết vòng vòng) | pytest |
+| Bảng `system_events` + đo thời gian xử lý p50/p95 | 21 kiểm chứng PG thật |
+| Trang `/cong-cu`: tình trạng từng thành phần + lỗi + thời gian xử lý | 17 kiểm chứng Next thật |
+| Hiện lý do thật khi đẩy DSpace thất bại (6 bước, kèm phản hồi DSpace) | UI build exit 0 |
 
 ---
 
@@ -73,6 +86,7 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
 
 ---
 
+
 ## Việc code còn nợ (chưa xếp sprint)
 
 - **UI:** trang duyệt tài liệu `needs_review` (tô màu trường điểm thấp bằng `ConfidenceBadge`) và
@@ -85,6 +99,11 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
   `AFTER UPDATE` không kích hoạt (đã ghi chú trong `init.sql`). Muốn có lịch sử đầy đủ thì chuyển sang
   câu `UPDATE`, hoặc ghi lịch sử ở tầng ứng dụng.
 - **Chuẩn hóa `NEXT_PUBLIC` build-args** cho UI image (xem `docs/DEPLOY.md` mục 4).
+- **Dọn `system_events` theo tuổi** — bảng sẽ lớn dần, chưa có cơ chế xóa bản ghi cũ. Chưa gấp
+  (mỗi sự kiện là một dòng nhỏ, và chỉ ghi khi ĐỔI trạng thái) nhưng cần trước khi chạy dài hạn.
+- **Đẩy DSpace đang thất bại trên máy chủ** — đã hiện lý do thật ở giao diện; chờ nguyên văn phản
+  hồi của DSpace để xác định (nghi: DSpace 6 REST cho đọc công khai nhưng ghi cần
+  `rest-dspace-token` chứ không chỉ cookie `JSESSIONID`).
 
 ## Định nghĩa "Hoàn thành" (mọi sprint)
 - [ ] Không phá endpoint/UI đang chạy (KT-KH pass)

@@ -71,6 +71,8 @@ PUBLIC_API_URL=https://sohoa.hpu.edu.vn/ocr-api
 | **"Failed to fetch"** khi lưu collection | Trình duyệt không tới được API. Đã sửa: mọi lời gọi từ client giờ đi qua proxy same-origin `/api/ocr/*` | `docker compose up -d --build ui` |
 | Thanh tiến độ không nhích | SSE bị đệm ở proxy | Caddy phải có `flush_interval -1` (xem block ở mục 0) |
 | Đăng nhập được nhưng quay lại form | `NEXT_PUBLIC_SITE_URL` bị dùng cho self-fetch | Đã sửa — dùng `SITE_INTERNAL_URL` |
+| Log worker ngập `redis.exceptions.TimeoutError: Timeout reading from socket` | **KHÔNG phải lỗi** — `BLPOP` hết giờ chờ khi hàng đợi rỗng, nhưng redis-py áp thời hạn đọc socket theo `timeout` của lệnh | Đã sửa (ADR-009): `socket_timeout=None` + bắt riêng `TimeoutError`. Nếu tái diễn, kiểm không ai đặt lại `socket_timeout` |
+| Không biết thành phần nào đang hỏng | — | `curl -s http://127.0.0.1:8000/api/v2/health/detailed \| python3 -m json.tool` hoặc mở trang `/cong-cu` |
 
 Kiểm nhanh có worker đang sống hay không:
 ```bash
@@ -111,7 +113,7 @@ docker compose exec ollama ollama pull qwen2.5:7b   # chỉ mô hình đã rà g
 ```bash
 docker compose ps                       # tất cả service 'healthy'
 curl http://localhost:8000/health       # API: {"status":"ok",...}
-curl http://localhost:3000/api/health   # UI:  {"status":"ok","service":"ui"}
+curl http://localhost:3200/api/health   # UI:  {"status":"ok","service":"ui"}  (cổng mới, xem mục 0)
 ```
 - PostgreSQL tự chạy `database/init.sql` khi khởi tạo volume LẦN ĐẦU (tạo bảng documents, job_statuses,
   metadata_fields, audit_log, extraction_schemas, model_calls... + seed lookup).
@@ -129,8 +131,16 @@ docker compose exec -T postgres psql -U "$POSTGRES_USER" -d library_digitization
     < database/migrations/001_provider_layer_and_soft_delete.sql
 ```
 
-Migration idempotent (chạy lại nhiều lần không sao) và không xóa dữ liệu — đã kiểm chứng: áp 2 lần
-liên tiếp không lỗi, tài liệu + metadata cũ nguyên vẹn, `updated_at` được điền theo `created_at`.
+Bản nâng cấp theo dõi vận hành (ADR-009) cần thêm migration 002:
+
+```bash
+docker compose exec -T postgres psql -U "$POSTGRES_USER" -d library_digitization \
+    < database/migrations/002_monitoring.sql
+```
+
+Cả hai migration đều idempotent (chạy lại nhiều lần không sao) và không xóa dữ liệu — đã kiểm
+chứng trên PostgreSQL 17 thật: áp 2 lần liên tiếp không lỗi, tài liệu + metadata cũ nguyên vẹn,
+`updated_at` được điền theo `created_at`.
 
 Kiểm tra sau khi chạy:
 ```bash

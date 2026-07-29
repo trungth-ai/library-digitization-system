@@ -5,6 +5,56 @@
 
 ---
 
+## ADR-009: Theo dõi vận hành — sự kiện hạ tầng tách khỏi nhật ký kiểm toán
+**Status:** Accepted · **Date:** 2026-07-29 · **Decided by:** Đội phát triển
+
+**Context:** Ba lần liên tiếp khi deploy, triệu chứng đều là **sự im lặng**: tài liệu treo ở "Chờ xử lý"
+(không có worker), "Failed to fetch" (không rõ URL nào), "Failed to push" (không rõ bước nào). Mỗi lần
+đều mất một vòng trao đổi chỉ để biết chuyện gì đang xảy ra. Song song đó, log worker ngập traceback
+`redis.exceptions.TimeoutError: Timeout reading from socket` — một chuyện **bình thường** bị báo như lỗi.
+
+**Decision:**
+1. **`BLPOP` hết giờ chờ KHÔNG phải lỗi.** redis-py áp thời hạn đọc socket theo chính `timeout` của
+   lệnh chặn, nên phản hồi "hàng đợi rỗng" về chậm một nhịp là ném `TimeoutError`. Client tạo với
+   `socket_timeout=None` (bắt buộc cho lệnh chặn) + `socket_keepalive` + `health_check_interval=30`,
+   và vòng lặp bắt riêng `TimeoutError` → `continue` không ghi lỗi, không ngủ.
+   `_redis_exception_classes()` là hàm module-level để test dựng được tình huống này trên máy không
+   cài redis — nếu để lấy lớp ngoại lệ ngay trong `run()` thì đúng lỗi production lại không test được.
+2. **Bảng `system_events` TÁCH KHỎI `audit_log`.** Audit ghi thao tác **nghiệp vụ** của con người và
+   bất biến (YC-AU-03); `system_events` ghi sự cố **hạ tầng**. Trộn vào một bảng sẽ làm nhật ký kiểm
+   toán bị nhiễu bởi mỗi lần Redis chớp mạng, và nhật ký kiểm toán thì không được xóa.
+3. **Ghi theo LẦN ĐỔI trạng thái, không ghi mỗi vòng.** Mỗi 5 giây một dòng sẽ làm bảng vô dụng. Cái
+   người vận hành cần là "mất lúc nào, nối lại lúc nào" → có thêm `status='resolved'`. Lần quan sát
+   đầu tiên mà kết nối bình thường thì **không** báo "đã nối lại" — chưa mất thì không có gì để nối
+   lại (test bắt được lỗi này của bản đầu).
+4. **Thời gian xử lý đo phần worker THỰC SỰ làm** (`duration_ms` + `stage_timings`), không dùng
+   `finished_at - created_at` vì con số đó gồm cả thời gian nằm chờ hàng đợi — nói về tải hệ thống chứ
+   không nói về hiệu năng. Báo cáo dùng **p50/p95**, không chỉ trung bình: một tài liệu 500 trang kéo
+   trung bình lên và che mất thực tế của phần lớn tài liệu.
+5. **`/api/v2/health/detailed` trả tình trạng TỪNG thành phần** (Redis, PostgreSQL, worker, công cụ
+   mô hình) kèm lý do tiếng Việt. Khi hệ thống im lặng, câu hỏi thật là *cái nào* đang hỏng — một chữ
+   "ok" chung không trả lời được.
+6. **Trường chưa đo được để `None`, không để 0.** `workers_alive: null` nghĩa là không đọc được Redis;
+   `0` nghĩa là chắc chắn không có worker nào. Hai điều đó dẫn tới hai hành động khác nhau.
+
+**Rationale:** Chi phí lớn nhất trong ba lần deploy vừa rồi không phải sửa lỗi mà là **tìm ra lỗi gì**.
+Đầu tư vào khả năng quan sát rẻ hơn nhiều so với mỗi sự cố lại mất một vòng trao đổi — và với hệ thống
+mà người vận hành không phải người viết mã, thông báo đọc được chính là điều kiện để họ tự xử lý.
+
+**Consequences:** ✅ Hết ngập log lỗi giả, job được nhận nhanh hơn (không còn ngủ 2s mỗi vòng).
+✅ Tra được lịch sử sự cố sau khi log container đã bị cắt vòng. ✅ Có số liệu hiệu năng thật cho hồ sơ
+(YC-HN) lấy từ vận hành, không cần chạy harness riêng. ✅ 224 pytest + 21 kiểm chứng PostgreSQL thật +
+17 kiểm chứng trang theo dõi trên Next server thật.
+⚠️ Cần chạy `database/migrations/002_monitoring.sql` trên DB đã tồn tại.
+⚠️ `system_events` sẽ lớn dần — chưa có cơ chế dọn theo tuổi (xem PLAN.md).
+
+**Alternatives:** (a) Ghi sự cố hạ tầng vào `audit_log` — làm nhiễu nhật ký bất biến, bị loại; (b) đặt
+`socket_timeout` bằng một giá trị lớn hơn `BLPOP timeout` — vẫn còn cửa sổ đua, và không diễn tả được
+ý "lệnh chặn thì không có thời hạn đọc"; (c) dùng Prometheus/Grafana cho toàn bộ theo dõi — hạ tầng
+nặng cho một đội hai người, và `grafana` đã có sẵn ở profile `extras` nếu sau này cần.
+
+---
+
 ## ADR-008: Nối pipeline vào lớp provider + xóa mềm + dự phòng chỉ trong cùng chế độ
 **Status:** Accepted · **Date:** 2026-07-26 · **Decided by:** Đội phát triển
 

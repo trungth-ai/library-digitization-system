@@ -7,6 +7,7 @@ Cài đặt: pip install psycopg2-binary>=2.9.9
 Biến môi trường: DATABASE_URL=postgresql://user:password@host:5432/library_digitization
 """
 
+import json
 import os
 import logging
 from contextlib import contextmanager
@@ -865,3 +866,139 @@ def purge_document(job_id: str) -> bool:
 
     logger.warning(f"PURGED (xóa vật lý) document: {job_id} → {purged}")
     return purged
+
+
+# =============================================================
+# THEO DÕI VẬN HÀNH: thời gian xử lý + sự kiện hệ thống
+# =============================================================
+
+def set_job_timing(job_id: str, duration_ms: int,
+                   stage_timings: Optional[Dict] = None) -> None:
+    """
+    Ghi thời gian worker THỰC SỰ xử lý tài liệu (không tính thời gian nằm chờ hàng đợi).
+
+    `finished_at - created_at` không dùng được cho mục đích này: tài liệu có thể nằm chờ hàng giờ
+    nếu hàng đợi dài, con số đó nói về tải hệ thống chứ không nói về hiệu năng xử lý.
+    """
+    sql = """
+        UPDATE documents
+        SET duration_ms   = %(duration_ms)s,
+            stage_timings = %(stage_timings)s::jsonb
+        WHERE id = %(job_id)s
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {
+                "job_id": job_id,
+                "duration_ms": duration_ms,
+                "stage_timings": json.dumps(stage_timings, ensure_ascii=False) if stage_timings else None,
+            })
+
+    logger.debug(f"Job timing saved: {job_id} → {duration_ms}ms {stage_timings}")
+
+
+def log_system_event(
+    source: str,
+    kind: str,
+    message: str,
+    level: str = "error",
+    detail: Optional[str] = None,
+    instance: Optional[str] = None,
+    document_id: Optional[str] = None,
+) -> None:
+    """
+    Ghi một sự kiện hạ tầng (mất kết nối, lỗi vòng lặp, công cụ mô hình không dùng được).
+
+    KHÔNG ném lỗi ra ngoài: nếu chính DB đang có vấn đề thì việc ghi sự kiện sẽ thất bại, và nó
+    tuyệt đối không được làm sập luồng đang chạy — cùng nguyên tắc với audit.log_action.
+    """
+    sql = """
+        INSERT INTO system_events (source, instance, kind, level, message, detail, document_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (source, instance, kind, level, message, detail, document_id))
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Ghi system_events thất bại (kind={kind}): {e}")
+
+
+def resolve_system_events(kind: str, instance: Optional[str] = None) -> int:
+    """
+    Đánh dấu các sự kiện cùng loại là đã khắc phục — dùng khi kết nối được nối lại.
+    Nhờ vậy giao diện phân biệt được "đang mất kết nối" với "từng mất kết nối hôm qua".
+    """
+    sql = "UPDATE system_events SET status = 'resolved' WHERE kind = %s AND status = 'new'"
+    params = [kind]
+    if instance:
+        sql += " AND instance = %s"
+        params.append(instance)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.rowcount
+
+
+def list_system_events(
+    level: Optional[str] = None,
+    kind: Optional[str] = None,
+    status: Optional[str] = None,
+    since_hours: Optional[int] = None,
+    limit: int = 100,
+) -> List[Dict]:
+    """Sự kiện hệ thống, mới nhất trước — nguồn cho trang theo dõi vận hành."""
+    conditions, params = [], []
+    if level:
+        conditions.append("level = %s"); params.append(level)
+    if kind:
+        conditions.append("kind = %s"); params.append(kind)
+    if status:
+        conditions.append("status = %s"); params.append(status)
+    if since_hours:
+        conditions.append("created_at >= NOW() - (%s || ' hours')::interval")
+        params.append(str(since_hours))
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    sql = f"""
+        SELECT id, source, instance, kind, level, message, detail, document_id, status, created_at
+        FROM system_events
+        {where}
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+    """
+    params.append(limit)
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+
+def processing_time_summary(since_hours: int = 24) -> Dict:
+    """
+    Tổng hợp thời gian xử lý (theo dõi hiệu năng — YC-HN).
+
+    Dùng phân vị thay vì chỉ trung bình: một tài liệu 500 trang sẽ kéo trung bình lên và che mất
+    thực tế của phần lớn tài liệu. p50 nói "thường mất bao lâu", p95 nói "trường hợp xấu tới đâu".
+    """
+    sql = """
+        SELECT COUNT(*)                                                    AS so_tai_lieu,
+               ROUND(AVG(duration_ms))                                     AS tb_ms,
+               MIN(duration_ms)                                            AS min_ms,
+               MAX(duration_ms)                                            AS max_ms,
+               ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms))  AS p50_ms,
+               ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms)) AS p95_ms
+        FROM documents
+        WHERE duration_ms IS NOT NULL
+          AND status <> 'deleted'
+          AND created_at >= NOW() - (%s || ' hours')::interval
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (str(since_hours),))
+            row = dict(cur.fetchone() or {})
+
+    # NUMERIC → Decimal; đổi sang int để JSON hóa được. None nghĩa là CHƯA CÓ SỐ, không phải 0.
+    return {k: (int(v) if v is not None else None) for k, v in row.items()}
