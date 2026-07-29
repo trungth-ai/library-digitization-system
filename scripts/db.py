@@ -270,7 +270,10 @@ def list_documents(
             d.dspace_community_name,
             d.dspace_item_id,
             d.dspace_handle,
-            d.dspace_uploaded_at
+            d.dspace_uploaded_at,
+            -- Lý do đẩy DSpace thất bại: trước đây được ghi vào DB nhưng KHÔNG trả ra danh sách,
+            -- nên toast tắt là mất dấu vết. Có cột này thì giao diện hiện lại được.
+            d.dspace_error
         FROM documents d
         JOIN document_types         dt ON dt.code = d.document_type
         JOIN job_statuses           js ON js.code = d.status

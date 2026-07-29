@@ -12,6 +12,23 @@ import { useOCRJobs } from "@/hooks/useOCRJobs";
 // chặn vì mixed content. Đây là nguyên nhân lỗi "Failed to fetch" khi lưu collection.
 const DSPACE_URL  = process.env.NEXT_PUBLIC_DSPACE_URL;
 
+
+// Doc LY DO THAT tu phan hoi loi.
+// Cac route da tra ve {error, status, detail} nhung truoc day client bo het va nem mot cau chung
+// ("Failed to create DSpace item"), nen toast chi noi "Failed to push" — khong ai biet vuong o dau.
+async function errorFromResponse(res, step) {
+  let detail = "";
+  try {
+    const body = await res.json();
+    detail = body.detail || body.error || JSON.stringify(body);
+  } catch {
+    try { detail = await res.text(); } catch { /* than rong */ }
+  }
+  // Than loi cua Tomcat/DSpace la ca trang HTML -> boc the va cat ngan cho vua toast
+  detail = String(detail).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
+  return new Error(`${step} (HTTP ${res.status})${detail ? ": " + detail : ""}`);
+}
+
 export default function PageClient({ session, initialCollections = [] }) {
   const collections = initialCollections;
 
@@ -184,8 +201,8 @@ export default function PageClient({ session, initialCollections = [] }) {
   // ---------------------------------------------------------------
   const pushJob = useCallback(async (job) => {
     if (!job.dspace_collection_id) {
-      showToast(`Select a collection for "${job.filename}" first`, "warning");
-      return false;
+      showToast(`Hãy chọn collection cho "${job.filename}" trước`, "warning");
+      return { ok: false, error: "Chưa chọn collection" };
     }
 
     setPushingIds(prev => new Set([...prev, job.job_id]));
@@ -193,7 +210,7 @@ export default function PageClient({ session, initialCollections = [] }) {
       // Fix 8: Kiem tra session truoc khi push, canh bao neu het han
       const sessionOk = await checkDSpaceSession();
       if (!sessionOk) {
-        throw new Error("DSpace session expired — please refresh the page and login again");
+        throw new Error("Phiên DSpace đã hết hạn — tải lại trang và đăng nhập lại");
       }
 
       await updateDSpaceStatus(job.job_id, "uploading").catch(() => {});
@@ -213,7 +230,7 @@ export default function PageClient({ session, initialCollections = [] }) {
           dspaceUrl:    DSPACE_URL,
         }),
       });
-      if (!createRes.ok) throw new Error("Failed to create DSpace item");
+      if (!createRes.ok) throw await errorFromResponse(createRes, "Tạo item trên DSpace thất bại");
       const itemData = await createRes.json();
 
       // Resolve itemId
@@ -226,16 +243,16 @@ export default function PageClient({ session, initialCollections = [] }) {
         });
         if (hRes.ok) itemId = (await hRes.json()).id;
       }
-      if (!itemId) throw new Error("Could not get DSpace item ID");
+      if (!itemId) throw new Error("DSpace tạo được item nhưng không trả về ID/handle để tải file lên");
 
       // Upload PDF
       const dlRes  = await fetch(`/api/ocr/download/${job.job_id}`);
-      if (!dlRes.ok) throw new Error("Failed to download processed files");
+      if (!dlRes.ok) throw await errorFromResponse(dlRes, "Không tải được file đã xử lý từ backend");
 
       const JSZip  = (await import("jszip")).default;
       const zip    = await new JSZip().loadAsync(await dlRes.blob());
       const pdfKey = Object.keys(zip.files).find(n => n.endsWith(".pdf") && !n.includes("metadata"));
-      if (!pdfKey) throw new Error("PDF not found in output");
+      if (!pdfKey) throw new Error("Không tìm thấy PDF trong kết quả xử lý (kiểm tra worker đã OCR xong chưa)");
 
       const upRes = await fetch(
         `/api/dspace/upload-bitstream?itemId=${encodeURIComponent(itemId)}&fileName=${encodeURIComponent(pdfKey)}&dspaceUrl=${encodeURIComponent(DSPACE_URL)}`,
@@ -243,18 +260,19 @@ export default function PageClient({ session, initialCollections = [] }) {
           headers: { "Content-Type": "application/octet-stream" },
           body: await zip.files[pdfKey].async("blob") }
       );
-      if (!upRes.ok) throw new Error("Failed to upload PDF");
+      if (!upRes.ok) throw await errorFromResponse(upRes, "Tải PDF lên DSpace thất bại");
 
       await updateDSpaceStatus(job.job_id, "uploaded", {
         itemId: itemData.itemId || itemId,
         handle: itemData.handle || null,
       });
-      return true;
+      return { ok: true, error: null };
 
     } catch (err) {
       console.error(`Push failed for ${job.filename}:`, err);
+      // Luu ly do vao DB (cot dspace_error) de con tra duoc sau, khong chi hien tam tren toast
       await updateDSpaceStatus(job.job_id, "upload_failed", { error: err.message }).catch(() => {});
-      return false;
+      return { ok: false, error: err.message };
     } finally {
       setPushingIds(prev => { const n = new Set(prev); n.delete(job.job_id); return n; });
     }
@@ -268,9 +286,10 @@ export default function PageClient({ session, initialCollections = [] }) {
   }, []);
 
   const handlePushSingle = useCallback(async (job) => {
-    const ok = await pushJob(job);
+    const { ok, error } = await pushJob(job);
     showToast(
-      ok ? `"${job.filename}" uploaded successfully` : `Failed to push "${job.filename}"`,
+      ok ? `Đã đẩy "${job.filename}" lên DSpace`
+         : `Đẩy "${job.filename}" thất bại — ${error}`,
       ok ? "success" : "error"
     );
   }, [pushJob]);
@@ -288,13 +307,20 @@ export default function PageClient({ session, initialCollections = [] }) {
     const CONCURRENCY = 3;
     let okCount = 0;
     let failCount = 0;
+    let firstError = null;   // neu ly do dau tien trong toast tong ket
 
     for (let i = 0; i < pushable.length; i += CONCURRENCY) {
       const batch = pushable.slice(i, i + CONCURRENCY);
       const results = await Promise.allSettled(batch.map(j => pushJob(j)));
 
-      okCount   += results.filter(r => r.value === true).length;
-      failCount += results.filter(r => r.value !== true).length;
+      okCount   += results.filter(r => r.value?.ok === true).length;
+      const failedResults = results.filter(r => r.value?.ok !== true);
+      failCount += failedResults.length;
+      if (failedResults.length && !firstError) {
+        firstError = failedResults[0].value?.error
+                  || failedResults[0].reason?.message
+                  || "lỗi không rõ";
+      }
 
       // Cap nhat toast sau moi lo
       if (i + CONCURRENCY < pushable.length) {
@@ -306,7 +332,8 @@ export default function PageClient({ session, initialCollections = [] }) {
     }
 
     showToast(
-      `Done: ${okCount} uploaded${failCount ? `, ${failCount} failed` : ""}`,
+      `Xong: ${okCount} thành công`
+        + (failCount ? `, ${failCount} thất bại — ${firstError}` : ""),
       failCount === 0 ? "success" : "warning"
     );
     setIsUploading(false);

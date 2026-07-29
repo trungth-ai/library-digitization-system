@@ -444,6 +444,7 @@ async def list_jobs(
             "dspace_community_name":  doc["dspace_community_name"],
             "dspace_item_id":       doc["dspace_item_id"],
             "dspace_handle":        doc["dspace_handle"],
+            "dspace_error":         doc.get("dspace_error"),
         }
 
         if include_metadata and doc["status"] == "completed":

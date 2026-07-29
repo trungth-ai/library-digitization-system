@@ -262,6 +262,16 @@ export default function ReadyForDSpaceTable({
                         {dsCfg.label}
                       </span>
                     </div>
+                    {/* Lý do thất bại: trước đây chỉ nằm trong toast (biến mất sau 3s) và trong DB
+                        (không ai xem được). Hiện ngay ở đây, đầy đủ khi trỏ chuột vào. */}
+                    {job.dspace_status === "upload_failed" && job.dspace_error && (
+                      <p
+                        className="mt-1 text-xs text-red-600 max-w-xs break-words line-clamp-3"
+                        title={job.dspace_error}
+                      >
+                        {job.dspace_error}
+                      </p>
+                    )}
                     {job.dspace_handle && (
                       <a
                         href={`${dspaceUrl || ""}/handle/${job.dspace_handle}`}
