@@ -72,6 +72,7 @@ PUBLIC_API_URL=https://sohoa.hpu.edu.vn/ocr-api
 | Thanh tiến độ không nhích | SSE bị đệm ở proxy | Caddy phải có `flush_interval -1` (xem block ở mục 0) |
 | Đăng nhập được nhưng quay lại form | `NEXT_PUBLIC_SITE_URL` bị dùng cho self-fetch | Đã sửa — dùng `SITE_INTERNAL_URL` |
 | Log worker ngập `redis.exceptions.TimeoutError: Timeout reading from socket` | **KHÔNG phải lỗi** — `BLPOP` hết giờ chờ khi hàng đợi rỗng, nhưng redis-py áp thời hạn đọc socket theo `timeout` của lệnh | Đã sửa (ADR-009): `socket_timeout=None` + bắt riêng `TimeoutError`. Nếu tái diễn, kiểm không ai đặt lại `socket_timeout` |
+| Đẩy DSpace lỗi **"Không tải được file đã xử lý từ backend (HTTP 502)"** mà log FastAPI vẫn `200 OK` | Route proxy tải file đặt `Content-Length: ''` (FastAPI dùng `StreamingResponse` nên không có header đó) → Node bỏ thân phản hồi, Caddy trả 502 | Đã sửa: chỉ đặt `Content-Length` khi upstream có |
 | Không biết thành phần nào đang hỏng | — | `curl -s http://127.0.0.1:8000/api/v2/health/detailed \| python3 -m json.tool` hoặc mở trang `/cong-cu` |
 
 Kiểm nhanh có worker đang sống hay không:

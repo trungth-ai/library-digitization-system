@@ -48,6 +48,7 @@ test được · `src/core/responses.py` trong tài liệu là đường dẫn k
 | Bảng `system_events` + đo thời gian xử lý p50/p95 | 21 kiểm chứng PG thật |
 | Trang `/cong-cu`: tình trạng từng thành phần + lỗi + thời gian xử lý | 17 kiểm chứng Next thật |
 | Hiện lý do thật khi đẩy DSpace thất bại (6 bước, kèm phản hồi DSpace) | UI build exit 0 |
+| **Sửa lỗi tải file ZIP** — `Content-Length` rỗng làm mất thân phản hồi (Caddy → 502) | 8 kiểm chứng Next thật, tái hiện được lỗi rồi sửa |
 
 ---
 
@@ -101,9 +102,10 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
 - **Chuẩn hóa `NEXT_PUBLIC` build-args** cho UI image (xem `docs/DEPLOY.md` mục 4).
 - **Dọn `system_events` theo tuổi** — bảng sẽ lớn dần, chưa có cơ chế xóa bản ghi cũ. Chưa gấp
   (mỗi sự kiện là một dòng nhỏ, và chỉ ghi khi ĐỔI trạng thái) nhưng cần trước khi chạy dài hạn.
-- **Đẩy DSpace đang thất bại trên máy chủ** — đã hiện lý do thật ở giao diện; chờ nguyên văn phản
-  hồi của DSpace để xác định (nghi: DSpace 6 REST cho đọc công khai nhưng ghi cần
-  `rest-dspace-token` chứ không chỉ cookie `JSESSIONID`).
+- ~~Đẩy DSpace thất bại~~ **ĐÃ TÌM RA VÀ SỬA**: không phải vấn đề quyền DSpace như tôi nghi ban đầu.
+  Route proxy tải file đặt `Content-Length: ''` (FastAPI dùng `StreamingResponse` nên không gửi
+  header này) → thân ZIP bị mất, Caddy trả 502. Đã tái hiện được lỗi ở máy dev rồi sửa và kiểm lại.
+  **Cần thử lại trên máy chủ để xác nhận bước đẩy DSpace chạy trọn.**
 
 ## Định nghĩa "Hoàn thành" (mọi sprint)
 - [ ] Không phá endpoint/UI đang chạy (KT-KH pass)

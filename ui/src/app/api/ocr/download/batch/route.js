@@ -33,18 +33,23 @@ export async function GET(req) {
 
     const timestamp = new Date().toISOString().slice(0, 10);
 
-    return new NextResponse(res.body, {
-      headers: {
-        'Content-Type': 'application/zip',
-        'Content-Disposition': `attachment; filename="batch_${timestamp}.zip"`,
-        'Content-Length': res.headers.get('content-length') || '',
-      },
-    });
+    // ⚠️ KHÔNG đặt Content-Length khi upstream không có: FastAPI dùng StreamingResponse (chunked),
+    // nên `|| ''` sẽ tạo header rỗng KHÔNG HỢP LỆ → Node bỏ thân phản hồi (0 byte) và Caddy trả 502.
+    const headers = {
+      'Content-Type': res.headers.get('content-type') || 'application/zip',
+      'Content-Disposition':
+        res.headers.get('content-disposition') || `attachment; filename="batch_${timestamp}.zip"`,
+      'Cache-Control': 'no-store',
+    };
+    const length = res.headers.get('content-length');
+    if (length) headers['Content-Length'] = length;
+
+    return new NextResponse(res.body, { headers });
 
   } catch (err) {
     return NextResponse.json(
-      { error: 'Batch download error', message: err.message },
-      { status: 500 }
+      { error: 'Không kết nối được backend khi tải file', detail: err.message },
+      { status: 502 }
     );
   }
 }
