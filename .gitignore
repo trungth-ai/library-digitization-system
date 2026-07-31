@@ -79,3 +79,20 @@ eval_out/
 tmp/
 temp/
 *.tmp
+
+# ---------------------------------------------------------------------
+# RÀO CHẮN: đây là repo của HỆ THỐNG SỐ HÓA TÀI LIỆU.
+# Ngày 29/07/2026 một dự án khác (hệ đối sánh CTĐT) bị push nhầm vào đây, kèm 272 MB
+# tài liệu thật trong `uploads/`. Các mẫu dưới đây để lần sau `git add .` không kéo
+# theo nữa. KHÔNG BAO GIỜ commit tài liệu thật vào repo — dữ liệu số hóa nằm ở
+# volume ngoài (DIGITIZE_DATA_DIR), không nằm trong mã nguồn.
+# ---------------------------------------------------------------------
+uploads/
+/app/
+/migrations/
+/alembic.ini
+/run.py
+/config.py
+/entrypoint.sh
+/dev_data*.sql
+/docker-compose.prod.yml
