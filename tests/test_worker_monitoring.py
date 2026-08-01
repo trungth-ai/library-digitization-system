@@ -28,21 +28,84 @@ class _StopLoop(BaseException):
 
 
 class _ScriptedRedis:
-    """Redis giả diễn theo kịch bản: mỗi lượt blpop làm một việc đã định trước."""
+    """
+    Redis giả diễn theo kịch bản: mỗi lượt lấy việc làm một việc đã định trước.
+
+    Hỗ trợ CẢ HAI chế độ hàng đợi để cùng một kịch bản kiểm chứng được cả đường cũ (`blpop`) và
+    đường tin cậy mặc định (`blmove`, ADR-011). Nếu chỉ hỗ trợ `blpop` thì các bảo đảm của ADR-009
+    (hết giờ chờ không phải lỗi, ghi nhận mất kết nối, nhịp tim) sẽ không còn được kiểm trên đường
+    đang chạy thật — mất độ phủ ở đúng chỗ quan trọng.
+    """
 
     def __init__(self, script):
         self.script = list(script)
         self.hashes = {}
         self.calls = 0
+        self.lists = {}
 
-    def blpop(self, key, timeout=0):
+    def _next_action(self):
         self.calls += 1
         if not self.script:
             raise _StopLoop()
         action = self.script.pop(0)
-        if isinstance(action, Exception) or isinstance(action, BaseException):
+        if isinstance(action, BaseException):
             raise action
         return action           # None = hàng đợi rỗng; tuple = có việc
+
+    def blpop(self, key, timeout=0):
+        return self._next_action()
+
+    # ── Hàng đợi tin cậy (ADR-011) ──────────────────────────────
+    def lmove(self, src, dst, from_side, to_side):
+        """Thăm dò không chặn: luôn rỗng, để kịch bản được điều khiển qua `blmove`."""
+        return None
+
+    def blmove(self, src, dst, timeout, from_side, to_side):
+        action = self._next_action()
+        if action is None:
+            return None
+        # Kịch bản dùng dạng tuple của blpop `(key, raw)`; blmove trả về chính chuỗi raw
+        raw = action[1] if isinstance(action, tuple) else action
+        self.lists.setdefault(dst, []).insert(0, raw)
+        return raw
+
+    def lrem(self, key, count, value):
+        items = self.lists.get(key) or []
+        if value in items:
+            items.remove(value)
+            return 1
+        return 0
+
+    def lpush(self, key, value):
+        self.lists.setdefault(key, []).insert(0, value)
+
+    def rpush(self, key, value):
+        self.lists.setdefault(key, []).append(value)
+
+    def llen(self, key):
+        return len(self.lists.get(key) or [])
+
+    def lpop(self, key):
+        items = self.lists.get(key) or []
+        return items.pop(0) if items else None
+
+    def zadd(self, key, mapping):
+        self.hashes.setdefault("_delayed", {}).update(mapping)
+
+    def zrangebyscore(self, key, mini, maxi, start=0, num=None):
+        return []
+
+    def zrem(self, key, member):
+        return 0
+
+    def zcard(self, key):
+        return len(self.hashes.get("_delayed") or {})
+
+    def exists(self, key):
+        return 1
+
+    def scan_iter(self, match, count=None):
+        return []
 
     def hset(self, name, mapping=None, **kw):
         self.hashes.setdefault(name, {}).update(mapping or {})

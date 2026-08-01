@@ -118,11 +118,18 @@ def update_document_status(
     progress: Optional[int] = None,
     pdf_path: Optional[str] = None,
     error_message: Optional[str] = None,
+    clear_error: bool = False,
 ) -> None:
     """
     Cập nhật trạng thái OCR job.
     - progress=None → tự lấy progress_value từ bảng job_statuses
     - Tự set finished_at khi status là terminal (is_terminal=TRUE)
+    - `clear_error=True` → XÓA `error_message` (đặt NULL).
+
+    Vì sao cần `clear_error`: `error_message` dùng `COALESCE` nên truyền `None` là GIỮ giá trị cũ —
+    hợp lý khi cập nhật từng phần, nhưng từ khi có cơ chế thử lại (ADR-011) thì một tài liệu có thể
+    thất bại rồi thành công ở lần sau. Không có cờ này thì tài liệu `completed` vẫn mang thông báo lỗi
+    của lần thử trước — một trạng thái tự mâu thuẫn mà người dùng không hiểu được.
     """
     sql = """
         UPDATE documents
@@ -133,7 +140,10 @@ def update_document_status(
                                 (SELECT progress_value FROM job_statuses WHERE code = %(status)s)
                             ),
             pdf_path      = COALESCE(%(pdf_path)s, pdf_path),
-            error_message = COALESCE(%(error_message)s, error_message),
+            error_message = CASE
+                                WHEN %(clear_error)s THEN NULL
+                                ELSE COALESCE(%(error_message)s, error_message)
+                            END,
             finished_at   = CASE
                                 WHEN (SELECT is_terminal FROM job_statuses WHERE code = %(status)s)
                                 THEN NOW()
@@ -149,6 +159,7 @@ def update_document_status(
                 "progress":      progress,
                 "pdf_path":      pdf_path,
                 "error_message": error_message,
+                "clear_error":   clear_error,
             })
 
     logger.debug(f"Updated document status: {job_id} → {status}")

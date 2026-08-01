@@ -15,6 +15,7 @@ from typing import Dict
 from scripts.digitize import DigitizationPipeline, ProcessingConfig
 import scripts.db as db
 from scripts.core import audit
+from scripts.core import queue as jobqueue
 from scripts.core.exceptions import SensitivityViolation
 from scripts.sse import publish_job_event
 
@@ -44,7 +45,73 @@ WORKER_HEARTBEAT_PREFIX = "worker:heartbeat:"
 # KHÔNG phải lỗi — xem cách xử lý RedisTimeoutError trong run().
 BLPOP_TIMEOUT = int(os.getenv("BLPOP_TIMEOUT", "5"))
 
+# Hàng đợi TIN CẬY (ADR-011) — mặc định BẬT. `QUEUE_MODE=blpop` là van lùi về vòng lặp cũ mà không
+# cần build lại image. Chế độ cũ MẤT job nếu worker chết giữa lúc xử lý (lỗi N-02) nên chỉ dùng để
+# đối chứng khi gỡ lỗi, không dùng lâu dài.
+QUEUE_MODE = os.getenv("QUEUE_MODE", "reliable").strip().lower()
+RELIABLE_QUEUE = QUEUE_MODE != "blpop"
+# Số lần thử TỐI ĐA cho lỗi hạ tầng (tính cả lần đầu). Lỗi tài liệu không thử lại — xem _classify_failure.
+MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
+RETRY_BACKOFF_SEC = int(os.getenv("RETRY_BACKOFF_SEC", "30"))
+# Quét thu hồi việc mồ côi mỗi N giây (không quét mỗi vòng lặp: `scan_iter` rẻ nhưng không miễn phí)
+RECLAIM_INTERVAL_SEC = int(os.getenv("RECLAIM_INTERVAL_SEC", "60"))
+
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
+
+# ── Kết quả xử lý một job (ADR-011 mục 6) ────────────────────────────
+JOB_OK = "ok"
+JOB_FAILED_DOCUMENT = "document"   # lỗi của TÀI LIỆU → không thử lại, vào hàng đợi chết ngay
+JOB_FAILED_INFRA = "infra"         # lỗi HẠ TẦNG → thử lại có khoảng lùi
+
+# Nhận diện lỗi hạ tầng theo TÊN LỚP thay vì `isinstance`, để không phải import psycopg2/redis ở mức
+# module — máy dev không cài hai gói đó vẫn kiểm thử được phần phân loại này. Cùng lý do với
+# `_redis_exception_classes()` (ADR-009).
+_INFRA_EXCEPTION_NAMES = frozenset({
+    "OperationalError",     # psycopg2: mất kết nối / DB không nhận kết nối
+    "InterfaceError",       # psycopg2: kết nối đã đóng
+    "PoolError",            # psycopg2 pool cạn
+    "ConnectionError",      # redis-py + builtin
+    "TimeoutError",         # redis-py + builtin
+    "BrokenPipeError",
+    "OSError",              # đĩa đầy, lỗi I/O — FileNotFoundError đã được loại trước đó
+})
+
+
+class JobResult:
+    """
+    Kết quả xử lý một job. `process_job` trước đây trả `None`; nay trả về đối tượng này để vòng lặp
+    biết nên thử lại hay bỏ vào hàng đợi chết. Nơi gọi cũ không dùng giá trị trả về nên không bị ảnh hưởng.
+    """
+
+    __slots__ = ("status", "error")
+
+    def __init__(self, status: str, error: str = None):
+        self.status = status
+        self.error = error
+
+    @property
+    def ok(self) -> bool:
+        return self.status == JOB_OK
+
+    def __repr__(self) -> str:
+        return f"JobResult(status={self.status!r}, error={self.error!r})"
+
+
+def _classify_failure(exc: BaseException) -> str:
+    """
+    Lỗi này nên THỬ LẠI (hạ tầng) hay BỎ VÀO HÀNG ĐỢI CHẾT (tài liệu)?
+
+    Mặc định là lỗi TÀI LIỆU (không thử lại) — chọn có chủ đích: giữ đúng hành vi hiện tại cho mọi
+    tình huống thất bại đã biết, chỉ thêm việc thử lại cho những lỗi hạ tầng nhận diện được chắc chắn.
+    Mặc định ngược lại (cứ thử lại) sẽ làm một tài liệu hỏng tốn 3 lượt OCR để rồi kết cục y như cũ.
+    """
+    # Tệp không có / không đọc được là lỗi TÀI LIỆU, dù FileNotFoundError là con của OSError
+    if isinstance(exc, (FileNotFoundError, IsADirectoryError, NotADirectoryError, PermissionError)):
+        return JOB_FAILED_DOCUMENT
+    for cls in type(exc).__mro__:
+        if cls.__name__ in _INFRA_EXCEPTION_NAMES:
+            return JOB_FAILED_INFRA
+    return JOB_FAILED_DOCUMENT
 
 # Trích metadata qua lớp trừu tượng hóa mô hình (ADR-008) — mặc định BẬT.
 # Đặt USE_PROVIDER_LAYER=0 để lùi ngay về đường cũ bám Claude mà không cần build lại image:
@@ -85,6 +152,12 @@ class DigitizationWorker:
         self.worker_id = os.getenv("HOSTNAME") or f"pid-{os.getpid()}"
         # Trạng thái kết nối Redis; None = chưa biết, để lần đầu xác định được cũng ghi nhận
         self._redis_ok = None
+        # Lần cuối quét thu hồi việc mồ côi (0 = chưa quét → quét ngay vòng đầu, đúng lúc cần nhất:
+        # worker vừa khởi động lại thường là sau khi worker trước đã chết)
+        self._last_reclaim = 0.0
+        # Chế độ hàng đợi đặt ở MỨC ĐỐI TƯỢNG, không đọc trực tiếp hằng module trong `run()`:
+        # để kiểm thử bật/tắt được từng worker mà không phải nạp lại module (van lùi vẫn là QUEUE_MODE).
+        self.reliable_queue = RELIABLE_QUEUE
 
         if redis_client is not None:
             self.redis = redis_client
@@ -210,9 +283,84 @@ class DigitizationWorker:
         except Exception as e:  # noqa: BLE001 - nhịp tim hỏng không được làm dừng việc xử lý
             logger.debug("Không ghi được nhịp tim: %s", e)
 
+    def _maintenance(self) -> None:
+        """
+        Việc nền của hàng đợi tin cậy: đưa job đến hạn thử lại về hàng đợi + thu hồi việc mồ côi.
+
+        Chạy trong worker khi rỗi, KHÔNG thêm container. `promote_delayed` rẻ (một lệnh có LIMIT) nên
+        chạy mỗi vòng; `reclaim_orphans` phải quét khóa nên giãn ra theo `RECLAIM_INTERVAL_SEC`.
+        """
+        try:
+            jobqueue.promote_delayed(self.redis, REDIS_QUEUE)
+        except Exception as e:  # noqa: BLE001 - việc nền hỏng không được làm dừng xử lý tài liệu
+            logger.debug("Không chuyển được job đến hạn thử lại: %s", e)
+
+        now = time.time()
+        if now - self._last_reclaim < RECLAIM_INTERVAL_SEC:
+            return
+        self._last_reclaim = now
+
+        try:
+            for worker_id, count in jobqueue.reclaim_orphans(self.redis, REDIS_QUEUE):
+                # Đây là sự kiện vận hành QUAN TRỌNG: nó nghĩa là một worker đã chết giữa lúc làm việc.
+                # Trước ADR-011 thì những job này biến mất không dấu vết.
+                self._log_event(
+                    "job_reclaimed", "warning",
+                    f"Thu hồi {count} job từ worker đã chết '{worker_id}' — đã trả về hàng đợi",
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Không thu hồi được việc mồ côi: %s", e)
+
+    def _handle_claimed(self, job: "jobqueue.ClaimedJob") -> None:
+        """
+        Xử lý một job đã nhận, rồi báo kết quả cho hàng đợi.
+
+        Thứ tự QUAN TRỌNG: chỉ `ack` (xóa khỏi danh sách đang-xử-lý) SAU KHI job thực sự xong. Ack
+        sớm là mở lại đúng cửa sổ mất job mà ADR-011 đang đóng.
+        """
+        logger.info("Processing job: %s (ưu tiên=%s, lần thử %d)",
+                    job.job_id, job.priority, job.attempts + 1)
+
+        # `process_job` trước ADR-011 trả `None`. Nơi nào còn theo hợp đồng cũ (lớp con, mã kiểm thử)
+        # thì hiểu là "đã tự xử lý xong" → ack. Không normalize ở đây sẽ ném AttributeError trên None.
+        result = self.process_job(job.data) or JobResult(JOB_OK)
+
+        if result.status == JOB_OK:
+            jobqueue.ack(self.redis, self.worker_id, job)
+            return
+
+        retryable = result.status == JOB_FAILED_INFRA
+        action, attempts = jobqueue.fail(
+            self.redis, REDIS_QUEUE, self.worker_id, job,
+            reason=result.error or "không rõ nguyên nhân",
+            retryable=retryable, max_attempts=MAX_ATTEMPTS, backoff_sec=RETRY_BACKOFF_SEC,
+        )
+
+        if action == "retry":
+            # Trả tài liệu về "Chờ xử lý" với lý do đọc được: người dùng thấy nó đang được thử lại,
+            # không phải đã thất bại hẳn. `process_job` vừa đặt trạng thái 'failed' cho lần thử này.
+            self._update_status(
+                job.job_id, "queued", 10, job.data.get("filename", ""),
+                error_message=f"Thử lại lần {attempts}/{MAX_ATTEMPTS} (lỗi hạ tầng): {result.error}",
+            )
+        else:
+            self._log_event(
+                "job_dead", "error",
+                f"Job {job.job_id} vào hàng đợi chết sau {attempts} lần thử: {result.error}",
+                document_id=job.job_id,
+            )
+
     def run(self):
         logger.info("Worker started (id=%s). Waiting for jobs on queue '%s'...",
                     self.worker_id, REDIS_QUEUE)
+
+        if self.reliable_queue:
+            logger.info("Hàng đợi TIN CẬY BẬT (BLMOVE + thu hồi việc mồ côi, ADR-011) — "
+                        "job không mất khi worker chết. Tối đa %d lần thử, khoảng lùi %ds.",
+                        MAX_ATTEMPTS, RETRY_BACKOFF_SEC)
+        else:
+            logger.warning("Hàng đợi chế độ CŨ (QUEUE_MODE=blpop) — ⚠️ job sẽ MẤT nếu worker chết "
+                           "giữa lúc xử lý (lỗi N-02). Chỉ dùng để đối chứng khi gỡ lỗi.")
 
         RedisTimeoutError, RedisConnectionError = _redis_exception_classes()
 
@@ -220,6 +368,18 @@ class DigitizationWorker:
             while True:
                 try:
                     self._beat()
+
+                    if self.reliable_queue:
+                        self._maintenance()
+                        claimed = jobqueue.claim(self.redis, REDIS_QUEUE, self.worker_id,
+                                                 timeout=BLPOP_TIMEOUT)
+                        self._set_redis_state(True)
+                        if claimed is None:
+                            continue    # hết giờ chờ, hàng đợi rỗng — chuyện bình thường
+                        self._handle_claimed(claimed)
+                        continue
+
+                    # ── Đường CŨ (van lùi QUEUE_MODE=blpop) — giữ nguyên từng dòng ──
                     job = self.redis.blpop(REDIS_QUEUE, timeout=BLPOP_TIMEOUT)
 
                     self._set_redis_state(True)
@@ -263,12 +423,15 @@ class DigitizationWorker:
 
     def _update_status(self, job_id: str, status: str, progress: int,
                        filename: str = "", pdf_path: str = None,
-                       error_message: str = None):
+                       error_message: str = None, clear_error: bool = False):
         """
         Ghi trạng thái đồng thời vào 3 nơi:
         1. Redis hash  — API polling cũ vẫn hoạt động
         2. PostgreSQL  — nguồn dữ liệu chính
         3. Redis Pub/Sub — SSE push xuống frontend ngay lập tức
+
+        `clear_error=True` xóa thông báo lỗi cũ — cần khi một tài liệu thất bại rồi thành công ở lần
+        thử lại, nếu không nó sẽ hiện "Hoàn thành" kèm lỗi của lần trước (xem `db.update_document_status`).
         """
         # 1. Redis hash (backward compat)
         mapping = {"status": status, "progress": str(progress)}
@@ -284,6 +447,7 @@ class DigitizationWorker:
                 progress=progress,
                 pdf_path=pdf_path,
                 error_message=error_message,
+                clear_error=clear_error,
             )
         except Exception as e:
             logger.error(f"DB update failed for {job_id}: {e}")
@@ -309,7 +473,13 @@ class DigitizationWorker:
     # MAIN JOB PROCESSOR
     # ─────────────────────────────────────────────────────────────
 
-    def process_job(self, job_data: Dict):
+    def process_job(self, job_data: Dict) -> JobResult:
+        """
+        Xử lý trọn một tài liệu. Trả về `JobResult` để vòng lặp quyết định thử lại hay không (ADR-011).
+
+        MỌI hiệu ứng phụ giữ nguyên như trước: cập nhật trạng thái, ghi audit, ghi sự kiện, lưu thời
+        gian. Chỉ thêm giá trị trả về.
+        """
         job_id        = job_data.get("job_id", "unknown")
         filename      = job_data.get("filename", "")
         input_file    = job_data["input_file"]
@@ -378,7 +548,9 @@ class DigitizationWorker:
             pdf_path     = summary.get("output_pdf", "")
             finished_at  = datetime.now(timezone.utc).isoformat()
 
-            self._update_status(job_id, "completed", 100, filename, pdf_path=pdf_path)
+            # `clear_error=True`: tài liệu thành công ở lần thử lại không được mang lỗi của lần trước
+            self._update_status(job_id, "completed", 100, filename, pdf_path=pdf_path,
+                                clear_error=True)
 
             # Ghi thêm finished_at vào Redis (không có trong _update_status)
             self.redis.hset(f"job:{job_id}", mapping={
@@ -411,6 +583,8 @@ class DigitizationWorker:
             logger.info("Job %s completed successfully trong %.1fs %s",
                         job_id, duration_ms / 1000, stage_timings)
 
+            return JobResult(JOB_OK)
+
         except SensitivityViolation as e:
             # YC-DR-03: ràng buộc cứng — KHÔNG xử lý tạm, KHÔNG âm thầm đổi chế độ.
             # Job thất bại có mô tả tiếng Việt để cán bộ biết phải sửa cấu hình, và audit giữ
@@ -431,6 +605,10 @@ class DigitizationWorker:
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             })
 
+            # Ràng buộc cứng bị vi phạm là lỗi CẤU HÌNH/TÀI LIỆU, không phải sự cố tạm thời:
+            # thử lại sẽ bị từ chối y như vậy. Vào hàng đợi chết ngay để người phụ trách sửa lược đồ.
+            return JobResult(JOB_FAILED_DOCUMENT, error_msg)
+
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Job {job_id} failed: {e}")
@@ -449,6 +627,12 @@ class DigitizationWorker:
             self.redis.hset(f"job:{job_id}", mapping={
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             })
+
+            kind = _classify_failure(e)
+            if kind == JOB_FAILED_INFRA:
+                logger.warning("Job %s thất bại vì LỖI HẠ TẦNG (%s) — sẽ thử lại",
+                               job_id, type(e).__name__)
+            return JobResult(kind, error_msg)
 
     def _read_metadata(self, output_dir: str) -> list:
         """
