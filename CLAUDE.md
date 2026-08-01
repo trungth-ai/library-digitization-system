@@ -84,6 +84,10 @@ docker compose up -d --build
 - `docs/DEPLOY.md` — triển khai + hai chốt an toàn có thể làm deploy dừng
 - `docs/PRODUCT.md` — mô tả sản phẩm + kiến trúc nâng cấp
 - `docs/REQUIREMENTS.md` — yêu cầu kỹ thuật (bảng YC-*) + chuẩn HPU
-- `docs/ROADMAP.md` — lộ trình chia sprint
+- `docs/ROADMAP.md` — lộ trình chia sprint (GĐ0–3 + GĐ2B nhánh nâng cấp)
 - `docs/DECISIONS.md` — ADR (quyết định kiến trúc)
 - `docs/PLAN.md` — sprint đang chạy
+- `docs/UPGRADE_REQUIREMENTS.md` — **yêu cầu nâng cấp đợt 2** (log hệ thống, phân tích AI chi tiết,
+  nạp khối lượng lớn, dashboard, phân quyền, nhật ký người dùng) + 3 vấn đề nghiêm trọng của hệ đang chạy
+- `docs/UPGRADE_SPRINTS.md` — 9 sprint V1–V9: việc, DoD, van lùi, cổng đi tiếp
+- `docs/UPGRADE_TEST_CASES.md` — 145 trường hợp kiểm thử + ma trận truy vết YC ↔ KT ↔ Sprint

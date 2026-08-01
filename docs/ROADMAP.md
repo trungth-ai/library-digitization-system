@@ -11,6 +11,7 @@
 | **GĐ 0** | 16–29/7/2026 | POC có đo đạc (chế độ tại chỗ chạy được + số liệu) | **Hạn hồ sơ 30/7** |
 | GĐ 1 | 8–9/2026 | Chế độ tại chỗ dùng được trong vận hành | Bán kết T9 |
 | GĐ 2 | 10–11/2026 | Lược đồ cấu hình được + Kiểm toán/Báo cáo | Chung kết T11 |
+| **GĐ 2B** ⭐ | 8–11/2026 | **Nhánh nâng cấp vận hành & quản trị** (V0–V9) — đan xen với GĐ1/GĐ2 | xem `docs/UPGRADE_SPRINTS.md` |
 | GĐ 3 | 12/2026–5/2027 | Lớp RAG & khai thác dữ liệu | Cam kết 6 tháng |
 
 > **Cập nhật 25/7/2026 → đang trong GĐ 0, còn 5 ngày tới hạn hồ sơ.** Kỷ luật phạm vi GĐ 0 là ưu
@@ -92,6 +93,44 @@ mạng chứng minh không rò dữ liệu; thử ghi đè thủ công bị từ
 
 **Nghiệm thu GĐ 2 (phép thử quyết định):** người **không biết lập trình** tạo được lược đồ mới và
 chạy thử thành công; nhật ký kiểm toán truy được trách nhiệm tới từng trường, không sửa được.
+
+---
+
+## GĐ 2B — Nhánh nâng cấp vận hành & quản trị  *(8–11/2026, đan xen GĐ1–GĐ2)* ⭐
+
+> **Chi tiết đầy đủ nằm ở ba tài liệu riêng** (nhánh này lớn ngang một giai đoạn):
+> `docs/UPGRADE_REQUIREMENTS.md` (yêu cầu) · `docs/UPGRADE_SPRINTS.md` (sprint) ·
+> `docs/UPGRADE_TEST_CASES.md` (kiểm thử). Mục này chỉ tóm tắt để đọc lộ trình tổng.
+
+**Vì sao có nhánh này:** rà mã nguồn tại commit `50dd3bd` phát hiện ba vấn đề của hệ đang chạy —
+(N-01) **không có xác thực nào ở backend** nên `audit_log.actor` không tin cậy; (N-02) hàng đợi
+`BLPOP` **mất việc** khi worker chết; (N-03) upload **chặn event loop**. Ba vấn đề này chặn cả việc
+mở rộng quy mô lẫn việc nghiệm thu một số yêu cầu BB của SRS.
+
+| Sprint | Nội dung | YC | KT | Tuần |
+|---|---|---|---|---|
+| **V0** | Chốt `QĐ-01→08`, viết ADR-010→016, sao lưu + khôi phục thử, chuẩn bị BD-06/07/08 | — | — | 03–04/8 |
+| **V1** | Log hệ thống có cấu trúc (JSON, `request_id`, che bí mật, dọn theo tuổi, trang xem log) | YC-LG-01→11 | KT-LG | 1 |
+| **V2** | Phân tích chi tiết kết quả AI (token, chi phí VNĐ, từng trường, chỉ số OCR, **độ chính xác đo trên việc thật**) | YC-AN-01→11 | KT-AN | 2–3 |
+| **V3** ⚠️ | **Danh tính & phân quyền** — 4 vai trò, ba nấc `off→shadow→on` | YC-QT-01→12 | KT-QT, KT-BM-16→18 | 4–5 |
+| **V4** | Nhật ký người dùng + dòng thời gian một tài liệu | YC-NK-01→09 | KT-NK | 7 |
+| **V5** | Nạp khối lượng lớn: bỏ trần 10 tệp, lô, chống trùng, ZIP, thư mục theo dõi | YC-BU-01→10 | KT-BU-01→14 | 8–9 |
+| **V6** | Hàng đợi tin cậy (`BLMOVE` + thu hồi + thử lại + hàng đợi chết + ưu tiên) | YC-BU-11→20 | KT-BU-15→26 | 10–11 |
+| **V7** | Bảng điều khiển theo dõi công việc (việc của tôi, hàng đợi, lô, SLA) | YC-DB-01→10 | KT-DB | 12–13 |
+| **V8** | Không gian duyệt tài liệu + thùng rác + thông báo/cảnh báo | YC-RV, YC-TB | KT-RV, KT-TB | 14–15 |
+| **V9** | Sao lưu tự động + dọn dữ liệu + CI/E2E + tài khoản dịch vụ | YC-VH-07→12, YC-TK | KT-VH, KT-TK | 16 |
+
+**Quan hệ với các giai đoạn khác:**
+- **V3 mở nút cho GĐ 1:** `YC-DR-04` ("chỉ quản trị viên đổi được độ nhạy cảm") của Sprint 2 hiện
+  **không thể hiện thực** vì chưa có khái niệm quản trị viên. Vì vậy V3 xếp trước Bán kết T9.
+- **V2 + V7 hấp thụ Sprint 7 của GĐ 2** (Nhật ký kiểm toán + Báo cáo/Dashboard). Phần `audit_log`
+  của Sprint 7 thực tế **đã làm xong**; phần báo cáo/dashboard được mở rộng đáng kể ở V2/V7.
+- **V3 là tiền đề bắt buộc của GĐ 3:** `YC-RG-10` ("kết quả tra cứu tuân theo phân quyền") không
+  làm được nếu không có phân quyền.
+
+**Nghiệm thu GĐ 2B:** cán bộ đăng nhập bằng tài khoản riêng · nhật ký kiểm toán ghi **tên thật** ·
+nạp được lô 500 tài liệu · **khởi động lại máy chủ giữa chừng không mất tài liệu nào** ·
+bảng điều khiển trả lời được "hôm nay tôi phải làm gì" · dữ liệu được sao lưu **và đã khôi phục thử**.
 
 ---
 
