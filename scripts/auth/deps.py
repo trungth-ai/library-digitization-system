@@ -202,6 +202,18 @@ def _record_gap(request: Request) -> None:
     except Exception as e:  # noqa: BLE001 - ghi nhận hỏng không được chặn request
         logger.debug("Không ghi được sự kiện thiếu xác thực: %s", e)
 
+    # Ghi cả vào nhật ký người dùng: `system_events` để người vận hành thấy tổng thể, còn ở đây thì
+    # lọc được theo IP/endpoint để tìm chính xác client nào còn sót trước khi bật `AUTH_MODE=on`.
+    try:
+        from scripts.core import user_log
+        user_log.log_activity(
+            action=user_log.ACTION_UNAUTHENTICATED, username=policy.LEGACY_ACTOR,
+            resource_type="endpoint", resource_id=f"{request.method} {request.url.path}",
+            ip=client, user_agent=agent, result=user_log.RESULT_FAILED,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Không ghi được nhật ký thiếu xác thực: %s", e)
+
 
 def _record_denied(request: Request, principal: Principal, missing) -> None:
     """
@@ -211,14 +223,15 @@ def _record_denied(request: Request, principal: Principal, missing) -> None:
     có quyền, nên một chuỗi 403 thường nghĩa là có gì đó bất thường.
     """
     try:
-        from scripts.core import audit
-        audit.log_action(
-            action="permission_denied", actor=principal.actor,
-            detail={"method": request.method, "path": request.url.path,
-                    "role": principal.role, "missing": list(missing)},
+        from scripts.core import user_log
+        user_log.log_denied(
+            username=principal.actor, method=request.method, path=request.url.path,
+            role=principal.role, missing=missing,
+            ip=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
         )
     except Exception as e:  # noqa: BLE001
-        logger.debug("Không ghi được audit từ chối quyền: %s", e)
+        logger.debug("Không ghi được nhật ký từ chối quyền: %s", e)
 
 
 def require_authenticated() -> Callable:

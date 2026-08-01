@@ -88,6 +88,25 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
 ---
 
 
+## Sprint vừa xong: V1 log có cấu trúc + V4 nhật ký người dùng ✅  *(01/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-LG-01/04** Log JSON một dòng, có `request_id`/`job_id`/`actor`; middleware ghi tổng kết mỗi request | 27 pytest với handler dựng đúng như production |
+| **YC-LG-05 🔴** Bộ lọc **che khóa API/mật khẩu** ở tầng logging — YC-BM-03 trước đây *không có cơ chế nào cưỡng chế* | 11 pytest gồm khóa Anthropic/Google/Groq/HF, `Bearer`, cookie phiên |
+| **YC-LG-02/03** `contextvars` cho `request_id` (nhận `X-Request-Id` từ giao diện) và `job_id` xuyên suốt vòng đời một tài liệu | pytest ngữ cảnh lồng nhau |
+| **YC-LG-06/07** Tệp JSONL luân chuyển + **dọn theo tuổi** — trả nợ "`system_events` sẽ lớn dần" | 17 pytest |
+| **YC-NK-01→05** Bảng `user_activity` không sửa được; ghi đăng nhập/đăng xuất/sai mật khẩu/**bị từ chối quyền**/thiếu xác thực | migration 004 + pytest |
+| **YC-NK-07** Dòng thời gian một tài liệu: gộp `audit_log` + `user_activity` + `model_calls` + `ocr_runs` | pytest |
+| Endpoint `/api/v2/user-activity`, `/api/v2/jobs/{id}/timeline` | py_compile + test phân quyền |
+
+**374 pytest PASS** · UI build exit 0. Van lùi: `LOG_FORMAT=text` · `USER_ACTIVITY_ENABLED=0`.
+
+> ⚠️ **Cần chạy `database/migrations/004_user_activity.sql`** (sau 003). Trước khi chạy: `pg_dump`.
+> `audit_log` **không** nằm trong danh sách bảng được dọn theo tuổi — có test chốt điều đó.
+
+---
+
 ## Sprint vừa xong: VÁ BA LỖ HỔNG N-01/N-02/N-03 ✅  *(01/08/2026)*
 
 Ba vấn đề của hệ đang chạy, phát hiện khi rà mã cho đợt nâng cấp. Chi tiết quyết định: ADR-010/011/012.
@@ -123,7 +142,9 @@ Mặc định `AUTH_MODE=off` → **hành vi hệ thống KHÔNG đổi** sau kh
   (hai lần liên tiếp) và thử trọn luồng đăng nhập → thao tác → đăng xuất.
 - **Chưa đo hiệu năng** `KT-HN-08` sau khi đổi cách ghi tệp — ADR-010 ghi rõ thông lượng một tệp đơn
   lẻ *có thể giảm nhẹ*; phải đo chứ không tuyên bố.
-- Nhật ký người dùng (`user_activity`) **chưa làm** — hiện mới ghi vào `audit_log`. Thuộc sprint V4.
+- ~~Nhật ký người dùng (`user_activity`)~~ **ĐÃ LÀM** ở sprint V1+V4 ngay sau đó (xem mục trên).
+- **Giao diện** cho nhật ký người dùng (`/quan-tri/nhat-ky-nguoi-dung`) và dòng thời gian tài liệu
+  chưa có — API đã sẵn (`/api/v2/user-activity`, `/api/v2/jobs/{id}/timeline`).
 
 ---
 

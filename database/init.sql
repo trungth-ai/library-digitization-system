@@ -515,5 +515,46 @@ INSERT INTO role_permissions (role_code, permission) VALUES
 ON CONFLICT (role_code, permission) DO NOTHING;
 
 -- =====================================================================
+-- 10. NHẬT KÝ HÀNH VI NGƯỜI DÙNG (YC-NK — sprint V4)
+--     Giữ ĐỒNG BỘ với database/migrations/004_user_activity.sql.
+--
+--     Lớp thứ BA trong bốn lớp nhật ký. KHÁC `audit_log`: bảng kia ghi thao tác NGHIỆP VỤ trên TÀI
+--     LIỆU và giữ vĩnh viễn; bảng này ghi HÀNH VI truy cập (đăng nhập, sai mật khẩu, bị từ chối
+--     quyền, kết xuất) và giữ 365 ngày. Trộn hai loại sẽ làm nhật ký kiểm toán ngập những lần đăng
+--     nhập thường ngày, và buộc giữ vĩnh viễn cả dữ liệu chỉ có giá trị điều tra trong một năm.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS user_activity (
+    id            BIGSERIAL PRIMARY KEY,
+    -- Giữ CẢ user_id lẫn username: username để nhật ký còn đọc được sau khi tài khoản bị xóa mềm
+    user_id       BIGINT,
+    username      VARCHAR(100),
+    action        VARCHAR(50)  NOT NULL,   -- login|logout|login_failed|permission_denied|view|export
+    resource_type VARCHAR(50),
+    resource_id   TEXT,
+    ip            VARCHAR(64),
+    user_agent    TEXT,
+    request_id    VARCHAR(64),             -- nối với tệp log JSONL (YC-LG-02)
+    result        VARCHAR(20)  NOT NULL DEFAULT 'ok',   -- ok | denied | failed
+    detail        JSONB,
+    status        VARCHAR(20)  NOT NULL DEFAULT 'active',
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_activity_user    ON user_activity(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_activity_created ON user_activity(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_activity_action  ON user_activity(action);
+CREATE INDEX IF NOT EXISTS idx_user_activity_ip      ON user_activity(ip);
+-- Bị từ chối quyền là tín hiệu an ninh quan trọng nhất trong bảng này → index riêng
+CREATE INDEX IF NOT EXISTS idx_user_activity_denied  ON user_activity(created_at DESC)
+    WHERE result <> 'ok';
+
+-- Chặn SỬA (YC-NK-01), KHÔNG chặn xóa: thời hạn lưu 365 ngày cần xóa được bản ghi quá hạn qua
+-- `scripts/core/retention.py` (việc dọn có ghi số lượng vào system_events).
+DROP TRIGGER IF EXISTS trg_user_activity_no_update ON user_activity;
+CREATE TRIGGER trg_user_activity_no_update BEFORE UPDATE ON user_activity
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_mutation();
+
+-- =====================================================================
 -- END OF SCHEMA
 -- =====================================================================

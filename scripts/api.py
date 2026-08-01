@@ -30,12 +30,14 @@ from scripts.sse import job_event_stream
 from scripts.core import reports, audit, schema_store, provider_view, uploads
 from scripts.core import queue as jobqueue
 from scripts.core import users as user_store
+from scripts.core import user_log
 from scripts.core.responses import success, error as err_envelope
 
 # Danh tính & phân quyền (ADR-012). `require(...)` cưỡng chế ở MÁY CHỦ; ẩn nút trên giao diện chỉ là
 # tiện ích. Ba nấc AUTH_MODE quyết định có chặn hay không — xem scripts/auth/deps.py.
 from scripts.auth import bootstrap, local as auth_local, policy, sessions
 from scripts.auth.deps import Principal, current_principal, require, require_authenticated
+from scripts.middleware.request_log import RequestContextMiddleware
 
 
 # ---------------------------------------------------------------------
@@ -55,11 +57,11 @@ UPLOAD_CHUNK_SIZE = int(float(os.getenv("UPLOAD_CHUNK_MB", "1")) * 1024 * 1024)
 # LOGGING
 # ---------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger("library-api")
+# Log JSON có cấu trúc + che bí mật + request_id (sprint V1). Van lùi `LOG_FORMAT=text` khôi phục
+# đúng định dạng chữ thuần trước đây. Bộ lọc che khóa API/mật khẩu chạy ở MỌI chế độ (YC-BM-03).
+from scripts.core import logging_setup   # noqa: E402 - phải cấu hình log trước khi có logger nào
+
+logger = logging_setup.configure("api")
 
 # ---------------------------------------------------------------------
 # MODELS
@@ -107,6 +109,10 @@ app = FastAPI(
 # gửi cookie tới nguồn dùng ký tự thay thế, nên khi bật xác thực bằng cookie thì cấu hình cũ sẽ làm
 # đăng nhập không hoạt động. Giao diện đã gọi API qua proxy same-origin (commit 440f550) nên mặc định
 # không cần mở nguồn nào; đặt `CORS_ORIGINS` (phân tách bằng dấu phẩy) nếu có client khác nguồn.
+# Gắn TRƯỚC CORS: middleware của Starlette chạy theo thứ tự ngược lại khi thêm, nên đặt ở đây thì
+# lớp ghi log bao ngoài cùng và ghi được cả những request bị CORS từ chối.
+app.add_middleware(RequestContextMiddleware)
+
 _cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -326,8 +332,16 @@ async def api_login(payload: LoginRequest, request: Request, response: Response)
     outcome = auth_local.get_backend()(payload.username, payload.password, ip=client_ip)
 
     if not outcome.ok:
-        audit.log_action(action="login_failed", actor=payload.username,
-                         detail={"reason": outcome.reason, "ip": client_ip})
+        # Ghi vào nhật ký NGƯỜI DÙNG, không vào `audit_log`: đăng nhập sai là hành vi truy cập, không
+        # phải thao tác nghiệp vụ trên tài liệu. Trộn vào audit sẽ làm nhật ký kiểm toán ngập những
+        # lần gõ nhầm mật khẩu (xem migration 004).
+        user_log.log_activity(
+            action=(user_log.ACTION_LOCKED if outcome.reason == "locked"
+                    else user_log.ACTION_LOGIN_FAILED),
+            username=payload.username, ip=client_ip,
+            user_agent=request.headers.get("user-agent"),
+            result=user_log.RESULT_FAILED, detail={"reason": outcome.reason},
+        )
         # 401 cho mọi lý do: mã lý do nằm trong body để giao diện hiển thị đúng thông báo tiếng Việt
         return JSONResponse(status_code=401, content=err_envelope(
             outcome.message, code=(outcome.reason or "UNAUTHORIZED").upper()))
@@ -337,7 +351,11 @@ async def api_login(payload: LoginRequest, request: Request, response: Response)
         user_agent=request.headers.get("user-agent"),
     )
     _set_session_cookie(response, token)
-    audit.log_action(action="login", actor=outcome.user["username"], detail={"ip": client_ip})
+    user_log.log_activity(
+        action=user_log.ACTION_LOGIN, username=outcome.user["username"],
+        user_id=outcome.user["id"], ip=client_ip,
+        user_agent=request.headers.get("user-agent"),
+    )
 
     return success({
         "user": {
@@ -364,7 +382,8 @@ async def api_logout(request: Request, response: Response):
         sessions.revoke_session(token)
 
     response.delete_cookie(sessions.SESSION_COOKIE_NAME, path="/")
-    audit.log_action(action="logout", actor=actor)
+    user_log.log_activity(action=user_log.ACTION_LOGOUT, username=actor,
+                          ip=request.client.host if request.client else None)
     return success(None, "Đã đăng xuất")
 
 
@@ -560,6 +579,51 @@ async def api_delete_user(user_id: int,
                      detail={"target_user": user["username"], "soft_delete": True})
     return success({"user_id": user_id},
                    f"Đã vô hiệu hóa '{user['username']}'. Nhật ký của người này vẫn được giữ.")
+
+
+@app.get("/api/v2/user-activity")
+async def api_user_activity(
+    username:  Optional[str] = Query(None),
+    action:    Optional[str] = Query(None),
+    result:    Optional[str] = Query(None, description="ok | denied | failed"),
+    ip:        Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    page:      int           = Query(1, ge=1),
+    per_page:  int           = Query(100, ge=1, le=1000),
+    principal: Principal     = Depends(require(policy.AUDIT_READ)),
+):
+    """
+    Nhật ký hành vi người dùng (YC-NK-05): đăng nhập, đăng xuất, sai mật khẩu, **bị từ chối quyền**,
+    tải tệp, kết xuất báo cáo.
+
+    Khác `/api/v2/audit` (thao tác nghiệp vụ trên tài liệu) — xem migration 004 để biết vì sao tách.
+    """
+    rows = user_log.list_activity(
+        username=username, action=action, result=result, ip=ip,
+        date_from=date_from, date_to=date_to,
+        limit=per_page, offset=(page - 1) * per_page,
+    )
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+    return success(rows, f"{len(rows)} bản ghi hoạt động")
+
+
+@app.get("/api/v2/jobs/{job_id}/timeline")
+async def api_document_timeline(job_id: str,
+                                principal: Principal = Depends(require(policy.AUDIT_READ))):
+    """
+    Dòng thời gian đầy đủ của một tài liệu (YC-NK-07): gộp nhật ký kiểm toán + hành vi người dùng +
+    lượt gọi model + lượt OCR thành MỘT danh sách theo thời gian.
+
+    Trả lời trong một màn hình: tài liệu này đã qua tay ai, model nào trích, ai sửa trường gì, ai duyệt.
+    """
+    rows = user_log.document_timeline(job_id)
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+    return success(rows, f"{len(rows)} sự kiện trong vòng đời tài liệu")
 
 
 @app.get("/api/v2/sessions")

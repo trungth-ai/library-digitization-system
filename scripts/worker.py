@@ -24,11 +24,10 @@ from scripts.sse import publish_job_event
 # LOGGING
 # =========================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("worker")
+# Log JSON có cấu trúc + che bí mật (sprint V1). Van lùi: `LOG_FORMAT=text`.
+from scripts.core import context, logging_setup   # noqa: E402
+
+logger = logging_setup.configure("worker")
 
 
 # =========================
@@ -480,6 +479,14 @@ class DigitizationWorker:
         MỌI hiệu ứng phụ giữ nguyên như trước: cập nhật trạng thái, ghi audit, ghi sự kiện, lưu thời
         gian. Chỉ thêm giá trị trả về.
         """
+        # Đặt `job_id` vào ngữ cảnh cho TOÀN BỘ vòng đời xử lý (YC-LG-03): mọi dòng log sinh ra từ
+        # đây trở xuống — kể cả từ digitize.py, extraction.py, quality.py — đều mang mã này, nên
+        # grep một job_id ra được đủ chuỗi thay vì phải lần theo dấu thời gian giữa nhiều tài liệu
+        # đang chạy song song trên nhiều worker.
+        with context.job_context(job_data.get("job_id", "unknown"), actor="worker"):
+            return self._process_job_inner(job_data)
+
+    def _process_job_inner(self, job_data: Dict) -> JobResult:
         job_id        = job_data.get("job_id", "unknown")
         filename      = job_data.get("filename", "")
         input_file    = job_data["input_file"]
