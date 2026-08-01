@@ -4,7 +4,7 @@
 // =============================================================================
 
 import { NextResponse } from 'next/server';
-import { apiBase } from '@/lib/api';
+import { apiBase, forwardHeaders } from '@/lib/api';
 
 /**
  * Dựng header trả về cho tệp tải xuống.
@@ -39,7 +39,8 @@ export async function GET(req, ctx) {
   try {
     // Route handler chạy PHÍA SERVER → gọi qua mạng nội bộ Docker (OCR_API_INTERNAL_URL).
     // Không dùng NEXT_PUBLIC_* ở đây: biến đó là URL cho TRÌNH DUYỆT và bị nhúng lúc build.
-    const res = await fetch(`${apiBase()}/api/v2/download/${jobId}`, { cache: 'no-store' });
+    const res = await fetch(`${apiBase()}/api/v2/download/${jobId}`,
+      { cache: 'no-store', headers: await forwardHeaders() });
 
     if (!res.ok) {
       let detail = '';

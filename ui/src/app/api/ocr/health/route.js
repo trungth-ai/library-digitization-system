@@ -1,10 +1,11 @@
 import { NextResponse } from 'next/server';
-import { apiBase } from '@/lib/api';
+import { apiBase, forwardHeaders } from '@/lib/api';
 
 // Proxy tình trạng chi tiết từng thành phần (Redis, PostgreSQL, worker, công cụ mô hình).
 export async function GET() {
   try {
-    const res = await fetch(`${apiBase()}/api/v2/health/detailed`, { cache: 'no-store' });
+    const res = await fetch(`${apiBase()}/api/v2/health/detailed`,
+      { cache: 'no-store', headers: await forwardHeaders() });
     return new NextResponse(await res.text(), {
       status: res.status,
       headers: { 'Content-Type': 'application/json' },

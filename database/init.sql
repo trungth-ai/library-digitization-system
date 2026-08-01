@@ -402,5 +402,118 @@ INSERT INTO dspace_upload_statuses (code, label, is_terminal, color, sort_order)
 ON CONFLICT (code) DO NOTHING;
 
 -- =====================================================================
+-- 9. DANH TÍNH & PHÂN QUYỀN (ADR-012 — vá lỗ hổng N-01 "không có xác thực")
+--    Giữ ĐỒNG BỘ với database/migrations/003_users_rbac.sql: file này cho cài MỚI, migration cho DB
+--    đã tồn tại. Lệch nhau sẽ tạo ra hai hệ thống hành xử khác nhau tùy theo cài lúc nào.
+--
+--    Sau khi tạo, hệ thống VẪN chạy như cũ vì AUTH_MODE=off là mặc định. Quy trình bật ba nấc
+--    off → shadow → on xem ADR-012 và docs/DEPLOY.md.
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS roles (
+    code        VARCHAR(50)  PRIMARY KEY,
+    label       VARCHAR(150) NOT NULL,
+    description TEXT,
+    is_system   BOOLEAN      NOT NULL DEFAULT FALSE,   -- không cho xóa/đổi tên vai trò hệ thống
+    sort_order  INTEGER      NOT NULL DEFAULT 0,
+    status      VARCHAR(20)  NOT NULL DEFAULT 'active',
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- Quyền là DỮ LIỆU, không phải hằng số trong mã (YC-QT-09) — cùng triết lý với extraction_schemas
+CREATE TABLE IF NOT EXISTS role_permissions (
+    id         BIGSERIAL PRIMARY KEY,
+    role_code  VARCHAR(50)  NOT NULL REFERENCES roles(code) ON DELETE CASCADE,
+    permission VARCHAR(100) NOT NULL,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_role_permission UNIQUE (role_code, permission)
+);
+CREATE INDEX IF NOT EXISTS idx_role_permissions_role ON role_permissions(role_code);
+
+CREATE TABLE IF NOT EXISTS users (
+    id                   BIGSERIAL PRIMARY KEY,
+    username             VARCHAR(100) NOT NULL UNIQUE,
+    email                VARCHAR(200),
+    full_name            VARCHAR(200) NOT NULL,
+    -- Băm tự mô tả `pbkdf2_sha256$<vòng>$<salt>$<hash>` — cho phép nâng số vòng lặp / đổi thuật toán
+    -- về sau mà không phải đặt lại mật khẩu hàng loạt (scripts/core/passwords.py)
+    password_hash        TEXT         NOT NULL,
+    role                 VARCHAR(50)  NOT NULL DEFAULT 'viewer' REFERENCES roles(code),
+    must_change_password BOOLEAN      NOT NULL DEFAULT FALSE,   -- YC-QT-05
+    failed_attempts      INTEGER      NOT NULL DEFAULT 0,       -- YC-QT-06 khóa sau N lần sai
+    locked_until         TIMESTAMPTZ,
+    last_login_at        TIMESTAMPTZ,
+    last_login_ip        VARCHAR(64),
+    -- Xóa MỀM (YC-QT-08): audit_log tham chiếu tới người dùng, xóa cứng là mất khả năng truy trách nhiệm
+    status               VARCHAR(20)  NOT NULL DEFAULT 'active',
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    created_by           BIGINT,
+    CONSTRAINT ck_users_status CHECK (status IN ('active', 'disabled', 'deleted'))
+);
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_active   ON users(username) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_users_role     ON users(role);
+
+DROP TRIGGER IF EXISTS trg_users_touch ON users;
+CREATE TRIGGER trg_users_touch BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+DROP TRIGGER IF EXISTS trg_roles_touch ON roles;
+CREATE TRIGGER trg_roles_touch BEFORE UPDATE ON roles
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- Phiên lưu ở PostgreSQL, KHÔNG ở Redis (QĐ-02): Redis ở hệ này là hàng đợi không bền vững, restart
+-- là đăng xuất toàn bộ. Lưu ở đây còn cho phép THU HỒI phiên ngay lập tức — điều JWT không làm được.
+CREATE TABLE IF NOT EXISTS user_sessions (
+    -- Băm SHA-256 của token, KHÔNG lưu token thô: rò CSDL không đồng nghĩa với chiếm được phiên
+    token_hash   CHAR(64)     PRIMARY KEY,
+    user_id      BIGINT       NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    ip           VARCHAR(64),
+    user_agent   TEXT,
+    expires_at   TIMESTAMPTZ  NOT NULL,
+    last_seen_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    revoked_at   TIMESTAMPTZ,
+    status       VARCHAR(20)  NOT NULL DEFAULT 'active',
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user    ON user_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON user_sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_active  ON user_sessions(user_id) WHERE status = 'active';
+
+DROP TRIGGER IF EXISTS trg_sessions_touch ON user_sessions;
+CREATE TRIGGER trg_sessions_touch BEFORE UPDATE ON user_sessions
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- 9.1 Seed vai trò & quyền — phải khớp scripts/auth/policy.py
+INSERT INTO roles (code, label, description, is_system, sort_order) VALUES
+    ('admin',     'Quản trị hệ thống', 'Toàn quyền: quản lý người dùng, cấu hình, độ nhạy cảm lược đồ', TRUE, 1),
+    ('approver',  'Cán bộ duyệt',      'Duyệt tài liệu và đẩy DSpace, kể cả tài liệu do mình tải lên',  TRUE, 2),
+    ('librarian', 'Cán bộ nghiệp vụ',  'Tải lên, sửa metadata, gửi duyệt',                              TRUE, 3),
+    ('viewer',    'Người xem',         'Chỉ xem tài liệu và báo cáo',                                   TRUE, 4),
+    ('service',   'Tài khoản dịch vụ', 'Dùng cho tích hợp qua API key; không có quyền mặc định nào',     TRUE, 5)
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO role_permissions (role_code, permission) VALUES
+    ('viewer', 'document:read'), ('viewer', 'report:read'),
+    ('librarian', 'document:read'), ('librarian', 'report:read'),
+    ('librarian', 'document:upload'), ('librarian', 'document:edit'),
+    ('librarian', 'document:download'), ('librarian', 'schema:read'),
+    ('approver', 'document:read'), ('approver', 'report:read'),
+    ('approver', 'document:upload'), ('approver', 'document:edit'),
+    ('approver', 'document:download'), ('approver', 'schema:read'),
+    ('approver', 'document:approve'), ('approver', 'document:delete'),
+    ('approver', 'dspace:push'), ('approver', 'queue:manage'), ('approver', 'audit:read'),
+    ('admin', 'document:read'), ('admin', 'report:read'), ('admin', 'document:upload'),
+    ('admin', 'document:edit'), ('admin', 'document:download'), ('admin', 'document:approve'),
+    ('admin', 'document:delete'), ('admin', 'document:purge'), ('admin', 'dspace:push'),
+    ('admin', 'schema:read'), ('admin', 'schema:write'), ('admin', 'schema:sensitivity'),
+    ('admin', 'audit:read'), ('admin', 'log:read'), ('admin', 'queue:manage'),
+    ('admin', 'user:manage'), ('admin', 'system:config')
+ON CONFLICT (role_code, permission) DO NOTHING;
+
+-- =====================================================================
 -- END OF SCHEMA
 -- =====================================================================

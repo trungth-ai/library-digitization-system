@@ -3,7 +3,7 @@
 // =============================================================================
 
 import { NextResponse } from 'next/server';
-import { apiBase } from '@/lib/api';
+import { apiBase, forwardHeaders } from '@/lib/api';
 
 export async function GET(req) {
   try {
@@ -22,7 +22,8 @@ export async function GET(req) {
     const params = new URLSearchParams();
     ids.forEach(id => params.append('ids', id));
 
-    const res = await fetch(`${ocrApiUrl}/api/v2/download/batch?${params.toString()}`);
+    const res = await fetch(`${ocrApiUrl}/api/v2/download/batch?${params.toString()}`,
+      { headers: await forwardHeaders() });
 
     if (!res.ok) {
       return NextResponse.json(

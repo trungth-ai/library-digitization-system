@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { apiBase } from '@/lib/api';
+import { apiBase, forwardHeaders } from '@/lib/api';
 
 export async function DELETE(req, { params }) {
   try {
@@ -12,6 +12,7 @@ export async function DELETE(req, { params }) {
 
     const res = await fetch(`${ocrApiUrl}/api/v2/jobs/${jobId}`, {
       method: 'DELETE',
+      headers: await forwardHeaders(),
     });
 
     if (!res.ok) {

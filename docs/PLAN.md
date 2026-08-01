@@ -88,7 +88,69 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
 ---
 
 
+## Sprint vừa xong: VÁ BA LỖ HỔNG N-01/N-02/N-03 ✅  *(01/08/2026)*
+
+Ba vấn đề của hệ đang chạy, phát hiện khi rà mã cho đợt nâng cấp. Chi tiết quyết định: ADR-010/011/012.
+
+| Việc | Kiểm chứng |
+|---|---|
+| **N-03** Ghi tệp tải lên theo mảnh, không chặn event loop; băm SHA-256 trong cùng lượt đọc (ADR-010) | 7 pytest, gồm test **tái hiện lỗi cũ** (bản đồng bộ = 0 nhịp event loop) |
+| **N-02** Hàng đợi tin cậy `BLMOVE` + thu hồi việc mồ côi + thử lại có khoảng lùi + hàng đợi chết + 3 mức ưu tiên (ADR-011) | 47 pytest, gồm **KT-BU-15** kill worker giữa chừng → 0 job mất |
+| **N-01** Danh tính & phân quyền: 4 vai trò, phiên trong PostgreSQL, ba nấc `AUTH_MODE`, khóa sau N lần sai (ADR-012) | 52 pytest, gồm **KT-QT-09** quét AST bắt endpoint ghi thiếu `require()` |
+| Giao diện: trang `/dang-nhap`, `/quan-tri/nguoi-dung`, chuyển tiếp cookie qua 12 route proxy | UI build exit 0 |
+| Sửa kèm: CORS `allow_origins=["*"]` + cookie (trình duyệt sẽ không gửi cookie) | test AST chặn tái diễn |
+| Sửa kèm: `update_document_status` thêm `clear_error` — tài liệu thành công ở lần thử lại không mang lỗi cũ | pytest |
+| Sửa kèm: mật khẩu chứa tên tiếng Việt **không dấu** giờ bị chặn (`strip_diacritics`) | pytest |
+
+**330 pytest PASS** (224 cũ + 106 mới) · **0 hồi quy** · UI build exit 0.
+Mặc định `AUTH_MODE=off` → **hành vi hệ thống KHÔNG đổi** sau khi cập nhật mã.
+
+### ⚠️ Cần làm trước khi bật xác thực (theo thứ tự)
+
+| # | Việc | Ai |
+|---|---|---|
+| 1 | `pg_dump` rồi chạy `database/migrations/003_users_rbac.sql` | 👤 |
+| 2 | Đặt `ADMIN_BOOTSTRAP_USER`/`PASSWORD`, khởi động API, đăng nhập, **đổi mật khẩu**, rồi **xóa hai biến đó** | 👤 |
+| 3 | Tạo tài khoản cho từng cán bộ + tập huấn (vẫn ở `AUTH_MODE=off`) | 👤 |
+| 4 | `AUTH_MODE=shadow` → chạy **≥ 1 tuần**, theo dõi `system_events` `kind='auth_missing'` | 👤 |
+| 5 | Chỉ bật `AUTH_MODE=on` khi **48 giờ liên tiếp không còn cảnh báo nào** | 👤 |
+
+> Van lùi mọi lúc: `AUTH_MODE=off` · `QUEUE_MODE=blpop` — đổi biến môi trường, **không build lại image**.
+
+### Việc còn nợ của phần vá này
+- **Chưa kiểm chứng trên PostgreSQL thật**: `users`, `roles`, `role_permissions`, `user_sessions`
+  mới chỉ chạy qua `py_compile` + test logic thuần. Cần chạy migration 003 trên bản sao dữ liệu thật
+  (hai lần liên tiếp) và thử trọn luồng đăng nhập → thao tác → đăng xuất.
+- **Chưa đo hiệu năng** `KT-HN-08` sau khi đổi cách ghi tệp — ADR-010 ghi rõ thông lượng một tệp đơn
+  lẻ *có thể giảm nhẹ*; phải đo chứ không tuyên bố.
+- Nhật ký người dùng (`user_activity`) **chưa làm** — hiện mới ghi vào `audit_log`. Thuộc sprint V4.
+
+---
+
+## Sprint kế tiếp: V0 — Chuẩn bị đợt nâng cấp 2  *(cập nhật 31/07/2026)*
+
+Kế hoạch đầy đủ: `docs/UPGRADE_SPRINTS.md`. Yêu cầu: `docs/UPGRADE_REQUIREMENTS.md`.
+Kiểm thử: `docs/UPGRADE_TEST_CASES.md`.
+
+**V0 không viết mã** — bốn việc, bỏ qua sẽ làm hỏng các sprint sau:
+
+| # | Việc | Ai |
+|---|---|---|
+| 1 | Chốt 8 quyết định `QĐ-01→08` (phiên đăng nhập, băm mật khẩu, hạ tầng log, bốn mắt, ai xem năng suất, đường nạp chính, thời hạn lưu) | 👤 + 🤖 tư vấn |
+| 2 | Viết ADR-010→016 vào `DECISIONS.md` cho các quyết định đã chốt — **trước khi** viết mã | 🤖 |
+| 3 | `pg_dump` dữ liệu thật **và khôi phục thử vào DB tạm** | 👤 |
+| 4 | Chuẩn bị BD-06 (500 PDF), BD-07 (8 tài khoản), BD-08 (15 tệp đầu vào xấu) | 👤 |
+
+> ⚠️ **Ba vấn đề của hệ đang chạy** phát hiện khi rà mã (chi tiết ở `UPGRADE_REQUIREMENTS.md` mục 0):
+> **N-01** không có xác thực ở backend → `YC-AU-02` hiện không thỏa mãn (sửa ở V3) ·
+> **N-02** `BLPOP` (`worker.py:223`) mất job khi worker chết (sửa ở V6) ·
+> **N-03** `save_upload_file` (`api.py:142`) chặn event loop (sửa ở V5).
+
 ## Việc code còn nợ (chưa xếp sprint)
+
+> Các mục dưới đây **đã được xếp sprint** trong `docs/UPGRADE_SPRINTS.md`: trang duyệt `needs_review`
+> + thùng rác → **V8** · `/luoc-do` nối API thật → **V8** · `metadata_history` ghi ở tầng ứng dụng →
+> **V4** (chờ có `actor` thật) · dọn `system_events` theo tuổi → **V1**.
 
 - **UI:** trang duyệt tài liệu `needs_review` (tô màu trường điểm thấp bằng `ConfidenceBadge`) và
   thùng rác/phục hồi. API đã sẵn: `GET /api/v2/jobs?needs_review=true`,

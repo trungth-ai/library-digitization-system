@@ -12,6 +12,7 @@ const NAV = [
   { key: "reports", label: "Báo cáo", icon: "📊", href: "/bao-cao" },
   { key: "tools", label: "Công cụ mô hình", icon: "🧠", href: "/cong-cu" },
   { key: "audit", label: "Nhật ký kiểm toán", icon: "🔒", href: null },
+  { key: "users", label: "Quản trị người dùng", icon: "👥", href: "/quan-tri/nguoi-dung" },
 ];
 
 export function HpuSidebar({ appName = "DocuFlow HP", activeKey = null }) {

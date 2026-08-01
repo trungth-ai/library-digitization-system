@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { apiBase } from '@/lib/api';
+import { apiBase, forwardHeaders } from '@/lib/api';
 
 export async function GET(req) {
   try {
@@ -22,7 +22,7 @@ export async function GET(req) {
 
     console.log('Fetching OCR jobs:', url);
 
-    const res = await fetch(url);
+    const res = await fetch(url, { cache: 'no-store', headers: await forwardHeaders() });
     
     if (!res.ok) {
       const errorText = await res.text();
