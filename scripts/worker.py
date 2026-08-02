@@ -61,6 +61,10 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 # việc mở lại PDF để đếm trang làm chậm đáng kể trên phần cứng yếu.
 OCR_METRICS_ENABLED = os.getenv("OCR_METRICS_ENABLED", "1").strip() not in ("0", "false", "no")
 
+# Bao lâu thì thử lại một job thuộc lô đang tạm dừng. Không nên quá ngắn (quay vòng nóng trên Redis)
+# cũng không nên quá dài (bấm "tiếp tục" xong phải đợi lâu mới thấy chạy lại).
+BATCH_PAUSE_RECHECK_SEC = int(os.getenv("BATCH_PAUSE_RECHECK_SEC", "30"))
+
 # ── Kết quả xử lý một job (ADR-011 mục 6) ────────────────────────────
 JOB_OK = "ok"
 JOB_FAILED_DOCUMENT = "document"   # lỗi của TÀI LIỆU → không thử lại, vào hàng đợi chết ngay
@@ -324,12 +328,24 @@ class DigitizationWorker:
         logger.info("Processing job: %s (ưu tiên=%s, lần thử %d)",
                     job.job_id, job.priority, job.attempts + 1)
 
+        # Lô bị tạm dừng/hủy: trả job về hàng đợi và KHÔNG xử lý (YC-BU-16). Trả về chứ không bỏ đi —
+        # "tạm dừng" phải nghĩa là hoãn lại, không phải mất tài liệu.
+        batch_id = job.data.get("batch_id")
+        if batch_id and self._batch_paused(batch_id):
+            logger.info("Lô %s đang tạm dừng — hoãn job %s", batch_id[:8], job.job_id)
+            jobqueue.fail(self.redis, REDIS_QUEUE, self.worker_id, job,
+                          reason="Lô đang tạm dừng", retryable=True,
+                          max_attempts=10 ** 6,       # tạm dừng không tính là lần thử thất bại
+                          backoff_sec=BATCH_PAUSE_RECHECK_SEC)
+            return
+
         # `process_job` trước ADR-011 trả `None`. Nơi nào còn theo hợp đồng cũ (lớp con, mã kiểm thử)
         # thì hiểu là "đã tự xử lý xong" → ack. Không normalize ở đây sẽ ném AttributeError trên None.
         result = self.process_job(job.data) or JobResult(JOB_OK)
 
         if result.status == JOB_OK:
             jobqueue.ack(self.redis, self.worker_id, job)
+            self._bump_batch(batch_id, done=1)
             return
 
         retryable = result.status == JOB_FAILED_INFRA
@@ -352,6 +368,9 @@ class DigitizationWorker:
                 f"Job {job.job_id} vào hàng đợi chết sau {attempts} lần thử: {result.error}",
                 document_id=job.job_id,
             )
+            # Chỉ đếm là thất bại khi ĐÃ HẾT đường thử lại — đếm ở mỗi lần thử sẽ làm tiến độ lô
+            # vượt quá tổng số tệp và tự đánh dấu "hoàn thành" quá sớm.
+            self._bump_batch(batch_id, failed=1)
 
     def run(self):
         logger.info("Worker started (id=%s). Waiting for jobs on queue '%s'...",
@@ -464,6 +483,25 @@ class DigitizationWorker:
             filename=filename,
             error=error_message,
         )
+
+    def _batch_paused(self, batch_id: str) -> bool:
+        """Lô có đang tạm dừng không? Lỗi truy vấn → coi như không, để tài liệu vẫn được xử lý."""
+        try:
+            from scripts.core import batches
+            return batches.is_paused(batch_id)
+        except Exception as e:  # noqa: BLE001 - chưa chạy migration 006 thì cứ xử lý bình thường
+            logger.debug("Không đọc được trạng thái lô %s: %s", batch_id, e)
+            return False
+
+    def _bump_batch(self, batch_id: Optional[str], done: int = 0, failed: int = 0) -> None:
+        """Cập nhật tiến độ lô. Số liệu tiến độ không bao giờ được chặn việc xử lý tài liệu."""
+        if not batch_id:
+            return
+        try:
+            from scripts.core import batches
+            batches.bump_counters(batch_id, done=done, failed=failed)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Không cập nhật được tiến độ lô %s: %s", batch_id, e)
 
     def _record_ocr_metrics(self, job_id: str, input_file: str, summary: dict,
                             config, language: Optional[str], stage_timings: dict) -> None:

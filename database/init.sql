@@ -637,5 +637,60 @@ CREATE TRIGGER trg_ocr_runs_touch BEFORE UPDATE ON ocr_runs
     FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 
 -- =====================================================================
+-- 12. LÔ NẠP TÀI LIỆU (YC-BU — sprint V5)
+--     Giữ ĐỒNG BỘ với database/migrations/006_batches.sql.
+--
+--     Không có khái niệm lô thì tải 300 tệp là 300 job rời rạc: không biết còn bao nhiêu, tệp nào
+--     lỗi, và không dừng/chạy lại cả mẻ được. `file_hash` được tính SẴN ở đường tải lên (ADR-010)
+--     nên chống trùng chỉ là một truy vấn.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS batches (
+    id            TEXT PRIMARY KEY,
+    name          VARCHAR(200) NOT NULL,
+    source        VARCHAR(20)  NOT NULL DEFAULT 'web',    -- web|folder|zip|watch|api
+    created_by    BIGINT,
+    priority      VARCHAR(10)  NOT NULL DEFAULT 'normal',
+    -- Bộ đếm thay vì COUNT mỗi lần hiển thị: lô đang chạy được mở xem liên tục
+    total_files   INTEGER      NOT NULL DEFAULT 0,
+    done_files    INTEGER      NOT NULL DEFAULT 0,
+    failed_files  INTEGER      NOT NULL DEFAULT 0,
+    skipped_files INTEGER      NOT NULL DEFAULT 0,
+    status        VARCHAR(20)  NOT NULL DEFAULT 'running',
+    note          TEXT,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    finished_at   TIMESTAMPTZ,
+    CONSTRAINT ck_batches_status CHECK (
+        status IN ('running', 'paused', 'completed', 'cancelled', 'deleted')),
+    CONSTRAINT ck_batches_priority CHECK (priority IN ('high', 'normal', 'low'))
+);
+CREATE INDEX IF NOT EXISTS idx_batches_created ON batches(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_batches_status  ON batches(status)
+    WHERE status IN ('running', 'paused');
+CREATE INDEX IF NOT EXISTS idx_batches_creator ON batches(created_by);
+
+DROP TRIGGER IF EXISTS trg_batches_touch ON batches;
+CREATE TRIGGER trg_batches_touch BEFORE UPDATE ON batches
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+ALTER TABLE documents
+    ADD COLUMN IF NOT EXISTS batch_id    TEXT REFERENCES batches(id),
+    ADD COLUMN IF NOT EXISTS file_hash   CHAR(64),      -- SHA-256, nền tảng chống trùng (YC-BU-04)
+    ADD COLUMN IF NOT EXISTS file_size   BIGINT,
+    ADD COLUMN IF NOT EXISTS page_count  INTEGER,
+    ADD COLUMN IF NOT EXISTS priority    VARCHAR(10) NOT NULL DEFAULT 'normal',
+    ADD COLUMN IF NOT EXISTS attempts    INTEGER     NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS uploaded_by BIGINT,
+    ADD COLUMN IF NOT EXISTS assigned_to BIGINT;       -- ai chịu trách nhiệm duyệt (YC-RV-07)
+
+CREATE INDEX IF NOT EXISTS idx_documents_batch    ON documents(batch_id);
+-- KHÔNG dùng UNIQUE: cùng một tệp có thể cần xử lý lại có chủ đích (DEDUP_MODE=reprocess)
+CREATE INDEX IF NOT EXISTS idx_documents_hash     ON documents(file_hash)
+    WHERE file_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_documents_uploader ON documents(uploaded_by);
+CREATE INDEX IF NOT EXISTS idx_documents_assignee ON documents(assigned_to)
+    WHERE assigned_to IS NOT NULL;
+
+-- =====================================================================
 -- END OF SCHEMA
 -- =====================================================================

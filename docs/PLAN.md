@@ -88,6 +88,28 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
 ---
 
 
+## Sprint vừa xong: V5 nạp tài liệu khối lượng lớn (đường vào) ✅  *(02/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-BU-02/03** Bỏ trần 10 tệp → hạn mức cấu hình theo *số tệp* và *tổng dung lượng*; khái niệm **lô** | migration 006 + 28 pytest |
+| **YC-BU-04** Chống trùng SHA-256 — báo rõ trùng với tài liệu nào | hash đã có sẵn từ ADR-010 |
+| **YC-BU-09** Kiểm tệp **thật sự là PDF** (chữ ký tệp), tệp rỗng, PDF có mật khẩu, tải lên đứt giữa chừng | pytest từng ca, mỗi ca một thông báo tiếng Việt riêng |
+| **YC-BU-05** Kiểm dung lượng đĩa **trước khi** nhận byte nào | pytest |
+| **YC-BU-07 🔴** Nạp từ ZIP — chống **zip-slip** và **zip bomb**, kiểm trên siêu dữ liệu trước khi giải nén | 14 pytest |
+| **YC-BU-16** Tạm dừng / tiếp tục / hủy lô; tài liệu đang xử lý dở vẫn chạy xong | 5 pytest, gồm ca tạm dừng lâu không đẩy job vào hàng đợi chết |
+| Trang `/lo` — nạp lô, theo dõi tiến độ, **liệt kê từng tệp bị bỏ qua kèm lý do** | UI build exit 0 |
+
+**475 pytest PASS** · UI build exit 0. Endpoint nạp cũ **giữ nguyên** (ADR-003).
+
+> ⚠️ **Cần chạy `database/migrations/006_batches.sql`** (sau 005). Trước khi chạy: `pg_dump`.
+
+### Còn nợ của V5
+- **Thư mục theo dõi** (`YC-BU-06`) và **upload chia mảnh** (`YC-BU-08`) chưa làm.
+- Chưa đo `KT-HN-08` (thông lượng nạp 500 tệp) — cần bộ BD-06 và môi trường thật.
+
+---
+
 ## Sprint vừa xong: V2 phân tích chi tiết kết quả AI ✅  *(02/08/2026)*
 
 | Việc | Kiểm chứng |

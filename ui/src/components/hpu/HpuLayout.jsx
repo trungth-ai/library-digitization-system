@@ -6,6 +6,7 @@ import { formatNumber } from "@/lib/format";
 // "chưa có" còn hơn để người dùng bấm vào một liên kết không đi đâu cả.
 const NAV = [
   { key: "upload", label: "Tải tài liệu", icon: "⬆️", href: "/" },
+  { key: "batches", label: "Lô tài liệu", icon: "📦", href: "/lo" },
   { key: "jobs", label: "Hàng đợi OCR", icon: "⏳", href: "/" },
   { key: "dspace", label: "Đẩy DSpace", icon: "📤", href: null },
   { key: "schemas", label: "Lược đồ", icon: "🧩", href: "/luoc-do" },

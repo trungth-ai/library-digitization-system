@@ -876,6 +876,41 @@ def log_model_call_fields(model_call_id: Optional[int], document_id: Optional[st
         return 0
 
 
+def set_document_batch_info(job_id: str, batch_id: Optional[str] = None,
+                            file_hash: Optional[str] = None, file_size: Optional[int] = None,
+                            page_count: Optional[int] = None, uploaded_by: Optional[int] = None,
+                            priority: Optional[str] = None) -> None:
+    """
+    Gắn thông tin lô/tệp cho một tài liệu (sprint V5). Không ném lỗi ra ngoài.
+
+    Tách khỏi `create_document` thay vì thêm tham số: `create_document` được gọi từ đường nạp CŨ
+    (`/api/v1/process`) vốn không có khái niệm lô, và đổi chữ ký của nó là chạm vào đường đang chạy
+    thật mà không được gì.
+
+    Chỉ cập nhật trường được truyền vào — `COALESCE` giữ nguyên giá trị cũ cho phần bỏ trống.
+    """
+    sql = """
+        UPDATE documents
+        SET batch_id    = COALESCE(%(batch_id)s, batch_id),
+            file_hash   = COALESCE(%(file_hash)s, file_hash),
+            file_size   = COALESCE(%(file_size)s, file_size),
+            page_count  = COALESCE(%(page_count)s, page_count),
+            uploaded_by = COALESCE(%(uploaded_by)s, uploaded_by),
+            priority    = COALESCE(%(priority)s, priority)
+        WHERE id = %(job_id)s
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {
+                    "job_id": job_id, "batch_id": batch_id, "file_hash": file_hash,
+                    "file_size": file_size, "page_count": page_count,
+                    "uploaded_by": uploaded_by, "priority": priority,
+                })
+    except Exception as e:  # noqa: BLE001 - chưa chạy migration 006 thì vẫn phải nạp được tài liệu
+        logger.warning(f"Không gắn được thông tin lô cho {job_id}: {e}")
+
+
 def log_ocr_run(document_id: str, **fields) -> None:
     """
     Ghi chỉ số một lượt OCR (YC-AN-03). Không ném lỗi ra ngoài.

@@ -773,6 +773,326 @@ async def batch_upload(
 
 
 # ---------------------------------------------------------------------
+# ROUTES - NẠP THEO LÔ (YC-BU, sprint V5)
+# ---------------------------------------------------------------------
+
+class BatchStatusUpdate(BaseModel):
+    status: str      # running | paused | cancelled
+
+
+@app.post("/api/v2/batches")
+async def create_batch_upload(
+    request:    Request,
+    files:      List[UploadFile] = File(...),
+    name:       str = Form(""),
+    collection: str = Form("default"),
+    language:   str = Form("vie"),
+    doc_type:   str = Form("book"),
+    priority:   str = Form("normal"),
+    principal:  Principal = Depends(require(policy.DOCUMENT_UPLOAD)),
+):
+    """
+    Nạp nhiều tệp thành MỘT LÔ theo dõi được (YC-BU-02/03/04).
+
+    Khác `/api/v2/batch-upload` cũ (trần cứng 10 tệp, không có khái niệm lô): endpoint này nhận tới
+    `MAX_BATCH_FILES` tệp, chống trùng bằng SHA-256, kiểm tệp thật sự là PDF, và trả về danh sách
+    tệp bị bỏ qua **kèm lý do từng tệp** — nạp 500 tệp mà chỉ báo "30 tệp lỗi" là vô dụng.
+
+    Endpoint cũ **giữ nguyên**, không đụng tới (ADR-003).
+    """
+    from scripts.core import batches, file_check
+
+    # Kiểm đĩa TRƯỚC khi ghi byte nào: đĩa đầy giữa lô lớn làm cả hệ thống hỏng khó gỡ
+    disk = file_check.check_disk_space(str(BASE_DIR))
+    if not disk.ok:
+        db.log_system_event(source="api", kind="disk_low", level="error", message=disk.reason)
+        return JSONResponse(status_code=507, content=err_envelope(disk.reason, code=disk.code))
+
+    limits = file_check.check_batch_limits(len(files), 0)
+    if not limits.ok:
+        return JSONResponse(status_code=400, content=err_envelope(limits.reason, code=limits.code))
+
+    batch_name = name.strip() or f"Lô ngày {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    batch_id = batches.create_batch(
+        name=batch_name, source=batches.SOURCE_WEB, created_by=principal.user_id,
+        priority=priority if priority in jobqueue.PRIORITIES else "normal",
+    )
+
+    dedup_mode = os.getenv("DEDUP_MODE", batches.DEDUP_SKIP).strip().lower()
+    accepted, skipped = [], []
+    total_bytes = 0
+
+    for file in files:
+        name_check = file_check.check_filename(file.filename or "")
+        if not name_check.ok:
+            skipped.append({"filename": file.filename, "ly_do": name_check.reason,
+                            "code": name_check.code})
+            await file.close()
+            continue
+
+        job_id = str(uuid.uuid4())
+        paths = create_job_dirs(job_id)
+        input_file_path = paths["input_dir"] / file.filename
+
+        try:
+            file_hash, file_size = await save_upload_stream(file, input_file_path)
+        except Exception:
+            logger.exception("Không ghi được '%s'", file.filename)
+            skipped.append({"filename": file.filename, "ly_do": "Không ghi được tệp xuống đĩa",
+                            "code": "write_failed"})
+            continue
+        finally:
+            await file.close()
+
+        content_check = file_check.check_pdf_content(input_file_path, expected_size=file_size)
+        if not content_check.ok:
+            skipped.append({"filename": file.filename, "ly_do": content_check.reason,
+                            "code": content_check.code})
+            shutil.rmtree(paths["job_dir"], ignore_errors=True)   # không giữ tệp không dùng được
+            continue
+
+        if dedup_mode != batches.DEDUP_REPROCESS:
+            existing = batches.find_by_hash(file_hash)
+            if existing:
+                skipped.append({
+                    "filename": file.filename, "code": "duplicate",
+                    "ly_do": f"Trùng nội dung với tài liệu đã có: '{existing['filename']}'",
+                    "trung_voi": existing["id"],
+                })
+                shutil.rmtree(paths["job_dir"], ignore_errors=True)
+                continue
+
+        total_bytes += file_size
+        job_payload = {
+            "job_id": job_id, "filename": file.filename,
+            "input_file": str(input_file_path), "output_dir": str(paths["output_dir"]),
+            "collection_id": collection, "language": language, "document_type": doc_type,
+            "file_hash": file_hash, "file_size": file_size, "batch_id": batch_id,
+        }
+
+        try:
+            enqueue_job(job_id, file.filename, job_payload,
+                        priority=priority if priority in jobqueue.PRIORITIES else "normal")
+            db.set_document_batch_info(job_id, batch_id=batch_id, file_hash=file_hash,
+                                       file_size=file_size, uploaded_by=principal.user_id,
+                                       priority=priority)
+            accepted.append({"job_id": job_id, "filename": file.filename})
+        except Exception:
+            logger.exception("Không đưa được '%s' vào hàng đợi", file.filename)
+            skipped.append({"filename": file.filename, "ly_do": "Không đưa được vào hàng đợi",
+                            "code": "enqueue_failed"})
+
+    batches.bump_counters(batch_id, total=len(accepted), skipped=len(skipped))
+    audit.log_action(action="batch_upload", actor=principal.actor,
+                     detail={"batch_id": batch_id, "accepted": len(accepted),
+                             "skipped": len(skipped), "bytes": total_bytes})
+
+    return success(
+        {"batch_id": batch_id, "name": batch_name,
+         "da_nhan": accepted, "bo_qua": skipped,
+         "so_da_nhan": len(accepted), "so_bo_qua": len(skipped)},
+        f"Đã nhận {len(accepted)} tệp vào lô '{batch_name}'"
+        + (f", bỏ qua {len(skipped)} tệp" if skipped else ""),
+    )
+
+
+@app.post("/api/v2/batches/zip")
+async def create_batch_from_zip(
+    request:    Request,
+    file:       UploadFile = File(...),
+    name:       str = Form(""),
+    collection: str = Form("default"),
+    language:   str = Form("vie"),
+    doc_type:   str = Form("book"),
+    priority:   str = Form("low"),
+    principal:  Principal = Depends(require(policy.DOCUMENT_UPLOAD)),
+):
+    """
+    Nạp một lô từ tệp ZIP (YC-BU-07).
+
+    Mặc định ưu tiên `low`: lô ZIP thường là mẻ lớn chạy nền, không nên chen trước tài liệu lẻ mà
+    cán bộ đang ngồi chờ (ADR-011).
+
+    Tệp nén được kiểm **trên siêu dữ liệu trước khi giải nén** — chống zip bomb và zip-slip
+    (xem `scripts/core/ingest_zip.py`).
+    """
+    from scripts.core import batches, file_check, ingest_zip
+
+    disk = file_check.check_disk_space(str(BASE_DIR))
+    if not disk.ok:
+        return JSONResponse(status_code=507, content=err_envelope(disk.reason, code=disk.code))
+
+    if not (file.filename or "").lower().endswith(".zip"):
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Chỉ nhận tệp .zip ở đường nạp này", code="not_zip"))
+
+    # Ghi tệp nén vào thư mục tạm riêng của lô — dọn sạch sau khi giải nén xong
+    staging = BASE_DIR / "_zip_staging" / uuid.uuid4().hex
+    staging.mkdir(parents=True, exist_ok=True)
+    zip_path = staging / "upload.zip"
+
+    try:
+        await save_upload_stream(file, zip_path)
+    except Exception:
+        logger.exception("Không ghi được tệp nén")
+        shutil.rmtree(staging, ignore_errors=True)
+        return JSONResponse(status_code=500, content=err_envelope(
+            "Không ghi được tệp nén xuống đĩa", code="write_failed"))
+    finally:
+        await file.close()
+
+    extracted = await run_in_threadpool(ingest_zip.extract_pdfs, zip_path, staging / "files")
+    if not extracted.ok:
+        shutil.rmtree(staging, ignore_errors=True)
+        return JSONResponse(status_code=400, content=err_envelope(
+            extracted.error, code="invalid_zip"))
+
+    batch_name = name.strip() or f"Lô từ {file.filename}"
+    batch_id = batches.create_batch(
+        name=batch_name, source=batches.SOURCE_ZIP, created_by=principal.user_id,
+        priority=priority if priority in jobqueue.PRIORITIES else "low",
+    )
+
+    dedup_mode = os.getenv("DEDUP_MODE", batches.DEDUP_SKIP).strip().lower()
+    accepted = []
+    skipped = list(extracted.skipped)
+
+    for entry in extracted.entries:
+        file_hash = uploads.hash_file(entry.path)
+
+        if dedup_mode != batches.DEDUP_REPROCESS:
+            existing = batches.find_by_hash(file_hash)
+            if existing:
+                skipped.append({"filename": entry.filename, "code": "duplicate",
+                                "ly_do": f"Trùng nội dung với '{existing['filename']}'",
+                                "trung_voi": existing["id"]})
+                continue
+
+        job_id = str(uuid.uuid4())
+        paths = create_job_dirs(job_id)
+        target = paths["input_dir"] / entry.filename
+        try:
+            await run_in_threadpool(shutil.move, str(entry.path), str(target))
+        except Exception:
+            logger.exception("Không chuyển được '%s' vào thư mục job", entry.filename)
+            skipped.append({"filename": entry.filename, "code": "move_failed",
+                            "ly_do": "Không chuyển được tệp vào thư mục xử lý"})
+            continue
+
+        job_payload = {
+            "job_id": job_id, "filename": entry.filename,
+            "input_file": str(target), "output_dir": str(paths["output_dir"]),
+            # Thư mục trong ZIP là GỢI Ý bộ sưu tập; con người vẫn quyết định (nguyên tắc SRS)
+            "collection_id": collection, "language": language, "document_type": doc_type,
+            "file_hash": file_hash, "file_size": entry.size, "batch_id": batch_id,
+            "zip_folder": entry.folder,
+        }
+        try:
+            enqueue_job(job_id, entry.filename, job_payload,
+                        priority=priority if priority in jobqueue.PRIORITIES else "low")
+            db.set_document_batch_info(job_id, batch_id=batch_id, file_hash=file_hash,
+                                       file_size=entry.size, uploaded_by=principal.user_id,
+                                       priority=priority)
+            accepted.append({"job_id": job_id, "filename": entry.filename})
+        except Exception:
+            logger.exception("Không đưa được '%s' vào hàng đợi", entry.filename)
+            skipped.append({"filename": entry.filename, "code": "enqueue_failed",
+                            "ly_do": "Không đưa được vào hàng đợi"})
+
+    shutil.rmtree(staging, ignore_errors=True)
+    batches.bump_counters(batch_id, total=len(accepted), skipped=len(skipped))
+    audit.log_action(action="batch_upload_zip", actor=principal.actor,
+                     detail={"batch_id": batch_id, "accepted": len(accepted),
+                             "skipped": len(skipped), "zip": file.filename})
+
+    return success(
+        {"batch_id": batch_id, "name": batch_name, "da_nhan": accepted, "bo_qua": skipped,
+         "so_da_nhan": len(accepted), "so_bo_qua": len(skipped)},
+        f"Đã nhận {len(accepted)} tài liệu từ tệp nén"
+        + (f", bỏ qua {len(skipped)}" if skipped else ""),
+    )
+
+
+@app.get("/api/v2/batches")
+async def api_list_batches(
+    status:    Optional[str] = Query(None),
+    page:      int           = Query(1, ge=1),
+    per_page:  int           = Query(50, ge=1, le=200),
+    principal: Principal     = Depends(require(policy.DOCUMENT_READ)),
+):
+    """Danh sách lô nạp, mới nhất trước."""
+    from scripts.core import batches
+
+    try:
+        rows = batches.list_batches(status=status, limit=per_page, offset=(page - 1) * per_page)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có bảng lô. Đã chạy migration 006 chưa?", code="BATCHES_UNAVAILABLE"))
+
+    for row in rows:
+        for field in ("created_at", "updated_at", "finished_at"):
+            if row.get(field):
+                row[field] = row[field].isoformat()
+        # Tiến độ tính sẵn: giao diện không nên phải tự tính rồi mỗi nơi tính một kiểu
+        total = row.get("total_files") or 0
+        xong = (row.get("done_files") or 0) + (row.get("failed_files") or 0) \
+            + (row.get("skipped_files") or 0)
+        row["tien_do_phan_tram"] = round(xong * 100 / total) if total else 0
+
+    return success(rows, f"{len(rows)} lô")
+
+
+@app.get("/api/v2/batches/{batch_id}")
+async def api_get_batch(batch_id: str,
+                        principal: Principal = Depends(require(policy.DOCUMENT_READ))):
+    """Chi tiết một lô + danh sách tài liệu trong lô."""
+    from scripts.core import batches
+
+    batch = batches.get_batch(batch_id)
+    if not batch:
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy lô này", code="NOT_FOUND"))
+
+    documents = batches.batch_documents(batch_id)
+    for row in [batch] + documents:
+        for field in ("created_at", "updated_at", "finished_at"):
+            if row.get(field):
+                row[field] = row[field].isoformat()
+
+    return success({"batch": batch, "documents": documents}, f"Lô '{batch['name']}'")
+
+
+@app.put("/api/v2/batches/{batch_id}/status")
+async def api_set_batch_status(batch_id: str, body: BatchStatusUpdate,
+                               principal: Principal = Depends(require(policy.QUEUE_MANAGE))):
+    """
+    Tạm dừng / tiếp tục / hủy một lô (YC-BU-16).
+
+    Tài liệu đang xử lý dở **vẫn chạy xong** — dừng giữa chừng OCR là vứt bỏ công đã làm. Chỉ những
+    tài liệu chưa bắt đầu mới bị giữ lại.
+    """
+    from scripts.core import batches
+
+    try:
+        changed = batches.set_batch_status(batch_id, body.status, actor=principal.actor)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content=err_envelope(str(e), code="INVALID_STATUS"))
+
+    if not changed:
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy lô đang hoạt động với id này", code="NOT_FOUND"))
+
+    audit.log_action(action="batch_status", actor=principal.actor,
+                     detail={"batch_id": batch_id, "status": body.status})
+
+    nhan = {"paused": "Đã tạm dừng lô. Tài liệu đang xử lý dở vẫn chạy xong.",
+            "running": "Đã tiếp tục lô.",
+            "cancelled": "Đã hủy lô. Tài liệu đã xử lý vẫn được giữ nguyên."}
+    return success({"batch_id": batch_id, "status": body.status},
+                   nhan.get(body.status, "Đã cập nhật"))
+
+
+# ---------------------------------------------------------------------
 # ROUTES - SSE
 # ---------------------------------------------------------------------
 

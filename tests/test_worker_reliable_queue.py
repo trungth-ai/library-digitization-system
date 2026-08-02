@@ -194,6 +194,89 @@ def test_maintenance_gian_theo_chu_ky(worker, monkeypatch):
     assert worker.redis.llen(BASE) == 0, "chưa tới chu kỳ thì không được quét"
 
 
+# ─────────────────────────────────────────────────────────────
+# TẠM DỪNG LÔ (YC-BU-16, sprint V5)
+# ─────────────────────────────────────────────────────────────
+
+def test_lo_tam_dung_thi_hoan_job_khong_mat(worker, monkeypatch):
+    """
+    🔴 Lô tạm dừng phải HOÃN job, không bỏ đi.
+
+    "Tạm dừng" nghĩa là hoãn lại; nếu job bị ack hoặc rơi vào hàng đợi chết thì bấm "tiếp tục" sẽ
+    không có gì chạy tiếp — mất tài liệu một cách im lặng, đúng loại lỗi ADR-011 đang chống.
+    """
+    q.push(worker.redis, BASE, {"job_id": "j1", "filename": "a.pdf", "batch_id": "lo-1"})
+    claimed = q.claim(worker.redis, BASE, worker.worker_id)
+
+    da_xu_ly = []
+    worker.process_job = lambda data: da_xu_ly.append(data)
+    monkeypatch.setattr(worker, "_batch_paused", lambda batch_id: True)
+
+    worker._handle_claimed(claimed)
+
+    assert da_xu_ly == [], "lô tạm dừng thì KHÔNG được xử lý tài liệu"
+    assert worker.redis.zcard(q.delayed_key(BASE)) == 1, "job phải nằm chờ, không được biến mất"
+    assert worker.redis.llen(q.dead_key(BASE)) == 0, "tạm dừng KHÔNG phải là thất bại"
+    assert worker.redis.llen(q.processing_key(worker.worker_id)) == 0
+
+
+def test_tam_dung_khong_tinh_la_lan_thu_that_bai(worker, monkeypatch):
+    """
+    Một lô tạm dừng vài ngày không được làm job hết lượt thử rồi rơi vào hàng đợi chết.
+
+    Vì vậy nhánh tạm dừng dùng `max_attempts` rất lớn thay vì giới hạn thông thường.
+    """
+    q.push(worker.redis, BASE, {"job_id": "j1", "batch_id": "lo-1"})
+    monkeypatch.setattr(worker, "_batch_paused", lambda batch_id: True)
+
+    for _ in range(5):
+        claimed = q.claim(worker.redis, BASE, worker.worker_id)
+        if claimed is None:
+            q.promote_delayed(worker.redis, BASE, now=10 ** 12)
+            claimed = q.claim(worker.redis, BASE, worker.worker_id)
+        worker._handle_claimed(claimed)
+
+    assert worker.redis.llen(q.dead_key(BASE)) == 0, "tạm dừng lâu không được đẩy job vào hàng đợi chết"
+
+
+def test_job_khong_thuoc_lo_khong_bi_anh_huong(worker, monkeypatch):
+    """Tài liệu lẻ (không có `batch_id`) không được đi qua nhánh kiểm tra lô."""
+    q.push(worker.redis, BASE, {"job_id": "le-1", "filename": "a.pdf"})
+    claimed = q.claim(worker.redis, BASE, worker.worker_id)
+
+    goi = []
+    monkeypatch.setattr(worker, "_batch_paused", lambda batch_id: goi.append(batch_id) or True)
+    worker.process_job = lambda data: JobResult(JOB_OK)
+
+    worker._handle_claimed(claimed)
+
+    assert goi == [], "không có batch_id thì không hỏi trạng thái lô"
+    assert worker.redis.llen(q.processing_key(worker.worker_id)) == 0
+
+
+def test_loi_doc_trang_thai_lo_van_xu_ly_tai_lieu(worker, monkeypatch):
+    """
+    Không đọc được trạng thái lô (chưa chạy migration 006) → CỨ XỬ LÝ.
+
+    Không xử lý tài liệu vì không đọc nổi trạng thái lô là đánh đổi sai: tạm dừng là tiện ích,
+    xử lý tài liệu là việc chính.
+    """
+    import scripts.worker as w
+
+    q.push(worker.redis, BASE, {"job_id": "j1", "batch_id": "lo-1"})
+    claimed = q.claim(worker.redis, BASE, worker.worker_id)
+
+    def batches_hong():
+        raise ImportError("bảng batches chưa tồn tại")
+
+    monkeypatch.setattr(w, "jobqueue", q)
+    worker.process_job = lambda data: JobResult(JOB_OK)
+    # `_batch_paused` thật sẽ bắt ImportError bên trong và trả False
+    worker._handle_claimed(claimed)
+
+    assert worker.redis.llen(q.processing_key(worker.worker_id)) == 0, "job phải được xử lý và ack"
+
+
 def test_van_lui_ve_duong_blpop_cu(monkeypatch):
     """
     Van lùi `QUEUE_MODE=blpop` phải chạy ĐÚNG vòng lặp cũ (ADR-011 mục 7).
