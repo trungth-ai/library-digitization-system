@@ -715,5 +715,21 @@ CREATE TABLE IF NOT EXISTS queue_samples (
 CREATE INDEX IF NOT EXISTS idx_queue_samples_created ON queue_samples(created_at DESC);
 
 -- =====================================================================
+-- 14. QUY TRÌNH DUYỆT TÀI LIỆU (YC-RV — sprint V8)
+--     Giữ ĐỒNG BỘ với database/migrations/008_review_workflow.sql.
+--
+--     `needs_review` cho biết tài liệu CẦN xem lại, nhưng không có chỗ nào ghi tài liệu ĐÃ ĐƯỢC
+--     DUYỆT — nên không chốt được điều kiện "chưa duyệt thì không đẩy DSpace" (YC-RV-04), tức là
+--     nguyên tắc SRS "con người giữ quyền quyết định" không cưỡng chế được.
+-- =====================================================================
+ALTER TABLE documents
+    -- NULL = chưa ai xác nhận. Không dùng BOOLEAN vì cần biết xác nhận LÚC NÀO và BỞI AI
+    ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS confirmed_by VARCHAR(150);
+
+CREATE INDEX IF NOT EXISTS idx_documents_unconfirmed ON documents(updated_at ASC)
+    WHERE confirmed_at IS NULL AND status = 'completed';
+
+-- =====================================================================
 -- END OF SCHEMA
 -- =====================================================================

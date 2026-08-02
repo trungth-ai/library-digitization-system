@@ -88,6 +88,35 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
 ---
 
 
+## Sprint vừa xong: V8 không gian duyệt + cảnh báo ✅  *(02/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-RV-01/02** Trang `/duyet` hai cột — PDF bên trái, metadata bên phải, **tô màu trường điểm thấp** | UI build exit 0 |
+| **YC-RV-03** Phím tắt J/K chuyển tài liệu, Ctrl+Enter xác nhận, Esc đóng | UI build exit 0 |
+| **YC-RV-04 🔴** Xác nhận ghi `audit_log` với tên thật + chốt **chưa duyệt không đẩy DSpace** | migration 008, van lùi `REQUIRE_CONFIRM_BEFORE_DSPACE=0` |
+| **YC-RV-05** Trang `/thung-rac` — phục hồi + xóa vĩnh viễn có **xác nhận hai bước** | UI build exit 0 |
+| **YC-RV-06** Duyệt hàng loạt, trần cứng ở máy chủ; giao diện **khóa chọn** tài liệu có trường điểm thấp | pytest |
+| **YC-TB-01/04** Kênh cảnh báo cắm được (log/email/webhook) + **chống spam** theo thời gian nguội | 38 pytest |
+| **YC-TB-02/03** Quy tắc: không worker, đĩa sắp đầy, hàng đợi tồn đọng, hàng đợi chết, quá hạn SLA, lô lỗi cao | pytest thuần, không cần DB |
+| **YC-TB-06 🔴 / KT-BM-21** Chặn webhook trỏ ra ngoài mạng nội bộ | pytest |
+
+**533 pytest PASS** · UI build exit 0.
+
+> ⚠️ **Cần chạy `database/migrations/008_review_workflow.sql`** (sau 007).
+> Chốt `REQUIRE_CONFIRM_BEFORE_DSPACE` **mặc định TẮT** — tài liệu cũ đều chưa có `confirmed_at`
+> (quy trình xác nhận chưa từng tồn tại), bật ngay sẽ chặn toàn bộ tồn đọng cũ. Bật sau khi đã
+> xử lý xong tồn đọng. **Không** tự đánh dấu tài liệu cũ là "đã duyệt": đó là bịa ra một sự kiện
+> chưa từng xảy ra, và nó sẽ nằm vĩnh viễn trong dữ liệu với tên một cán bộ không hề bấm nút nào.
+
+### Còn nợ của V8
+- `/luoc-do` (YC-RV-08) vẫn dùng dữ liệu mẫu — chưa nối `/api/v2/schemas`.
+- Phân công tài liệu (YC-RV-07) có API, chưa có giao diện.
+- `ALERTS_ENABLED` chưa có tiến trình chạy định kỳ — quy tắc và kênh đã sẵn sàng, còn thiếu bộ hẹn giờ
+  gọi `rules.collect_snapshot()` → `Dispatcher.send()`. Dự kiến gắn vào worker ở V9.
+
+---
+
 ## Sprint vừa xong: V7 bảng điều khiển theo dõi công việc ✅  *(02/08/2026)*
 
 | Việc | Kiểm chứng |

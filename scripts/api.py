@@ -1361,6 +1361,33 @@ async def update_dspace_status(job_id: str, body: DSpaceStatusUpdate,
     if body.dspace_status not in allowed:
         raise HTTPException(status_code=400, detail=f"Invalid dspace_status. Allowed: {allowed}")
 
+    # 🔴 CHỐT YC-RV-04: chưa có cán bộ xác nhận thì KHÔNG được ghi vào hệ đích.
+    #
+    # Hiện thực hóa nguyên tắc SRS "con người giữ quyền quyết định — không tự ghi vào DSpace khi chưa
+    # có cán bộ xác nhận". Chặn ở bước `uploading` (bắt đầu đẩy) chứ không ở `uploaded`: chặn sau khi
+    # đã đẩy xong là vô nghĩa, item đã nằm trên DSpace rồi.
+    #
+    # Mặc định TẮT vì tài liệu cũ đều chưa có `confirmed_at` (quy trình xác nhận chưa từng tồn tại) —
+    # bật ngay sẽ chặn toàn bộ tồn đọng cũ. Xem migration 008.
+    if REQUIRE_CONFIRM_BEFORE_DSPACE and body.dspace_status == "uploading":
+        confirmation = db.confirmation_status(job_id)
+
+        if confirmation is None:
+            # KHÔNG đọc được trạng thái xác nhận → CHẶN, không cho qua. Một chốt an toàn mà im lặng
+            # cho qua khi không đọc được dữ liệu là một chốt nói dối.
+            return JSONResponse(status_code=503, content=err_envelope(
+                "Không kiểm tra được trạng thái xác nhận của tài liệu. "
+                "Nếu vừa bật REQUIRE_CONFIRM_BEFORE_DSPACE, hãy chạy migration 008 trước.",
+                code="CONFIRM_CHECK_FAILED"))
+
+        if not confirmation.get("confirmed_at"):
+            logger.warning("Chặn đẩy DSpace tài liệu chưa xác nhận: %s (bởi %s)",
+                           job_id, principal.actor)
+            return JSONResponse(status_code=409, content=err_envelope(
+                "Tài liệu chưa được cán bộ xác nhận nên chưa đẩy lên DSpace được. "
+                "Vui lòng mở trang Duyệt tài liệu, kiểm tra metadata rồi bấm Xác nhận.",
+                code="NOT_CONFIRMED"))
+
     db.update_dspace_status(
         job_id=job_id,
         dspace_status=body.dspace_status,
@@ -1799,6 +1826,134 @@ async def api_system_events(
         if r.get("created_at"):
             r["created_at"] = r["created_at"].isoformat()
     return success(rows, "Sự kiện hệ thống")
+
+
+# ---------------------------------------------------------------------
+# ROUTES - DUYỆT TÀI LIỆU (YC-RV, sprint V8)
+# ---------------------------------------------------------------------
+
+class AssignRequest(BaseModel):
+    user_id: Optional[int] = None
+
+
+class BulkConfirmRequest(BaseModel):
+    job_ids: List[str]
+
+
+# Chốt "chưa xác nhận thì không đẩy DSpace" (YC-RV-04) — hiện thực hóa nguyên tắc SRS "con người giữ
+# quyền quyết định". MẶC ĐỊNH TẮT: bật ngay sẽ chặn toàn bộ tài liệu cũ (chúng có `confirmed_at`
+# NULL vì quy trình xác nhận chưa từng tồn tại). Bật sau khi đã xử lý xong tồn đọng — xem migration 008.
+REQUIRE_CONFIRM_BEFORE_DSPACE = os.getenv(
+    "REQUIRE_CONFIRM_BEFORE_DSPACE", "0").strip() not in ("0", "false", "no", "")
+
+
+@app.get("/api/v2/review/pending")
+async def api_review_pending(
+    mine_only: bool      = Query(False, description="Chỉ tài liệu giao cho tôi hoặc chưa giao"),
+    page:      int       = Query(1, ge=1),
+    per_page:  int       = Query(50, ge=1, le=200),
+    principal: Principal = Depends(require(policy.DOCUMENT_READ)),
+):
+    """
+    Tài liệu chờ duyệt (YC-RV-01), tài liệu chờ LÂU NHẤT lên đầu.
+
+    Sắp theo mới nhất trước sẽ đẩy tài liệu tồn đọng xuống cuối và chúng không bao giờ được xử lý —
+    đúng cái mà cảnh báo SLA của V7 đang cố phát hiện.
+    """
+    try:
+        rows = db.list_pending_review(
+            assigned_to=principal.user_id if mine_only else None,
+            limit=per_page, offset=(page - 1) * per_page,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được danh sách chờ duyệt: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa đọc được danh sách chờ duyệt. Đã chạy migration 008 chưa?",
+            code="REVIEW_UNAVAILABLE"))
+
+    for row in rows:
+        for field in ("created_at", "updated_at"):
+            if row.get(field):
+                row[field] = row[field].isoformat()
+        row["gio_cho"] = int(row.get("gio_cho") or 0)
+
+    return success(rows, f"{len(rows)} tài liệu chờ duyệt")
+
+
+@app.post("/api/v2/jobs/{job_id}/confirm")
+async def api_confirm_document(job_id: str,
+                               principal: Principal = Depends(require(policy.DOCUMENT_APPROVE))):
+    """
+    Cán bộ xác nhận tài liệu đã đúng (YC-RV-04).
+
+    QĐ-05: quyền duyệt do **phân quyền** quyết định, không do quan hệ sở hữu — người có
+    `document:approve` duyệt được cả tài liệu do chính mình tải lên.
+    """
+    doc = db.get_document(job_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu")
+
+    if doc["status"] != "completed":
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Chỉ xác nhận được tài liệu đã xử lý xong", code="NOT_COMPLETED"))
+
+    if not db.confirm_document(job_id, principal.actor):
+        return JSONResponse(status_code=409, content=err_envelope(
+            f"Tài liệu này đã được duyệt bởi '{doc.get('confirmed_by') or 'người khác'}'",
+            code="ALREADY_CONFIRMED"))
+
+    audit.log_action(action=audit.ACTION_CONFIRM, document_id=job_id, actor=principal.actor,
+                     detail={"filename": doc.get("filename")})
+    return success({"job_id": job_id, "confirmed_by": principal.actor}, "Đã xác nhận tài liệu")
+
+
+@app.post("/api/v2/review/bulk-confirm")
+async def api_bulk_confirm(body: BulkConfirmRequest,
+                           principal: Principal = Depends(require(policy.DOCUMENT_APPROVE))):
+    """
+    Xác nhận nhiều tài liệu một lần (YC-RV-06).
+
+    ⚠️ Trần cứng để duyệt hàng loạt không thành "bấm một nút duyệt cả kho": xác nhận là hành vi chịu
+    trách nhiệm, cán bộ phải thực sự nhìn qua từng tài liệu. Giao diện chỉ cho chọn tài liệu điểm
+    tin cậy cao, nhưng ràng buộc thật phải ở máy chủ.
+    """
+    max_bulk = int(os.getenv("MAX_BULK_CONFIRM", "50"))
+    if len(body.job_ids) > max_bulk:
+        return JSONResponse(status_code=400, content=err_envelope(
+            f"Chỉ xác nhận tối đa {max_bulk} tài liệu mỗi lần (bạn chọn {len(body.job_ids)})",
+            code="TOO_MANY"))
+
+    confirmed, skipped = [], []
+    for job_id in body.job_ids:
+        try:
+            if db.confirm_document(job_id, principal.actor):
+                confirmed.append(job_id)
+                audit.log_action(action=audit.ACTION_CONFIRM, document_id=job_id,
+                                 actor=principal.actor, detail={"bulk": True})
+            else:
+                skipped.append(job_id)
+        except Exception as e:  # noqa: BLE001 - một tài liệu lỗi không được làm hỏng cả mẻ
+            logger.warning("Không xác nhận được %s: %s", job_id, e)
+            skipped.append(job_id)
+
+    return success({"da_xac_nhan": confirmed, "bo_qua": skipped,
+                    "so_da_xac_nhan": len(confirmed), "so_bo_qua": len(skipped)},
+                   f"Đã xác nhận {len(confirmed)} tài liệu"
+                   + (f", bỏ qua {len(skipped)} (đã duyệt trước đó hoặc chưa xong)" if skipped else ""))
+
+
+@app.put("/api/v2/jobs/{job_id}/assign")
+async def api_assign_document(job_id: str, body: AssignRequest,
+                              principal: Principal = Depends(require(policy.DOCUMENT_APPROVE))):
+    """Giao tài liệu cho một cán bộ duyệt (YC-RV-07). `user_id=null` để bỏ phân công."""
+    if not db.get_document(job_id):
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu")
+
+    db.assign_document(job_id, body.user_id)
+    audit.log_action(action="assign", document_id=job_id, actor=principal.actor,
+                     new_value=str(body.user_id) if body.user_id else "(bỏ phân công)")
+    return success({"job_id": job_id, "assigned_to": body.user_id},
+                   "Đã giao tài liệu" if body.user_id else "Đã bỏ phân công")
 
 
 # ---------------------------------------------------------------------

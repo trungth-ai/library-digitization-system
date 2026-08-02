@@ -876,6 +876,100 @@ def log_model_call_fields(model_call_id: Optional[int], document_id: Optional[st
         return 0
 
 
+def confirm_document(job_id: str, actor: str) -> bool:
+    """
+    Cán bộ xác nhận một tài liệu (YC-RV-04). Trả `True` nếu vừa xác nhận, `False` nếu đã xác nhận rồi.
+
+    `confirmed_at IS NULL` trong điều kiện WHERE là chốt chống xác nhận hai lần: hai cán bộ cùng bấm
+    thì người sau nhận `False` và giao diện nói rõ "đã được duyệt bởi ...", thay vì ghi đè tên người
+    trước một cách im lặng.
+
+    Xác nhận CŨNG gỡ cờ `needs_review`: cán bộ đã xem và đồng ý thì tài liệu không còn nằm trong
+    danh sách chờ nữa — nếu không nó sẽ ở đó mãi và danh sách chờ mất ý nghĩa.
+    """
+    sql = """
+        UPDATE documents
+        SET confirmed_at = NOW(), confirmed_by = %s, needs_review = FALSE
+        WHERE id = %s AND confirmed_at IS NULL AND status = 'completed'
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (actor, job_id))
+            return bool(cur.rowcount)
+
+
+def confirmation_status(job_id: str) -> Optional[Dict]:
+    """
+    Trạng thái xác nhận của một tài liệu, hoặc `None` nếu KHÔNG XÁC ĐỊNH ĐƯỢC.
+
+    Truy vấn riêng thay vì thêm cột vào `get_document()`: cột `confirmed_at` chỉ tồn tại sau
+    migration 008, và thêm nó vào `get_document` sẽ làm **toàn bộ trang chi tiết tài liệu hỏng** nếu
+    mã mới được triển khai trước khi chạy migration — đúng tình huống bình thường lúc deploy.
+
+    Trả `None` (không biết) chứ không phải `{}` (chưa duyệt): nơi gọi phải phân biệt hai điều này.
+    Chốt chặn đẩy DSpace xử lý "không biết" bằng cách CHẶN kèm thông báo yêu cầu chạy migration —
+    một chốt an toàn mà im lặng cho qua khi không đọc được dữ liệu là một chốt nói dối.
+    """
+    try:
+        import psycopg2.extras
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT confirmed_at, confirmed_by FROM documents WHERE id = %s", (job_id,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được trạng thái xác nhận của %s: %s", job_id, e)
+        return None
+
+
+def assign_document(job_id: str, user_id: Optional[int]) -> bool:
+    """Giao tài liệu cho một cán bộ duyệt (YC-RV-07). `user_id=None` = bỏ phân công."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE documents SET assigned_to = %s WHERE id = %s", (user_id, job_id))
+            return bool(cur.rowcount)
+
+
+def list_pending_review(assigned_to: Optional[int] = None, only_unassigned: bool = False,
+                        limit: int = 100, offset: int = 0) -> List[Dict]:
+    """
+    Danh sách tài liệu chờ duyệt (YC-RV-01).
+
+    Sắp theo `updated_at` TĂNG DẦN — tài liệu chờ lâu nhất lên đầu. Sắp theo mới nhất trước sẽ làm
+    những tài liệu tồn đọng lâu bị đẩy xuống cuối và không bao giờ được xử lý.
+    """
+    conditions = ["d.status = 'completed'", "d.confirmed_at IS NULL"]
+    params: list = []
+
+    if assigned_to is not None:
+        conditions.append("(d.assigned_to = %s OR d.assigned_to IS NULL)")
+        params.append(assigned_to)
+    elif only_unassigned:
+        conditions.append("d.assigned_to IS NULL")
+
+    sql = f"""
+        SELECT d.id, d.filename, d.status, d.needs_review, d.review_note,
+               d.created_at, d.updated_at, d.assigned_to, d.batch_id,
+               d.extraction_provider, d.extraction_mode,
+               ROUND(EXTRACT(EPOCH FROM (NOW() - d.updated_at)) / 3600) AS gio_cho,
+               (SELECT COUNT(*) FROM metadata_fields m
+                 WHERE m.document_id = d.id AND m.confidence IS NOT NULL AND m.confidence < 0.5)
+                   AS so_truong_diem_thap
+        FROM documents d
+        WHERE {' AND '.join(conditions)}
+        ORDER BY d.needs_review DESC, d.updated_at ASC
+        LIMIT %s OFFSET %s
+    """
+    params.extend([limit, offset])
+
+    import psycopg2.extras
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+
 def log_queue_sample(depth: Dict, workers_alive: Optional[int] = None) -> None:
     """
     Ghi một mẫu độ sâu hàng đợi (YC-BU-18). Không ném lỗi — số liệu không được chặn việc xử lý.
