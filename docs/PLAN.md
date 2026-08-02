@@ -88,6 +88,29 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
 ---
 
 
+## Sprint vừa xong: V7 bảng điều khiển theo dõi công việc ✅  *(02/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-DB-01** "Việc của tôi" — chờ duyệt / đang xử lý / bị lỗi / đã duyệt hôm nay | 15 pytest |
+| **YC-DB-02 🔴** Số liệu **không vênh** với `/api/v2/stats` và `/bao-cao` — dùng chung hằng `NOT_DELETED` | pytest chốt bộ lọc ở cả 3 truy vấn |
+| **YC-DB-04** Cảnh báo SLA — ngưỡng riêng theo trạng thái, đo bằng `updated_at` | pytest chốt không dùng `created_at` |
+| **YC-DB-05** Năng suất theo cán bộ (**công khai** — QĐ-06), kèm **bối cảnh** (số trang, số trường đã sửa) | pytest chốt ghi chú nằm trong dữ liệu, không chỉ ở giao diện |
+| **YC-DB-03** Tiến độ lô đang chạy · **YC-DB-08** xuất bảng tính | UI build exit 0 |
+| Trang `/bang-dieu-khien` — trang đầu tiên trên sidebar | UI build exit 0 |
+
+**495 pytest PASS** · UI build exit 0. Không cần migration mới (dùng dữ liệu sẵn có).
+
+Ba điểm thiết kế đáng ghi:
+- **Một nguồn hỏng không làm trắng cả trang**: API trả 200 kèm `phan_loi` liệt kê thẻ nào chưa
+  đọc được, thay vì 500. Bảng điều khiển gộp 5 nguồn — chưa chạy migration 006 không được làm mất
+  4 nguồn còn lại.
+- **Chưa đăng nhập → trả số toàn hệ thống** kèm cờ `theo_ca_nhan=False`, thay vì rỗng. Ở nấc
+  `AUTH_MODE=off` trang vẫn có ích và nói rõ đây không phải số của riêng ai.
+- **Không có worker thì nói thẳng** trên bảng điều khiển (kế thừa ADR-009).
+
+---
+
 ## Sprint vừa xong: V6 hàng đợi — kiểm soát tải, lấy mẫu, giao diện ✅  *(02/08/2026)*
 
 Phần lõi của hàng đợi (`BLMOVE`, thu hồi, thử lại, hàng đợi chết, ưu tiên) đã xong từ ADR-011.

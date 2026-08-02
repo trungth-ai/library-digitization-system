@@ -5,6 +5,7 @@ import { formatNumber } from "@/lib/format";
 // Điều hướng: `href` chỉ đặt cho trang ĐÃ CÓ. Mục chưa làm để href=null và hiện mờ — thà nói rõ
 // "chưa có" còn hơn để người dùng bấm vào một liên kết không đi đâu cả.
 const NAV = [
+  { key: "dashboard", label: "Bảng điều khiển", icon: "🏠", href: "/bang-dieu-khien" },
   { key: "upload", label: "Tải tài liệu", icon: "⬆️", href: "/" },
   { key: "batches", label: "Lô tài liệu", icon: "📦", href: "/lo" },
   { key: "jobs", label: "Hàng đợi OCR", icon: "⏳", href: "/" },

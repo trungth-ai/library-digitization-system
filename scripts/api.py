@@ -1802,6 +1802,116 @@ async def api_system_events(
 
 
 # ---------------------------------------------------------------------
+# ROUTES - BẢNG ĐIỀU KHIỂN (YC-DB, sprint V7)
+# ---------------------------------------------------------------------
+
+@app.get("/api/v2/dashboard/summary")
+async def api_dashboard_summary(principal: Principal = Depends(require(policy.DOCUMENT_READ))):
+    """
+    Tổng quan điều hành: hôm nay + tồn đọng + hàng đợi + lô đang chạy + cảnh báo SLA.
+
+    Gộp trong MỘT lời gọi thay vì để giao diện gọi năm lần: bảng điều khiển tự làm mới mỗi vài giây,
+    và năm request song song mỗi nhịp là tải không cần thiết cho một trang chỉ để nhìn.
+    """
+    from scripts.core import dashboard
+
+    data: dict = {}
+    loi: list = []
+
+    try:
+        data["tong_quan"] = dashboard.summary()
+    except Exception as e:  # noqa: BLE001
+        loi.append(f"tổng quan: {e}")
+        data["tong_quan"] = None
+
+    try:
+        data["viec_cua_toi"] = dashboard.my_work(principal.user_id, principal.username)
+    except Exception as e:  # noqa: BLE001
+        loi.append(f"việc của tôi: {e}")
+        data["viec_cua_toi"] = None
+
+    try:
+        data["sla"] = dashboard.sla_breaches()
+    except Exception as e:  # noqa: BLE001
+        loi.append(f"SLA: {e}")
+        data["sla"] = None
+
+    data["lo_dang_chay"] = dashboard.active_batches()
+
+    # Hàng đợi lấy từ Redis, không phải PostgreSQL — nguồn khác, lỗi khác, nên bọc riêng
+    try:
+        data["hang_doi"] = jobqueue.depth(redis_client, REDIS_QUEUE).as_dict()
+        data["hang_doi"]["workers_alive"] = sum(
+            1 for _ in redis_client.scan_iter("worker:heartbeat:*", count=100))
+    except Exception as e:  # noqa: BLE001
+        loi.append(f"hàng đợi: {e}")
+        data["hang_doi"] = None
+
+    # Trả 200 kèm danh sách phần lỗi thay vì 500: một thẻ hỏng không nên làm trắng cả bảng điều khiển
+    data["phan_loi"] = loi or None
+    return success(data, "Bảng điều khiển")
+
+
+@app.get("/api/v2/dashboard/workload")
+async def api_dashboard_workload(
+    days:      int       = Query(7, ge=1, le=90),
+    principal: Principal = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Năng suất duyệt theo từng cán bộ (YC-DB-05).
+
+    Theo `QĐ-06` đây là số liệu **công khai** cho mọi người dùng đăng nhập. Phản hồi luôn kèm
+    `ghi_chu` nói rõ đây là số liệu vận hành, không phải bảng xếp hạng — giao diện không được bỏ.
+    """
+    from scripts.core import dashboard
+
+    try:
+        return success(dashboard.staff_workload(days=days), f"Năng suất {days} ngày gần nhất")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được năng suất: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Chưa đọc được số liệu năng suất: {e}", code="WORKLOAD_UNAVAILABLE"))
+
+
+@app.get("/api/v2/dashboard/export")
+async def api_dashboard_export(
+    days:      int       = Query(7, ge=1, le=90),
+    principal: Principal = Depends(require(policy.REPORT_READ)),
+):
+    """Xuất số liệu bảng điều khiển ra bảng tính (YC-DB-08)."""
+    from scripts.core import dashboard, export_excel
+
+    try:
+        workload = dashboard.staff_workload(days=days)
+        sla = dashboard.sla_breaches(limit=1000)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Chưa có dữ liệu để xuất: {e}", code="DASHBOARD_UNAVAILABLE"))
+
+    sheets = {
+        "Năng suất": export_excel.build_rows(workload["can_bo"], [
+            ("can_bo", "Cán bộ"), ("so_tai_lieu", "Số tài liệu"), ("so_trang", "Số trang"),
+            ("so_truong_da_sua", "Số trường đã sửa"), ("lan_cuoi", "Lần duyệt gần nhất"),
+        ]),
+        "Quá hạn SLA": export_excel.build_rows(sla["danh_sach"], [
+            ("filename", "Tài liệu"), ("status", "Trạng thái"),
+            ("gio_ton_dong", "Số giờ tồn đọng"), ("review_note", "Ghi chú"),
+        ]),
+    }
+
+    content, extension, media_type = export_excel.export(sheets)
+    filename = f"bang-dieu-khien-{datetime.now().strftime('%Y%m%d')}.{extension}"
+
+    user_log.log_activity(action=user_log.ACTION_EXPORT, resource_type="report",
+                          resource_id="dashboard", detail={"days": days, "format": extension})
+
+    return StreamingResponse(
+        io.BytesIO(content), media_type=media_type,
+        headers={"Content-Disposition": content_disposition(filename)},
+    )
+
+
+# ---------------------------------------------------------------------
 # ROUTES - PHÂN TÍCH KẾT QUẢ AI (YC-AN, sprint V2)
 # ---------------------------------------------------------------------
 
