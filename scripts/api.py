@@ -808,6 +808,14 @@ async def create_batch_upload(
         db.log_system_event(source="api", kind="disk_low", level="error", message=disk.reason)
         return JSONResponse(status_code=507, content=err_envelope(disk.reason, code=disk.code))
 
+    # Kiểm soát tải (YC-BU-17): từ chối MỀM khi hàng đợi đã quá sâu. Trả 429 chứ không phải lỗi —
+    # đây là "hãy thử lại sau", không phải "yêu cầu của bạn sai".
+    can_accept, queue_reason = jobqueue.check_capacity(redis_client, REDIS_QUEUE)
+    if not can_accept:
+        db.log_system_event(source="api", kind="queue_full", level="warning", message=queue_reason)
+        return JSONResponse(status_code=429, content=err_envelope(
+            queue_reason, code="QUEUE_FULL"))
+
     limits = file_check.check_batch_limits(len(files), 0)
     if not limits.ok:
         return JSONResponse(status_code=400, content=err_envelope(limits.reason, code=limits.code))
@@ -921,6 +929,10 @@ async def create_batch_from_zip(
     disk = file_check.check_disk_space(str(BASE_DIR))
     if not disk.ok:
         return JSONResponse(status_code=507, content=err_envelope(disk.reason, code=disk.code))
+
+    can_accept, queue_reason = jobqueue.check_capacity(redis_client, REDIS_QUEUE)
+    if not can_accept:
+        return JSONResponse(status_code=429, content=err_envelope(queue_reason, code="QUEUE_FULL"))
 
     if not (file.filename or "").lower().endswith(".zip"):
         return JSONResponse(status_code=400, content=err_envelope(
@@ -1966,6 +1978,30 @@ async def api_queue_depth():
             f"Không đọc được hàng đợi: {e}", code="QUEUE_UNAVAILABLE"))
     return success({**depth.as_dict(), "mode": os.getenv("QUEUE_MODE", "reliable")},
                    "Tình trạng hàng đợi")
+
+
+@app.get("/api/v2/queue/history")
+async def api_queue_history(
+    hours:          int       = Query(24, ge=1, le=720),
+    bucket_minutes: int       = Query(15, ge=1, le=1440),
+    principal:      Principal = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Lịch sử độ sâu hàng đợi (YC-BU-18, YC-DB-06) — trả lời "giờ nào trong ngày dồn nhất".
+
+    Lấy giá trị LỚN NHẤT trong mỗi khoảng, không phải trung bình: câu hỏi là "lúc cao điểm dồn bao
+    nhiêu", mà trung bình sẽ làm phẳng mất đỉnh.
+    """
+    try:
+        rows = db.queue_history(hours=hours, bucket_minutes=bucket_minutes)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được lịch sử hàng đợi: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có dữ liệu lịch sử hàng đợi. Đã chạy migration 007 chưa?",
+            code="QUEUE_HISTORY_UNAVAILABLE"))
+
+    return success({"diem": rows, "so_gio": hours},
+                   f"Độ sâu hàng đợi {hours} giờ gần nhất")
 
 
 @app.get("/api/v2/queue/dead")

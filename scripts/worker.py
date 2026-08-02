@@ -65,6 +65,10 @@ OCR_METRICS_ENABLED = os.getenv("OCR_METRICS_ENABLED", "1").strip() not in ("0",
 # cũng không nên quá dài (bấm "tiếp tục" xong phải đợi lâu mới thấy chạy lại).
 BATCH_PAUSE_RECHECK_SEC = int(os.getenv("BATCH_PAUSE_RECHECK_SEC", "30"))
 
+# Chu kỳ lấy mẫu độ sâu hàng đợi (YC-BU-18). Ngắn hơn chu kỳ thu hồi: mẫu thưa quá thì biểu đồ
+# xu hướng không thấy được đỉnh cao điểm — mà cao điểm mới là thứ cần biết.
+QUEUE_SAMPLE_INTERVAL_SEC = int(os.getenv("QUEUE_SAMPLE_INTERVAL_SEC", "60"))
+
 # ── Kết quả xử lý một job (ADR-011 mục 6) ────────────────────────────
 JOB_OK = "ok"
 JOB_FAILED_DOCUMENT = "document"   # lỗi của TÀI LIỆU → không thử lại, vào hàng đợi chết ngay
@@ -162,6 +166,7 @@ class DigitizationWorker:
         # Lần cuối quét thu hồi việc mồ côi (0 = chưa quét → quét ngay vòng đầu, đúng lúc cần nhất:
         # worker vừa khởi động lại thường là sau khi worker trước đã chết)
         self._last_reclaim = 0.0
+        self._last_sample = 0.0
         # Chế độ hàng đợi đặt ở MỨC ĐỐI TƯỢNG, không đọc trực tiếp hằng module trong `run()`:
         # để kiểm thử bật/tắt được từng worker mà không phải nạp lại module (van lùi vẫn là QUEUE_MODE).
         self.reliable_queue = RELIABLE_QUEUE
@@ -303,6 +308,13 @@ class DigitizationWorker:
             logger.debug("Không chuyển được job đến hạn thử lại: %s", e)
 
         now = time.time()
+
+        # Lấy mẫu độ sâu hàng đợi (YC-BU-18) — nguồn dữ liệu cho biểu đồ xu hướng.
+        # Chu kỳ riêng, ngắn hơn chu kỳ thu hồi: mẫu thưa quá thì không thấy được đỉnh cao điểm.
+        if now - self._last_sample >= QUEUE_SAMPLE_INTERVAL_SEC:
+            self._last_sample = now
+            self._sample_queue_depth()
+
         if now - self._last_reclaim < RECLAIM_INTERVAL_SEC:
             return
         self._last_reclaim = now
@@ -483,6 +495,27 @@ class DigitizationWorker:
             filename=filename,
             error=error_message,
         )
+
+    def _sample_queue_depth(self) -> None:
+        """
+        Ghi một mẫu độ sâu hàng đợi. Không ném lỗi ra ngoài.
+
+        ⚠️ NHIỀU WORKER cùng lấy mẫu sẽ ghi trùng thời điểm. Chấp nhận được: truy vấn lịch sử dùng
+        `MAX` theo khoảng thời gian nên các mẫu trùng cho cùng kết quả. Bầu chọn một worker "chủ" để
+        lấy mẫu sẽ phức tạp hơn nhiều so với giá trị nhận được.
+        """
+        try:
+            depth = jobqueue.depth(self.redis, REDIS_QUEUE)
+
+            try:
+                workers_alive = sum(
+                    1 for _ in self.redis.scan_iter(f"{WORKER_HEARTBEAT_PREFIX}*", count=100))
+            except Exception:  # noqa: BLE001
+                workers_alive = None      # None = KHÔNG BIẾT, khác hẳn 0 = không có worker nào
+
+            db.log_queue_sample(depth.as_dict(), workers_alive=workers_alive)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Không lấy được mẫu độ sâu hàng đợi: %s", e)
 
     def _batch_paused(self, batch_id: str) -> bool:
         """Lô có đang tạm dừng không? Lỗi truy vấn → coi như không, để tài liệu vẫn được xử lý."""

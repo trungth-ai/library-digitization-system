@@ -25,6 +25,7 @@ Sơ đồ khóa (mức `normal` DÙNG LẠI chính khóa đang chạy hôm nay �
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -353,6 +354,42 @@ def depth(redis_client: Any, base: str) -> QueueDepth:
     for key in redis_client.scan_iter(f"{PROCESSING_PREFIX}*", count=100):
         result.processing += redis_client.llen(key)
     return result
+
+
+def check_capacity(redis_client: Any, base: str,
+                   max_depth: Optional[int] = None) -> Tuple[bool, Optional[str]]:
+    """
+    Hàng đợi còn nhận thêm được không? (YC-BU-17 — kiểm soát tải)
+
+    Trả `(còn_nhận_được, lý_do_tiếng_Việt)`.
+
+    VÌ SAO CẦN: không có giới hạn thì một cán bộ nạp 5.000 tệp lúc 9 giờ sáng sẽ làm mọi tài liệu lẻ
+    của người khác chờ nhiều giờ, và tệp đầu vào chất đống trên đĩa nhanh hơn tốc độ worker xử lý —
+    dẫn tới đĩa đầy, thứ làm hỏng cả hệ thống chứ không chỉ hàng đợi.
+
+    ⚠️ Đếm cả `delayed`: job đang chờ thử lại vẫn sẽ quay lại hàng đợi. Bỏ qua chúng thì trong một
+    sự cố hạ tầng kéo dài (mọi job đều đang chờ thử lại), hàng đợi trông rỗng và hệ thống tiếp tục
+    nhận thêm — đúng lúc không nên nhận.
+
+    Lỗi đọc Redis → CHO NHẬN: từ chối tài liệu vì không đọc nổi độ sâu hàng đợi là phản ứng quá tay.
+    """
+    threshold = max_depth if max_depth is not None else int(os.getenv("QUEUE_MAX_DEPTH", "2000"))
+    if threshold <= 0:
+        return True, None            # 0 hoặc âm = tắt kiểm soát tải
+
+    try:
+        current = depth(redis_client, base)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được độ sâu hàng đợi để kiểm soát tải: %s", e)
+        return True, None
+
+    pending = current.ready + current.delayed
+    if pending >= threshold:
+        return False, (
+            f"Hàng đợi đang có {pending} tài liệu chờ xử lý, đã đạt ngưỡng {threshold}. "
+            f"Vui lòng đợi hệ thống xử lý bớt rồi nạp tiếp — tài liệu đã nạp không bị ảnh hưởng.")
+
+    return True, None
 
 
 def list_dead(redis_client: Any, base: str, limit: int = 100,

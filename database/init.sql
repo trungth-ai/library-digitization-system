@@ -692,5 +692,28 @@ CREATE INDEX IF NOT EXISTS idx_documents_assignee ON documents(assigned_to)
     WHERE assigned_to IS NOT NULL;
 
 -- =====================================================================
+-- 13. LẤY MẪU ĐỘ SÂU HÀNG ĐỢI (YC-BU-18, YC-DB-06 — sprint V6)
+--     Giữ ĐỒNG BỘ với database/migrations/007_queue_samples.sql.
+--
+--     `/api/v2/stats` chỉ cho biết độ sâu NGAY LÚC NÀY. Câu hỏi vận hành thật lại là câu về thời
+--     gian: "giờ nào dồn nhất", "thêm worker có giảm tồn đọng không". Không có lịch sử thì không
+--     trả lời được câu nào.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS queue_samples (
+    id            BIGSERIAL PRIMARY KEY,
+    -- Tách theo mức ưu tiên: gộp thành một số sẽ che mất tình huống đáng lo nhất — hàng đợi `high`
+    -- bị dồn trong khi tổng số trông bình thường vì `low` đã vơi.
+    high          INTEGER NOT NULL DEFAULT 0,
+    normal        INTEGER NOT NULL DEFAULT 0,
+    low           INTEGER NOT NULL DEFAULT 0,
+    delayed       INTEGER NOT NULL DEFAULT 0,
+    dead          INTEGER NOT NULL DEFAULT 0,
+    processing    INTEGER NOT NULL DEFAULT 0,
+    workers_alive INTEGER,     -- NULL = không đọc được Redis, KHÁC 0 = không có worker nào
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_queue_samples_created ON queue_samples(created_at DESC);
+
+-- =====================================================================
 -- END OF SCHEMA
 -- =====================================================================

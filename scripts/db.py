@@ -876,6 +876,60 @@ def log_model_call_fields(model_call_id: Optional[int], document_id: Optional[st
         return 0
 
 
+def log_queue_sample(depth: Dict, workers_alive: Optional[int] = None) -> None:
+    """
+    Ghi một mẫu độ sâu hàng đợi (YC-BU-18). Không ném lỗi — số liệu không được chặn việc xử lý.
+
+    `workers_alive=None` được lưu là NULL chứ không phải 0: "không đọc được Redis" và "không có
+    worker nào" dẫn tới hai hành động hoàn toàn khác nhau (cùng nguyên tắc với ADR-009 mục 6).
+    """
+    sql = """
+        INSERT INTO queue_samples (high, normal, low, delayed, dead, processing, workers_alive)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (
+                    depth.get("high", 0), depth.get("normal", 0), depth.get("low", 0),
+                    depth.get("delayed", 0), depth.get("dead", 0), depth.get("processing", 0),
+                    workers_alive,
+                ))
+    except Exception as e:  # noqa: BLE001 - chưa chạy migration 007 thì bỏ qua, không làm ồn log
+        logger.debug(f"Không ghi được mẫu hàng đợi: {e}")
+
+
+def queue_history(hours: int = 24, bucket_minutes: int = 15) -> List[Dict]:
+    """
+    Lịch sử độ sâu hàng đợi, gộp theo khoảng thời gian (YC-DB-06).
+
+    Gộp theo `bucket_minutes` thay vì trả từng mẫu: 24 giờ × 60 mẫu = 1440 điểm, vẽ ra thì rối và
+    truyền qua mạng thì lãng phí. Lấy giá trị LỚN NHẤT trong mỗi khoảng chứ không phải trung bình —
+    câu hỏi là "lúc cao điểm dồn bao nhiêu", mà trung bình sẽ làm phẳng mất đỉnh.
+    """
+    sql = """
+        SELECT to_char(
+                   to_timestamp(floor(extract(epoch FROM created_at) / (%(bucket)s * 60))
+                                * (%(bucket)s * 60)),
+                   'YYYY-MM-DD HH24:MI') AS moc_thoi_gian,
+               MAX(high + normal + low) AS cho_xu_ly,
+               MAX(high)                AS uu_tien_cao,
+               MAX(delayed)             AS cho_thu_lai,
+               MAX(dead)                AS da_chet,
+               MAX(processing)          AS dang_xu_ly,
+               MIN(workers_alive)       AS worker_it_nhat
+        FROM queue_samples
+        WHERE created_at > NOW() - (%(hours)s || ' hours')::interval
+        GROUP BY moc_thoi_gian
+        ORDER BY moc_thoi_gian
+    """
+    import psycopg2.extras
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, {"hours": hours, "bucket": bucket_minutes})
+            return [dict(r) for r in cur.fetchall()]
+
+
 def set_document_batch_info(job_id: str, batch_id: Optional[str] = None,
                             file_hash: Optional[str] = None, file_size: Optional[int] = None,
                             page_count: Optional[int] = None, uploaded_by: Optional[int] = None,

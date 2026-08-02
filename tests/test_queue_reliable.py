@@ -451,6 +451,81 @@ def test_chay_lai_giu_muc_uu_tien(r):
 # QUAN SÁT
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# KIỂM SOÁT TẢI (YC-BU-17, sprint V6)
+# ─────────────────────────────────────────────────────────────
+
+def test_hang_doi_thoang_thi_cho_nhan(r):
+    for i in range(5):
+        q.push(r, BASE, _payload(job_id=f"j{i}"))
+
+    con_nhan, ly_do = q.check_capacity(r, BASE, max_depth=100)
+
+    assert con_nhan is True
+    assert ly_do is None
+
+
+def test_hang_doi_qua_sau_thi_tu_choi_mem(r):
+    """
+    Không có giới hạn thì một lô 5.000 tệp làm mọi tài liệu lẻ của người khác chờ nhiều giờ, và tệp
+    đầu vào chất đống nhanh hơn tốc độ worker — dẫn tới đĩa đầy.
+    """
+    for i in range(10):
+        q.push(r, BASE, _payload(job_id=f"j{i}"))
+
+    con_nhan, ly_do = q.check_capacity(r, BASE, max_depth=10)
+
+    assert con_nhan is False
+    assert "10" in ly_do
+    assert "không bị ảnh hưởng" in ly_do, "phải trấn an rằng tài liệu đã nạp vẫn an toàn"
+
+
+def test_dem_ca_job_dang_cho_thu_lai(r):
+    """
+    🔴 Job đang chờ thử lại VẪN sẽ quay lại hàng đợi — phải tính vào độ sâu.
+
+    Bỏ qua chúng thì trong một sự cố hạ tầng kéo dài (mọi job đều đang chờ thử lại), hàng đợi trông
+    rỗng và hệ thống tiếp tục nhận thêm — đúng lúc không nên nhận.
+    """
+    for i in range(5):
+        q.push(r, BASE, _payload(job_id=f"j{i}"))
+        c = q.claim(r, BASE, "w1")
+        q.fail(r, BASE, "w1", c, reason="DB down", retryable=True, backoff_sec=60)
+
+    assert q.depth(r, BASE).ready == 0, "hàng đợi chờ đã rỗng"
+    con_nhan, _ = q.check_capacity(r, BASE, max_depth=5)
+    assert con_nhan is False, "nhưng 5 job đang chờ thử lại vẫn phải tính vào tải"
+
+
+def test_tat_kiem_soat_tai_bang_nguong_khong(r):
+    for i in range(100):
+        q.push(r, BASE, _payload(job_id=f"j{i}"))
+
+    assert q.check_capacity(r, BASE, max_depth=0)[0] is True
+
+
+def test_redis_hong_thi_van_cho_nhan():
+    """
+    Không đọc được độ sâu hàng đợi → CHO NHẬN.
+
+    Từ chối tài liệu vì không đọc nổi một con số thống kê là phản ứng quá tay: kiểm soát tải là
+    tiện ích bảo vệ, nhận tài liệu là việc chính.
+    """
+    class RedisHong:
+        def llen(self, *a):
+            raise ConnectionError("Redis chết")
+
+        def zcard(self, *a):
+            raise ConnectionError("Redis chết")
+
+        def scan_iter(self, *a, **k):
+            raise ConnectionError("Redis chết")
+
+    con_nhan, ly_do = q.check_capacity(RedisHong(), BASE, max_depth=1)
+    assert con_nhan is True
+    assert ly_do is None
+
+
 def test_do_sau_hang_doi_dem_du_moi_loai(r):
     """
     Độ sâu phải gồm cả job đang thử lại / đã chết / đang xử lý.

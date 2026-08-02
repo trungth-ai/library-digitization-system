@@ -8,6 +8,7 @@ const NAV = [
   { key: "upload", label: "Tải tài liệu", icon: "⬆️", href: "/" },
   { key: "batches", label: "Lô tài liệu", icon: "📦", href: "/lo" },
   { key: "jobs", label: "Hàng đợi OCR", icon: "⏳", href: "/" },
+  { key: "queue", label: "Tình trạng hàng đợi", icon: "🔁", href: "/hang-doi" },
   { key: "dspace", label: "Đẩy DSpace", icon: "📤", href: null },
   { key: "schemas", label: "Lược đồ", icon: "🧩", href: "/luoc-do" },
   { key: "reports", label: "Báo cáo", icon: "📊", href: "/bao-cao" },

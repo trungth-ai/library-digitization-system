@@ -88,6 +88,38 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
 ---
 
 
+## Sprint vừa xong: V6 hàng đợi — kiểm soát tải, lấy mẫu, giao diện ✅  *(02/08/2026)*
+
+Phần lõi của hàng đợi (`BLMOVE`, thu hồi, thử lại, hàng đợi chết, ưu tiên) đã xong từ ADR-011.
+Sprint này làm phần còn lại để nó **dùng được**, không chỉ chạy đúng.
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-BU-17** Kiểm soát tải — từ chối **mềm** (429) khi hàng đợi quá sâu; đếm cả job đang chờ thử lại | 5 pytest |
+| **YC-BU-18** Lấy mẫu độ sâu hàng đợi mỗi phút + API lịch sử (lấy `MAX` theo khoảng, không phải trung bình) | migration 007 |
+| **Trang `/hang-doi`** — hàng đợi chết thành thứ **nhìn thấy và bấm được**; cảnh báo khi đang chạy `QUEUE_MODE=blpop` | UI build exit 0 |
+| Chạy lại một job / toàn bộ hàng đợi chết từ giao diện, giữ nguyên mã tài liệu | có sẵn từ ADR-011, nay có nút |
+
+**480 pytest PASS** · UI build exit 0.
+
+> ⚠️ **Cần chạy `database/migrations/007_queue_samples.sql`** (sau 006).
+
+### ⛔ YC-BU-19 (đẩy DSpace theo lô phía máy chủ) — CẦN QUYẾT ĐỊNH, chưa làm
+
+Hiện việc đẩy DSpace dùng **phiên đăng nhập DSpace của từng cán bộ** trong trình duyệt (766 dòng JS
+trong `ui/src/app/api/dspace/*`, REST 6.3 dạng XML). Chuyển sang chạy phía máy chủ đòi hỏi một trong hai:
+
+| Phương án | Hệ quả |
+|---|---|
+| **(a) Tài khoản dịch vụ DSpace** — lưu thông tin đăng nhập của một tài khoản chung | DSpace sẽ ghi nhận **mọi** item do một tài khoản đẩy lên → mất dấu vết ai thực sự đẩy, ở phía DSpace. `audit_log` của DocuFlow vẫn ghi đúng người, nhưng hai hệ thống sẽ nói khác nhau |
+| **(b) Mượn phiên của cán bộ** cho tác vụ nền | Phiên DSpace hết hạn giữa chừng → lô 100 item đang đẩy dở dừng lại, cần cán bộ đăng nhập lại |
+
+Đây là quyết định về **trách nhiệm giải trình**, không phải kỹ thuật — cần Trung tâm chốt (đề xuất
+ghi thành `QĐ-09`). Tôi khuyến nghị **(a)** kèm bắt buộc ghi `dc.description.provenance` chứa tên cán
+bộ thật, để dấu vết không mất ở phía DSpace.
+
+---
+
 ## Sprint vừa xong: V5 nạp tài liệu khối lượng lớn (đường vào) ✅  *(02/08/2026)*
 
 | Việc | Kiểm chứng |
