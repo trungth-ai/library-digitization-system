@@ -792,28 +792,116 @@ def log_model_call(
     fallback_from: Optional[str] = None,
     error: Optional[str] = None,
     status: str = "success",
-) -> None:
+    analytics: Optional[Dict] = None,
+) -> Optional[int]:
     """
-    Ghi một lần gọi model (YC-MP-06). KHÔNG ném lỗi ra ngoài: nhật ký hỏng không được làm gãy
-    việc số hóa của cán bộ — cùng nguyên tắc với audit.log_action.
+    Ghi một lần gọi model (YC-MP-06). Trả về `id` của bản ghi, hoặc `None` nếu ghi thất bại.
+
+    KHÔNG ném lỗi ra ngoài: nhật ký hỏng không được làm gãy việc số hóa của cán bộ — cùng nguyên tắc
+    với `audit.log_action`.
+
+    `analytics` (sprint V2, tùy chọn) mang thêm token/chi phí/độ tin cậy. Truyền dưới dạng dict thay
+    vì mười tham số mới để không phá chữ ký hàm với mọi nơi gọi hiện có; khóa lạ bị bỏ qua, nên mã cũ
+    và DB chưa chạy migration 005 vẫn hoạt động bình thường.
+
+    Trả về `id` để `model_call_fields` gắn được vào đúng lượt gọi (YC-AN-02).
     """
-    sql = """
-        INSERT INTO model_calls
-            (document_id, provider, deployment, model, model_version, schema_code,
-             used_ai, attempts, latency_ms, rss_mb, gpu_mem_mb, n_fields,
-             fallback_from, error, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """
+    # Danh sách trắng cột phân tích — KHÔNG nhận tên cột tùy ý từ nơi gọi (chúng đi thẳng vào SQL)
+    _ANALYTICS_COLUMNS = (
+        "prompt_tokens", "completion_tokens", "total_tokens", "cost_micro_usd", "cost_vnd",
+        "prompt_version", "prompt_hash", "context_chars", "context_pages", "retry_reason",
+        "confidence_avg", "confidence_min", "grounded_ratio", "request_id",
+    )
+
+    columns = ["document_id", "provider", "deployment", "model", "model_version", "schema_code",
+               "used_ai", "attempts", "latency_ms", "rss_mb", "gpu_mem_mb", "n_fields",
+               "fallback_from", "error", "status"]
+    values = [document_id, provider, deployment, model, model_version, schema_code,
+              used_ai, attempts, latency_ms, rss_mb, gpu_mem_mb, n_fields,
+              fallback_from, error, status]
+
+    for column in _ANALYTICS_COLUMNS:
+        if analytics and analytics.get(column) is not None:
+            columns.append(column)
+            values.append(analytics[column])
+
+    sql = (f"INSERT INTO model_calls ({', '.join(columns)}) "
+           f"VALUES ({', '.join(['%s'] * len(columns))}) RETURNING id")
+
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (
-                    document_id, provider, deployment, model, model_version, schema_code,
-                    used_ai, attempts, latency_ms, rss_mb, gpu_mem_mb, n_fields,
-                    fallback_from, error, status,
-                ))
+                cur.execute(sql, values)
+                return int(cur.fetchone()[0])
     except Exception as e:  # noqa: BLE001 - nhật ký không được chặn nghiệp vụ chính
         logger.error(f"Ghi model_calls thất bại (provider={provider}, doc={document_id}): {e}")
+        return None
+
+
+def log_model_call_fields(model_call_id: Optional[int], document_id: Optional[str],
+                          fields: List[Dict], preview_chars: int = 200) -> int:
+    """
+    Ghi kết quả TỪNG TRƯỜNG của một lượt gọi model (YC-AN-02). Trả về số dòng đã ghi.
+
+    Đây là dữ liệu để đo độ chính xác trên việc thật: so giá trị AI trả về với giá trị cán bộ duyệt
+    sau đó (xem `scripts/core/analytics.py`).
+
+    `value_preview` cắt ngắn có chủ đích — đủ để đối chiếu, mà không biến bảng nhật ký thành bản sao
+    thứ hai của nội dung tài liệu (vừa phình DB, vừa nhân đôi bề mặt rủi ro dữ liệu nhạy cảm).
+    """
+    if not fields:
+        return 0
+
+    sql = """
+        INSERT INTO model_call_fields
+            (model_call_id, document_id, field_key, value_preview, confidence, grounded, attempt)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    rows = []
+    for field in fields:
+        value = field.get("value")
+        rows.append((
+            model_call_id, document_id, field.get("key"),
+            (str(value)[:preview_chars] if value is not None else None),
+            field.get("confidence"), field.get("grounded"), field.get("attempt", 1),
+        ))
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, rows)
+        return len(rows)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Ghi model_call_fields thất bại (doc={document_id}): {e}")
+        return 0
+
+
+def log_ocr_run(document_id: str, **fields) -> None:
+    """
+    Ghi chỉ số một lượt OCR (YC-AN-03). Không ném lỗi ra ngoài.
+
+    Nhận `**fields` theo danh sách trắng: pipeline OCR sẽ còn được bổ sung chỉ số mới theo thời gian,
+    và không nên phải sửa chữ ký hàm mỗi lần.
+    """
+    allowed = ("engine", "language", "pages", "pages_without_text", "dpi_pre", "dpi_post",
+               "size_in_bytes", "size_out_bytes", "text_chars", "duration_ms", "warnings", "status")
+
+    columns = ["document_id"]
+    values = [document_id]
+    for column in allowed:
+        if fields.get(column) is not None:
+            columns.append(column)
+            values.append(fields[column])
+
+    sql = (f"INSERT INTO ocr_runs ({', '.join(columns)}) "
+           f"VALUES ({', '.join(['%s'] * len(columns))})")
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, values)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Ghi ocr_runs thất bại (doc={document_id}): {e}")
 
 
 def list_model_calls(

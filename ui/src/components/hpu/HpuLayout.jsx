@@ -10,6 +10,7 @@ const NAV = [
   { key: "dspace", label: "Đẩy DSpace", icon: "📤", href: null },
   { key: "schemas", label: "Lược đồ", icon: "🧩", href: "/luoc-do" },
   { key: "reports", label: "Báo cáo", icon: "📊", href: "/bao-cao" },
+  { key: "ai", label: "Phân tích AI", icon: "🔬", href: "/phan-tich-ai" },
   { key: "tools", label: "Công cụ mô hình", icon: "🧠", href: "/cong-cu" },
   { key: "audit", label: "Nhật ký kiểm toán", icon: "🔒", href: null },
   { key: "users", label: "Quản trị người dùng", icon: "👥", href: "/quan-tri/nguoi-dung" },

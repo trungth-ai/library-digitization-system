@@ -27,7 +27,7 @@ import scripts.db as db
 from scripts.sse import job_event_stream
 
 # Module GĐ1-2 + envelope HPU (endpoints MỚI dùng envelope; route cũ giữ nguyên — ADR-003)
-from scripts.core import reports, audit, schema_store, provider_view, uploads
+from scripts.core import reports, audit, schema_store, provider_view, uploads, analytics
 from scripts.core import queue as jobqueue
 from scripts.core import users as user_store
 from scripts.core import user_log
@@ -1467,6 +1467,169 @@ async def api_system_events(
         if r.get("created_at"):
             r["created_at"] = r["created_at"].isoformat()
     return success(rows, "Sự kiện hệ thống")
+
+
+# ---------------------------------------------------------------------
+# ROUTES - PHÂN TÍCH KẾT QUẢ AI (YC-AN, sprint V2)
+# ---------------------------------------------------------------------
+
+@app.get("/api/v2/analytics/ai/accuracy")
+async def api_ai_accuracy(
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    provider:  Optional[str] = Query(None),
+    principal: Principal     = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Độ chính xác theo từng trường, **đo trên việc thật** (YC-AN-05).
+
+    ⚠️ Phản hồi LUÔN kèm `sample_size` và `phuong_phap`. Trường dưới ngưỡng mẫu tối thiểu trả
+    `do_chinh_xac=null` + ghi chú "chưa đủ dữ liệu" thay vì một tỉ lệ vô nghĩa — xem `analytics.py`.
+    """
+    try:
+        rows = analytics.field_accuracy(date_from=date_from, date_to=date_to, provider=provider)
+    except Exception as e:  # noqa: BLE001 - bảng chưa di trú thì nói rõ, không trả 500 trống
+        logger.warning("Không tính được độ chính xác: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có dữ liệu phân tích. Đã chạy migration 005 chưa?", code="ANALYTICS_UNAVAILABLE"))
+
+    return success(
+        {"fields": rows,
+         "phuong_phap": analytics.METHOD_NOTE,
+         "co_mau_toi_thieu": analytics.ACCURACY_MIN_SAMPLE},
+        "Độ chính xác trích xuất theo trường",
+    )
+
+
+@app.get("/api/v2/analytics/ai/providers")
+async def api_ai_providers(
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    principal: Principal     = Depends(require(policy.REPORT_READ)),
+):
+    """
+    So sánh độ chính xác giữa các công cụ mô hình (YC-AN-06).
+
+    Bảng số liệu cho hồ sơ dự thi **không cần chạy lại harness**: lấy từ việc thật nên phản ánh đúng
+    loại tài liệu Trung tâm đang xử lý.
+    """
+    try:
+        rows = analytics.provider_accuracy(date_from=date_from, date_to=date_to)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không so sánh được công cụ: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có dữ liệu phân tích. Đã chạy migration 005 chưa?", code="ANALYTICS_UNAVAILABLE"))
+
+    return success({"providers": rows, "phuong_phap": analytics.METHOD_NOTE},
+                   "So sánh công cụ mô hình")
+
+
+@app.get("/api/v2/analytics/ai/cost")
+async def api_ai_cost(
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    principal: Principal     = Depends(require(policy.REPORT_READ)),
+):
+    """Chi phí gọi model theo tháng và theo công cụ, đơn vị **VNĐ số nguyên** (YC-AN-04)."""
+    try:
+        return success(analytics.cost_summary(date_from=date_from, date_to=date_to),
+                       "Chi phí gọi model")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không tính được chi phí: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có dữ liệu chi phí. Đã chạy migration 005 chưa?", code="ANALYTICS_UNAVAILABLE"))
+
+
+@app.get("/api/v2/analytics/ai/ocr-quality")
+async def api_ocr_quality(
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    limit:     int           = Query(100, ge=1, le=1000),
+    principal: Principal     = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Chất lượng OCR + danh sách tài liệu **nên quét lại** (YC-AN-03).
+
+    `pages_without_text > 0` nghĩa là có trang không tạo được lớp text — ảnh quá mờ hoặc lệch. Biết
+    sớm thì đề nghị quét lại, thay vì để tài liệu vào DSpace ở dạng không tra cứu được.
+    """
+    try:
+        return success(analytics.ocr_quality(date_from=date_from, date_to=date_to, limit=limit),
+                       "Chất lượng OCR")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được chất lượng OCR: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có dữ liệu OCR. Đã chạy migration 005 chưa?", code="ANALYTICS_UNAVAILABLE"))
+
+
+@app.get("/api/v2/analytics/ai/export")
+async def api_ai_export(
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    principal: Principal     = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Xuất báo cáo phân tích AI ra bảng tính (YC-AN-10).
+
+    XLSX nếu có `openpyxl`, không thì CSV UTF-8 **có BOM** để Excel trên Windows hiển thị đúng
+    tiếng Việt. Cột "Độ chính xác" ghi rõ "chưa đủ dữ liệu" thay vì để trống — tệp xuất ra cũng phải
+    mang theo giới hạn của số liệu, vì nó sẽ rời khỏi hệ thống và không còn ghi chú phương pháp.
+    """
+    from scripts.core import export_excel
+
+    try:
+        fields = analytics.field_accuracy(date_from=date_from, date_to=date_to)
+        cost = analytics.cost_summary(date_from=date_from, date_to=date_to)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Chưa có dữ liệu để xuất: {e}", code="ANALYTICS_UNAVAILABLE"))
+
+    for row in fields:
+        row["hien_thi"] = (f"{row['do_chinh_xac']}%" if row["do_chinh_xac"] is not None
+                           else analytics.INSUFFICIENT)
+
+    sheets = {
+        "Độ chính xác": export_excel.build_rows(fields, [
+            ("field_key", "Trường"), ("so_dung", "Số đúng"),
+            ("sample_size", "Cỡ mẫu"), ("hien_thi", "Độ chính xác"),
+        ]),
+        "Chi phí": export_excel.build_rows(cost["theo_cong_cu"], [
+            ("provider", "Công cụ"), ("deployment", "Chế độ"),
+            ("so_luot_goi", "Lượt gọi"), ("tong_token", "Token"),
+            ("chi_phi_hien_thi", "Chi phí"),
+        ]),
+    }
+
+    content, extension, media_type = export_excel.export(sheets)
+    filename = f"phan-tich-ai-{datetime.now().strftime('%Y%m%d')}.{extension}"
+
+    user_log.log_activity(action=user_log.ACTION_EXPORT, resource_type="report",
+                          resource_id="analytics/ai", detail={"format": extension})
+
+    return StreamingResponse(
+        io.BytesIO(content), media_type=media_type,
+        headers={"Content-Disposition": content_disposition(filename)},
+    )
+
+
+@app.get("/api/v2/analytics/ai/drift")
+async def api_quality_drift(
+    days:          int       = Query(7, ge=1, le=90),
+    baseline_days: int       = Query(30, ge=1, le=365),
+    principal:     Principal = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Phát hiện suy giảm chất lượng (YC-AN-08): so kỳ gần đây với kỳ trước đó.
+
+    Chỉ kết luận khi CẢ HAI kỳ đủ mẫu — thiếu mẫu thì nói rõ, không báo động giả.
+    """
+    try:
+        return success(analytics.quality_drift(days=days, baseline_days=baseline_days),
+                       "Theo dõi suy giảm chất lượng")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không tính được suy giảm chất lượng: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Không tính được: {e}", code="ANALYTICS_UNAVAILABLE"))
 
 
 # ---------------------------------------------------------------------

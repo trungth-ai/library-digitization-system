@@ -40,6 +40,12 @@ FULL_MAX_CHARS = int(os.getenv("CONTEXT_FULL_MAX_CHARS", "20000"))
 # Ngưỡng điểm tin cậy dưới mức này thì coi là cần cán bộ kiểm tra (YC-CF-04)
 LOW_CONFIDENCE_THRESHOLD = float(os.getenv("LOW_CONFIDENCE_THRESHOLD", "0.5"))
 
+# Ghi chi tiết TỪNG TRƯỜNG vào `model_call_fields` (YC-AN-02, sprint V2). Van lùi `=0` khi bảng chưa
+# được di trú hoặc muốn giảm khối lượng ghi — hệ thống chạy y như trước, chỉ mất số liệu phân tích.
+ANALYTICS_DETAIL = os.getenv("AI_ANALYTICS_DETAIL", "1").strip() not in ("0", "false", "no")
+# Cắt giá trị lưu để bảng nhật ký không thành bản sao thứ hai của nội dung tài liệu
+FIELD_PREVIEW_CHARS = int(os.getenv("AI_FIELD_PREVIEW_CHARS", "200"))
+
 
 def resolve_schema(document_type: str) -> ExtractionSchema:
     """
@@ -103,6 +109,10 @@ class ProviderMetadataExtractor:
         self.max_retries = max_retries
         self.last_run: Dict = {}
         self._sample: Optional[metrics.ResourceSample] = None
+        # Kết quả và ngữ cảnh của lần trích gần nhất — dùng để ghi chi tiết từng trường (YC-AN-02).
+        # Giữ ở mức đối tượng thay vì truyền qua tham số vì `_persist` đã là bước cuối của luồng.
+        self._last_result = None
+        self._last_context: str = ""
 
     # -- Giao diện giống AIMetadataExtractor -------------------------------
     def extract(self, pdf_path: str) -> Dict:
@@ -136,6 +146,8 @@ class ProviderMetadataExtractor:
 
         metadata = result.to_metadata_list()
         low_conf = quality.low_confidence_fields(result, LOW_CONFIDENCE_THRESHOLD)
+        self._last_result = result
+        self._last_context = text
 
         # Cần cán bộ xem lại khi: không hợp lệ sau khi thử lại, HOẶC có trường điểm tin cậy thấp,
         # HOẶC không trích được gì. Thà báo cần xem lại còn hơn để dữ liệu sai đi tiếp vào DSpace.
@@ -199,6 +211,81 @@ class ProviderMetadataExtractor:
             self._sample = metrics.ResourceSample()
             return ExtractionResult(fields=[]), [f"Lỗi gọi model: {e}"], 1, True, str(e)
 
+    def _field_rows(self) -> List[Dict]:
+        """
+        Chuyển kết quả trích xuất thành các dòng cho `model_call_fields`.
+
+        `grounded` = giá trị có xuất hiện trong văn bản gốc không (YC-CF-05). Tính lại ở đây thay vì
+        lấy từ `quality` vì `quality` chỉ trả về điểm tin cậy tổng hợp; ta cần cờ nhị phân từng
+        trường để đếm được tỉ lệ ảo giác.
+        """
+        from scripts.core.analytics import normalize_value
+
+        context_text = normalize_value(self._last_context)
+        rows: List[Dict] = []
+
+        for field in getattr(self._last_result, "fields", []) or []:
+            value = getattr(field, "value", None)
+            normalized = normalize_value(str(value) if value is not None else "")
+            rows.append({
+                "key": getattr(field, "key", None),
+                "value": value,
+                "confidence": getattr(field, "confidence", None),
+                # Giá trị rỗng thì không xét bám văn bản: "không tìm thấy" là câu trả lời hợp lệ,
+                # không phải ảo giác.
+                "grounded": (bool(normalized and normalized in context_text)
+                             if normalized else None),
+                "attempt": self.last_run.get("attempts", 1),
+            })
+        return rows
+
+    def _build_analytics(self, run: Dict) -> Dict:
+        """
+        Gom các chỉ số phân tích cho một lượt gọi (YC-AN-01/04/11).
+
+        Bọc try/except riêng cho phần tính chi phí: bảng đơn giá hỏng hoặc thiếu không được làm mất
+        cả bản ghi `model_calls` — số liệu chi phí là thứ có thể thiếu, nhật ký gọi model thì không.
+        """
+        from scripts.core import context as ctx
+
+        usage = getattr(self._last_result, "usage", None) or {}
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+
+        fields = getattr(self._last_result, "fields", []) or []
+        confidences = [f.confidence for f in fields
+                       if getattr(f, "confidence", None) is not None]
+        grounded_flags = [row["grounded"] for row in (self._field_rows() if fields else [])
+                          if row["grounded"] is not None]
+
+        analytics: Dict = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": ((prompt_tokens or 0) + (completion_tokens or 0)) or None,
+            "context_chars": len(self._last_context) or None,
+            "request_id": ctx.get_request_id(),
+            "retry_reason": (run["errors"][0] if run.get("errors") else None),
+            "confidence_avg": (round(sum(confidences) / len(confidences), 3)
+                               if confidences else None),
+            "confidence_min": (round(min(confidences), 3) if confidences else None),
+            "grounded_ratio": (round(sum(grounded_flags) / len(grounded_flags), 3)
+                               if grounded_flags else None),
+        }
+
+        try:
+            from scripts.core import pricing
+            cost = pricing.compute_cost(
+                provider=run["provider"], deployment=run["deployment"], model=run["model"],
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            )
+            if cost.known:
+                analytics["cost_micro_usd"] = cost.micro_usd
+                analytics["cost_vnd"] = cost.vnd
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Không tính được chi phí lượt gọi: %s", e)
+
+        return analytics
+
     @staticmethod
     def _build_review_note(errors: List[str], low_conf: List[str],
                            metadata: List[Dict], error_msg: Optional[str]) -> Optional[str]:
@@ -225,7 +312,7 @@ class ProviderMetadataExtractor:
             from scripts.core import audit
 
             status = "failed" if run["error"] else ("fallback" if run["fallback_from"] else "success")
-            db.log_model_call(
+            model_call_id = db.log_model_call(
                 provider=run["provider"], deployment=run["deployment"],
                 document_id=self.document_id, model=run["model"],
                 model_version=run["model_version"], schema_code=run["schema_code"],
@@ -233,7 +320,16 @@ class ProviderMetadataExtractor:
                 latency_ms=run["latency_ms"], rss_mb=run["rss_mb"], gpu_mem_mb=run["gpu_mem_mb"],
                 n_fields=run["n_fields"], fallback_from=run["fallback_from"],
                 error=run["error"], status=status,
+                analytics=self._build_analytics(run),
             )
+
+            # Chi tiết TỪNG TRƯỜNG (YC-AN-02) — dữ liệu để đo độ chính xác trên việc thật về sau.
+            # Tắt được bằng AI_ANALYTICS_DETAIL=0 nếu bảng chưa di trú hoặc muốn giảm ghi.
+            if ANALYTICS_DETAIL and self._last_result is not None:
+                db.log_model_call_fields(
+                    model_call_id=model_call_id, document_id=self.document_id,
+                    fields=self._field_rows(), preview_chars=FIELD_PREVIEW_CHARS,
+                )
 
             if self.document_id:
                 db.set_extraction_info(

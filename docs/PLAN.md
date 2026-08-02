@@ -88,6 +88,26 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
 ---
 
 
+## Sprint vừa xong: V2 phân tích chi tiết kết quả AI ✅  *(02/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-AN-05 🔴** Độ chính xác **đo trên việc thật** — so giá trị AI với giá trị cán bộ đã duyệt | 15 pytest công thức so sánh (khoảng trắng, ngày tháng, rỗng, Unicode) |
+| **Cỡ mẫu tối thiểu** — dưới 30 quan sát trả `null` + "chưa đủ dữ liệu", KHÔNG trả % | pytest chốt hành vi |
+| **YC-AN-01/04** Token + chi phí **VNĐ số nguyên**; tại chỗ = 0 đ; chưa biết ≠ 0 đ | 13 pytest, gồm ca tỉ giá hỏng và đơn giá theo tiền tố tên model |
+| **YC-AN-02** `model_call_fields` — kết quả từng trường + cờ `grounded` (chống ảo giác) | migration 005 + nối vào `extraction.py` |
+| **YC-AN-03** `ocr_runs` — số trang **không có lớp text** = chỉ báo scan xấu cần quét lại | 14 pytest với trang giả |
+| **YC-AN-08** Phát hiện suy giảm chất lượng (7 ngày so 30 ngày trước) | chỉ kết luận khi cả hai kỳ đủ mẫu |
+| **YC-AN-10** Xuất bảng tính — XLSX nếu có `openpyxl`, không thì **CSV UTF-8 có BOM** | 15 pytest, gồm ca Excel hiển thị sai dấu tiếng Việt |
+| **YC-AN-09** Trang `/phan-tich-ai` — ghi chú phương pháp đặt ngay đầu trang | UI build exit 0 |
+
+**429 pytest PASS** · UI build exit 0. Van lùi: `AI_ANALYTICS_DETAIL=0` · `OCR_METRICS_ENABLED=0`.
+
+> ⚠️ **Cần chạy `database/migrations/005_ai_analytics.sql`** (sau 004). Trước khi chạy: `pg_dump`.
+> Số liệu độ chính xác **tích lũy dần** — chỉ có ý nghĩa sau khi cán bộ đã duyệt ≥ 30 tài liệu.
+
+---
+
 ## Sprint vừa xong: V1 log có cấu trúc + V4 nhật ký người dùng ✅  *(01/08/2026)*
 
 | Việc | Kiểm chứng |

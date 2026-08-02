@@ -10,7 +10,7 @@ import time
 from datetime import datetime, timezone
 import logging
 import traceback
-from typing import Dict
+from typing import Dict, Optional
 
 from scripts.digitize import DigitizationPipeline, ProcessingConfig
 import scripts.db as db
@@ -56,6 +56,10 @@ RETRY_BACKOFF_SEC = int(os.getenv("RETRY_BACKOFF_SEC", "30"))
 RECLAIM_INTERVAL_SEC = int(os.getenv("RECLAIM_INTERVAL_SEC", "60"))
 
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
+
+# Đo chất lượng OCR sau mỗi tài liệu (YC-AN-03). Van lùi `=0` khi chưa chạy migration 005 hoặc khi
+# việc mở lại PDF để đếm trang làm chậm đáng kể trên phần cứng yếu.
+OCR_METRICS_ENABLED = os.getenv("OCR_METRICS_ENABLED", "1").strip() not in ("0", "false", "no")
 
 # ── Kết quả xử lý một job (ADR-011 mục 6) ────────────────────────────
 JOB_OK = "ok"
@@ -461,6 +465,41 @@ class DigitizationWorker:
             error=error_message,
         )
 
+    def _record_ocr_metrics(self, job_id: str, input_file: str, summary: dict,
+                            config, language: Optional[str], stage_timings: dict) -> None:
+        """
+        Ghi chỉ số chất lượng OCR (YC-AN-03). Không bao giờ ném lỗi ra ngoài.
+
+        Đo trên PDF ĐẦU RA, không phải đầu vào: câu hỏi là "sau khi OCR, tài liệu này có tra cứu được
+        không", mà chỉ bản đầu ra mới trả lời được.
+        """
+        if not OCR_METRICS_ENABLED:
+            return
+
+        try:
+            from scripts.core import ocr_metrics
+
+            metrics_row = ocr_metrics.collect(
+                document_id=job_id,
+                input_pdf=input_file,
+                output_pdf=summary.get("output_pdf"),
+                duration_ms=stage_timings.get("ocr_and_extract"),
+                language=language,
+                dpi_pre=getattr(config, "pre_compress_dpi", None),
+                dpi_post=getattr(config, "post_compress_dpi", None),
+            )
+            db.log_ocr_run(job_id, **metrics_row)
+
+            # Cảnh báo ngay trong log worker: cán bộ thấy sớm thì còn kịp lấy lại bản giấy để quét lại
+            without_text = metrics_row.get("pages_without_text") or 0
+            if without_text:
+                logger.warning(
+                    "Job %s: %d/%s trang KHÔNG có lớp text sau OCR — bản scan có thể cần quét lại",
+                    job_id, without_text, metrics_row.get("pages"),
+                )
+        except Exception as e:  # noqa: BLE001 - số liệu không được làm hỏng tài liệu đã xử lý xong
+            logger.warning("Không ghi được chỉ số OCR cho %s: %s", job_id, e)
+
     def _save_timing(self, job_id: str, duration_ms: int, stage_timings: dict) -> None:
         """Lưu thời gian xử lý. Không được làm gãy job nếu ghi thất bại — đây chỉ là số liệu."""
         try:
@@ -537,6 +576,11 @@ class DigitizationWorker:
             summary = results.get("summary", {})
             if summary.get("status") == "failed":
                 raise RuntimeError(summary.get("error", "Processing failed"))
+
+            # Chỉ số chất lượng OCR (YC-AN-03). Đặt SAU khi biết pipeline thành công, và bọc riêng:
+            # đo đạc hỏng không được làm hỏng một tài liệu đã OCR xong.
+            self._record_ocr_metrics(job_id, input_file, summary, config,
+                                     job_data.get("language"), stage_timings)
 
             # ── extracting (60%) ─────────────────────────────────
             self._update_status(job_id, "extracting", 60, filename)
