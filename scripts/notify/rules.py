@@ -37,12 +37,25 @@ DEAD_LETTER_ALERT = int(os.getenv("ALERT_DEAD_LETTER", "10"))
 DISK_WARN_GB = int(os.getenv("ALERT_DISK_WARN_GB", "30"))
 
 
-def evaluate(snapshot: Dict) -> List[Alert]:
+# Quy tắc mà một WORKER không thể tự đánh giá — xem `evaluate(skip=...)`
+WORKER_BLIND_SPOTS = frozenset({"no_worker"})
+
+
+def evaluate(snapshot: Dict, skip: Optional[frozenset] = None) -> List[Alert]:
     """
     Sinh danh sách cảnh báo từ một bức ảnh trạng thái. Hàm THUẦN — không chạm DB, không gửi gì.
 
+    `skip` bỏ qua một số quy tắc theo mã. Dùng cho **điểm mù của người quan sát**: một worker đang
+    chạy thì không thể kết luận "không có worker nào" — chính sự tồn tại của nó bác bỏ điều đó. Nếu
+    số đếm nhịp tim ra 0 trong khi worker đang chạy thì đó là mâu thuẫn dữ liệu Redis, không phải
+    tình huống "hệ thống dừng"; báo động ở đó là báo động giả.
+
+    Ai đánh giá được `no_worker`? Bên NGOÀI worker: API (`/api/v2/health/detailed`), bảng điều khiển,
+    hoặc một bộ giám sát bên thứ ba. Đó là lý do hai trang đó vẫn hiển thị số worker độc lập — cảnh
+    báo là lớp bổ sung, không thay thế việc quan sát.
+
     `snapshot` gồm (mọi khóa đều tùy chọn; thiếu khóa = không đánh giá quy tắc đó, KHÔNG phải = 0):
-        workers_alive     int | None   None = không đọc được Redis
+        workers_alive     int | None   None = đã thử đọc Redis nhưng thất bại
         queue_ready       int
         queue_dead        int
         disk_free_gb      float
@@ -52,6 +65,7 @@ def evaluate(snapshot: Dict) -> List[Alert]:
     Tách khỏi phần đọc DB có chủ đích: quy tắc cảnh báo là thứ dễ sai một cách âm thầm (báo nhầm,
     hoặc tệ hơn, không báo) và là thứ khó kiểm chứng nhất trên môi trường thật.
     """
+    skip = skip or frozenset()
     alerts: List[Alert] = []
 
     # ── Không có worker nào (YC-TB-02) ──────────────────────────────
@@ -64,7 +78,7 @@ def evaluate(snapshot: Dict) -> List[Alert]:
     # Dùng `.get()` để quyết định sẽ biến mọi bức ảnh trạng thái thiếu khóa thành một cảnh báo giả
     # mức nghiêm trọng — đúng lỗi mà `test_thieu_khoa_thi_khong_danh_gia_quy_tac_do` bắt được.
     workers = snapshot.get("workers_alive")
-    has_worker_info = "workers_alive" in snapshot
+    has_worker_info = "workers_alive" in snapshot and "no_worker" not in skip
 
     if has_worker_info and workers == 0:
         alerts.append(Alert(

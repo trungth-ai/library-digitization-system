@@ -57,6 +57,7 @@ CREATE TRIGGER trg_user_activity_no_update BEFORE UPDATE ON user_activity
 -- tuổi (YC-LG-07) cần xóa được bản ghi quá hạn. Chặn UPDATE là đủ để bảo đảm bản ghi không bị SỬA;
 -- việc xóa chỉ xảy ra qua `scripts/core/retention.py`, có ghi nhận số lượng vào `system_events`.
 
-DROP TRIGGER IF EXISTS trg_user_activity_touch ON user_activity;
-CREATE TRIGGER trg_user_activity_touch BEFORE UPDATE ON user_activity
-    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+-- ⚠️ CỐ Ý KHÔNG có trigger `touch_updated_at` cho bảng này, khác với mọi bảng khác trong hệ thống.
+-- Lý do: trigger đó chạy BEFORE UPDATE, mà UPDATE ở đây luôn bị từ chối — hai trigger cùng sự kiện,
+-- một cái cập nhật giá trị và một cái ném lỗi, là mã chết gây hiểu nhầm cho người đọc sau. Cột
+-- `updated_at` vẫn giữ để đồng nhất với chuẩn HPU (mọi bảng có đủ 4 cột), giá trị luôn bằng `created_at`.

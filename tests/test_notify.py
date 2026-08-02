@@ -393,3 +393,28 @@ def test_moi_canh_bao_deu_noi_ro_hau_qua():
     assert len(alerts) >= 5
     for alert in alerts:
         assert len(alert.message) > 40, f"cảnh báo '{alert.key}' quá cụt để hành động"
+
+
+def test_worker_khong_tu_danh_gia_duoc_khong_co_worker():
+    """
+    🔴 Điểm mù của người quan sát: một worker ĐANG CHẠY không thể kết luận "không có worker nào".
+
+    Chính sự tồn tại của nó bác bỏ điều đó. Nếu số đếm nhịp tim ra 0 trong khi worker đang chạy thì
+    đó là mâu thuẫn dữ liệu Redis, không phải "hệ thống dừng" — báo động ở đó là báo động giả, và
+    báo động giả dạy người ta bỏ qua báo động thật.
+    """
+    snapshot = {"workers_alive": 0, "queue_ready": 10}
+
+    tu_ben_ngoai = rules.evaluate(snapshot)
+    tu_trong_worker = rules.evaluate(snapshot, skip=rules.WORKER_BLIND_SPOTS)
+
+    assert "no_worker" in _keys(tu_ben_ngoai), "bên ngoài worker thì đánh giá được"
+    assert "no_worker" not in _keys(tu_trong_worker), "trong worker thì không"
+
+
+def test_skip_khong_anh_huong_quy_tac_khac():
+    """Bỏ qua một quy tắc không được làm mất các quy tắc còn lại."""
+    alerts = rules.evaluate(
+        {"workers_alive": 0, "queue_dead": 100}, skip=rules.WORKER_BLIND_SPOTS)
+
+    assert "dead_letter" in _keys(alerts)

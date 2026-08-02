@@ -261,3 +261,81 @@ def test_bao_cao_don_dep_tom_tat_doc_duoc():
 def test_bao_cao_rong_noi_ro_khong_co_gi():
     """Nói rõ "không có gì quá hạn" thay vì im lặng — im lặng dễ bị hiểu là tác vụ chưa chạy."""
     assert retention.CleanupReport().summary() == "không có gì quá hạn"
+
+
+# ─────────────────────────────────────────────────────────────
+# DỌN TỆP TRUNG GIAN (YC-VH-09, sprint V9)
+# ─────────────────────────────────────────────────────────────
+
+def test_chi_don_thu_muc_dung_dang_uuid(tmp_path, monkeypatch):
+    """
+    🔴 CHỈ đụng thư mục tên đúng dạng uuid4 (id job).
+
+    Thư mục lạ — `_zip_staging`, tệp người dùng để nhầm, thư mục cấu hình — tuyệt đối không xóa.
+    Đây là hàm xóa dữ liệu; một mẫu khớp quá rộng ở đây là mất dữ liệu không lấy lại được.
+    """
+    from contextlib import contextmanager
+
+    uuid_hop_le = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+    (tmp_path / uuid_hop_le).mkdir()
+    (tmp_path / "_zip_staging").mkdir()
+    (tmp_path / "cau-hinh").mkdir()
+
+    @contextmanager
+    def fake_conn():
+        yield FakeConn([], rows=[(uuid_hop_le,)])
+
+    import scripts.db as db
+    monkeypatch.setattr(db, "get_conn", fake_conn)
+
+    da_xoa = retention.cleanup_job_files(str(tmp_path), days=90, dry_run=True)
+
+    assert da_xoa == [uuid_hop_le]
+    assert (tmp_path / "_zip_staging").exists()
+    assert (tmp_path / "cau-hinh").exists()
+
+
+def test_khong_doc_duoc_db_thi_khong_xoa_gi(tmp_path, monkeypatch):
+    """
+    🔴 Không tra được tài liệu nào quá hạn → KHÔNG xóa gì cả.
+
+    Xóa theo phỏng đoán (vd theo tuổi tệp) sẽ xóa nhầm tài liệu tải lên tháng trước mà vẫn đang chờ
+    duyệt — tệp của nó vẫn cần thiết.
+    """
+    from contextlib import contextmanager
+
+    (tmp_path / "3f2504e0-4f89-41d3-9a0c-0305e82c3301").mkdir()
+
+    @contextmanager
+    def hong():
+        raise RuntimeError("DB không đọc được")
+        yield
+
+    import scripts.db as db
+    monkeypatch.setattr(db, "get_conn", hong)
+
+    assert retention.cleanup_job_files(str(tmp_path), days=90) == []
+    assert (tmp_path / "3f2504e0-4f89-41d3-9a0c-0305e82c3301").exists()
+
+
+def test_dry_run_khong_xoa_that(tmp_path, monkeypatch):
+    """Xem trước danh sách sẽ xóa mà không đụng đĩa — bắt buộc có cho một hàm xóa dữ liệu."""
+    from contextlib import contextmanager
+
+    uuid_hop_le = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+    (tmp_path / uuid_hop_le).mkdir()
+
+    @contextmanager
+    def fake_conn():
+        yield FakeConn([], rows=[(uuid_hop_le,)])
+
+    import scripts.db as db
+    monkeypatch.setattr(db, "get_conn", fake_conn)
+
+    retention.cleanup_job_files(str(tmp_path), dry_run=True)
+
+    assert (tmp_path / uuid_hop_le).exists(), "dry_run KHÔNG được xóa thật"
+
+
+def test_thu_muc_khong_ton_tai_khong_gay_loi():
+    assert retention.cleanup_job_files("/khong/co/o/dau") == []

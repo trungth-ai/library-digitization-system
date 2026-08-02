@@ -1,0 +1,141 @@
+# CI cho DocuFlow HP (YC-VH-10 — sprint V9).
+#
+# VÌ SAO CẦN: 535 bài kiểm thử hiện chỉ chạy khi ai đó nhớ chạy. Với một đội hai người và những thay
+# đổi chạm vào hệ đang phục vụ thật, "nhớ chạy" không phải một cơ chế.
+#
+# Chạy được TOÀN BỘ mà không cần PostgreSQL/Redis/mạng: mọi bài kiểm thử đều là logic thuần hoặc dùng
+# lớp giả (xem docs/PLAN.md). Đó là điều kiện để CI nhanh và không dao động — nhưng cũng có nghĩa là
+# CI KHÔNG thay thế kiểm chứng trên môi trường thật.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+# Hủy lần chạy cũ khi có push mới cùng nhánh — không để hàng đợi CI dồn bản đã lỗi thời
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Kiểm thử Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Chỉ cài pytest + psycopg2: đúng bộ có trên máy dev. Cài trọn requirements.txt sẽ khiến CI
+      # xanh trong khi máy dev đỏ (hoặc ngược lại) — hai môi trường phải giống nhau thì tín hiệu CI
+      # mới có nghĩa.
+      - name: Cài phụ thuộc tối thiểu
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest psycopg2-binary
+
+      - name: Chạy kiểm thử
+        run: python -m pytest tests/ -q
+
+      # Bắt lỗi cú pháp ở những tệp mà bộ kiểm thử không import được (api.py cần fastapi + Redis)
+      - name: Kiểm biên dịch toàn bộ mã Python
+        run: python -m compileall -q scripts/
+
+  ui:
+    name: Dựng giao diện
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Cài phụ thuộc
+        working-directory: ui
+        run: npm ci
+
+      # Build phải thành công KHÔNG cần biến NEXT_PUBLIC_* và KHÔNG cần cờ TLS (xem ADR-006).
+      # Nếu một ngày build đòi thêm biến, CI sẽ đỏ ngay thay vì hỏng lúc triển khai.
+      - name: Dựng giao diện
+        working-directory: ui
+        run: npm run build
+
+  migrations:
+    name: Kiểm migration trên PostgreSQL thật
+    runs-on: ubuntu-latest
+    # Đây là phần DUY NHẤT cần dịch vụ thật — và cũng là phần máy dev không kiểm được.
+    # Chạy migration HAI LẦN liên tiếp: yêu cầu bắt buộc của mọi migration trong dự án này.
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: ci_test_only
+          POSTGRES_DB: library_digitization
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tạo schema từ init.sql
+        env:
+          PGPASSWORD: ci_test_only
+        run: psql -h localhost -U postgres -d library_digitization -v ON_ERROR_STOP=1 -f database/init.sql
+
+      - name: Chạy tất cả migration (lần 1)
+        env:
+          PGPASSWORD: ci_test_only
+        run: |
+          for f in database/migrations/*.sql; do
+            echo "→ $f"
+            psql -h localhost -U postgres -d library_digitization -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      # 🔴 Chạy lại lần hai: migration phải áp được nhiều lần không lỗi. Đây là điều kiện để việc
+      # triển khai an toàn — người vận hành không phải nhớ đã chạy cái nào rồi.
+      - name: Chạy lại tất cả migration (lần 2 — phải không lỗi)
+        env:
+          PGPASSWORD: ci_test_only
+        run: |
+          for f in database/migrations/*.sql; do
+            echo "→ $f (lần 2)"
+            psql -h localhost -U postgres -d library_digitization -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      # init.sql (cài mới) và migrations (DB đã tồn tại) phải cho ra CÙNG một schema. Lệch nhau sẽ
+      # tạo ra hai hệ thống hành xử khác nhau tùy theo cài lúc nào — loại lỗi rất khó lần ra.
+      - name: Đối chiếu schema init.sql với migrations
+        env:
+          PGPASSWORD: ci_test_only
+        run: |
+          psql -h localhost -U postgres -c "CREATE DATABASE fresh_install;"
+          psql -h localhost -U postgres -d fresh_install -v ON_ERROR_STOP=1 -f database/init.sql
+
+          for db in library_digitization fresh_install; do
+            psql -h localhost -U postgres -d "$db" -At -c "
+              SELECT table_name || '.' || column_name || ':' || data_type
+              FROM information_schema.columns
+              WHERE table_schema = 'public'
+              ORDER BY table_name, column_name;
+            " > "/tmp/$db.schema"
+          done
+
+          if ! diff -u /tmp/fresh_install.schema /tmp/library_digitization.schema; then
+            echo "::error::Schema của init.sql KHÁC schema sau khi chạy migrations."
+            echo "Cài mới và cài nâng cấp sẽ cho ra hai hệ thống khác nhau — phải đồng bộ lại."
+            exit 1
+          fi
+          echo "✅ init.sql và migrations cho ra cùng một schema"

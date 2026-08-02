@@ -69,6 +69,11 @@ BATCH_PAUSE_RECHECK_SEC = int(os.getenv("BATCH_PAUSE_RECHECK_SEC", "30"))
 # xu hướng không thấy được đỉnh cao điểm — mà cao điểm mới là thứ cần biết.
 QUEUE_SAMPLE_INTERVAL_SEC = int(os.getenv("QUEUE_SAMPLE_INTERVAL_SEC", "60"))
 
+# Cảnh báo (YC-TB, sprint V8/V9). Chu kỳ thưa hơn các phép đo nội bộ vì cảnh báo là việc nhìn ra
+# ngoài (SMTP/webhook). Van lùi `ALERTS_ENABLED=0`.
+ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "1").strip() not in ("0", "false", "no")
+ALERT_INTERVAL_SEC = int(os.getenv("ALERT_INTERVAL_SEC", "300"))
+
 # ── Kết quả xử lý một job (ADR-011 mục 6) ────────────────────────────
 JOB_OK = "ok"
 JOB_FAILED_DOCUMENT = "document"   # lỗi của TÀI LIỆU → không thử lại, vào hàng đợi chết ngay
@@ -167,6 +172,9 @@ class DigitizationWorker:
         # worker vừa khởi động lại thường là sau khi worker trước đã chết)
         self._last_reclaim = 0.0
         self._last_sample = 0.0
+        self._last_alert_check = 0.0
+        # Giữ MỘT bộ gửi cảnh báo cho cả vòng đời worker — trạng thái chống spam nằm trong nó
+        self._dispatcher = None
         # Chế độ hàng đợi đặt ở MỨC ĐỐI TƯỢNG, không đọc trực tiếp hằng module trong `run()`:
         # để kiểm thử bật/tắt được từng worker mà không phải nạp lại module (van lùi vẫn là QUEUE_MODE).
         self.reliable_queue = RELIABLE_QUEUE
@@ -314,6 +322,12 @@ class DigitizationWorker:
         if now - self._last_sample >= QUEUE_SAMPLE_INTERVAL_SEC:
             self._last_sample = now
             self._sample_queue_depth()
+
+        # Đánh giá & gửi cảnh báo (YC-TB-02/03). Chu kỳ riêng, thưa hơn: cảnh báo là việc nhìn ra
+        # ngoài (SMTP/webhook) nên không nên chạy dày như các phép đo nội bộ.
+        if ALERTS_ENABLED and now - self._last_alert_check >= ALERT_INTERVAL_SEC:
+            self._last_alert_check = now
+            self._check_alerts()
 
         if now - self._last_reclaim < RECLAIM_INTERVAL_SEC:
             return
@@ -516,6 +530,54 @@ class DigitizationWorker:
             db.log_queue_sample(depth.as_dict(), workers_alive=workers_alive)
         except Exception as e:  # noqa: BLE001
             logger.debug("Không lấy được mẫu độ sâu hàng đợi: %s", e)
+
+    def _check_alerts(self) -> None:
+        """
+        Đánh giá trạng thái hệ thống và gửi cảnh báo cần thiết (YC-TB-02/03).
+
+        VÌ SAO CHẠY TRONG WORKER chứ không thêm một container: worker là tiến trình duy nhất chạy
+        liên tục và có sẵn cả kết nối Redis lẫn PostgreSQL. Thêm một dịch vụ nữa chỉ để hẹn giờ là
+        thêm một thứ phải triển khai, giám sát và khởi động lại — với một đội hai người thì không đáng.
+        (Đánh đổi: nhiều worker sẽ cùng đánh giá; chống spam theo `key` xử lý phần trùng lặp.)
+
+        ⚠️ NGHỊCH LÝ CẦN BIẾT: cảnh báo "không có worker nào" chạy TRONG worker, nên khi nó đúng nhất
+        thì không ai gửi được. Đó là lý do trang `/cong-cu` và `/bang-dieu-khien` vẫn hiển thị trạng
+        thái worker độc lập — cảnh báo là lớp bổ sung, không thay thế việc quan sát.
+        """
+        try:
+            from scripts.notify import rules
+
+            snapshot = rules.collect_snapshot(self.redis)
+            # Bỏ qua quy tắc "không có worker nào": worker này đang chạy nên nó KHÔNG thể tự kết luận
+            # điều đó — xem `rules.WORKER_BLIND_SPOTS`. Quy tắc đó do API/bảng điều khiển đánh giá.
+            alerts = rules.evaluate(snapshot, skip=rules.WORKER_BLIND_SPOTS)
+            if not alerts:
+                return
+
+            dispatcher = self._alert_dispatcher()
+            for alert in alerts:
+                sent = dispatcher.send(alert)
+                if sent:
+                    logger.warning("Đã gửi cảnh báo '%s' qua %s",
+                                   alert.key, ", ".join(k for k, v in sent.items() if v) or "(không kênh nào)")
+        except Exception as e:  # noqa: BLE001 - cảnh báo hỏng không được làm dừng xử lý tài liệu
+            logger.warning("Không đánh giá được cảnh báo: %s", e)
+
+    def _alert_dispatcher(self):
+        """
+        Dựng bộ gửi cảnh báo MỘT LẦN và giữ lại — trạng thái chống spam nằm trong bộ nhớ của nó.
+
+        Dựng lại mỗi lần sẽ làm mất lịch sử "đã gửi lúc nào", và mọi cảnh báo đều được gửi lại ở
+        mỗi chu kỳ — đúng cái mà chống spam đang cố tránh.
+        """
+        if self._dispatcher is None:
+            from scripts.notify.base import Dispatcher
+            from scripts.notify.channels import build_channels
+
+            self._dispatcher = Dispatcher(channels=build_channels())
+            logger.info("Cảnh báo BẬT — kênh: %s",
+                        ", ".join(c.name for c in self._dispatcher.channels))
+        return self._dispatcher
 
     def _batch_paused(self, batch_id: str) -> bool:
         """Lô có đang tạm dừng không? Lỗi truy vấn → coi như không, để tài liệu vẫn được xử lý."""

@@ -142,6 +142,73 @@ def cleanup_log_files(log_dir: Optional[str] = None,
     return deleted
 
 
+def cleanup_job_files(data_dir: Optional[str] = None, days: Optional[int] = None,
+                      dry_run: bool = False) -> List[str]:
+    """
+    Dọn tệp TRUNG GIAN của các job đã xong từ lâu (YC-VH-09). Trả về danh sách thư mục đã xóa.
+
+    🔴 CHỈ xóa thư mục job của tài liệu đã ở trạng thái kết thúc VÀ quá hạn. KHÔNG xóa theo tuổi tệp
+    đơn thuần: một tài liệu tải lên từ tháng trước mà vẫn đang chờ duyệt thì tệp của nó vẫn cần thiết.
+
+    ⚠️ Đây là hàm xóa dữ liệu — mọi lối ra đều thận trọng:
+      • `dry_run=True` để xem trước danh sách mà không xóa gì.
+      • Thư mục không khớp mẫu id job (uuid) thì BỎ QUA, không đụng tới.
+      • Không đọc được trạng thái tài liệu từ DB → BỎ QUA thư mục đó, không xóa theo phỏng đoán.
+    """
+    import re
+    import shutil
+
+    directory = data_dir if data_dir is not None else os.getenv(
+        "DIGITIZE_DATA_DIR", "/data/digitization/jobs")
+    days = days if days is not None else int(os.getenv("JOB_FILES_RETENTION_DAYS", "90"))
+
+    root = Path(directory)
+    if not root.is_dir():
+        return []
+
+    # Chỉ đụng thư mục có tên đúng dạng uuid4 — thư mục lạ (`_zip_staging`, tệp người dùng để nhầm)
+    # tuyệt đối không xóa
+    uuid_pattern = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+    try:
+        import scripts.db as db
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT id FROM documents
+                    WHERE status IN ('completed', 'failed', 'cancelled', 'deleted')
+                      AND finished_at IS NOT NULL
+                      AND finished_at < NOW() - (%s || ' days')::interval
+                """, (days,))
+                eligible = {row[0] for row in cur.fetchall()}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được danh sách tài liệu quá hạn — KHÔNG dọn tệp: %s", e)
+        return []
+
+    deleted: List[str] = []
+    for child in root.iterdir():
+        if not child.is_dir() or not uuid_pattern.match(child.name):
+            continue
+        if child.name not in eligible:
+            continue
+
+        if dry_run:
+            deleted.append(child.name)
+            continue
+
+        try:
+            shutil.rmtree(child)
+            deleted.append(child.name)
+        except OSError as e:
+            logger.warning("Không xóa được thư mục job '%s': %s", child.name, e)
+
+    if deleted:
+        logger.info("%s %d thư mục job quá %d ngày",
+                    "Sẽ dọn" if dry_run else "Đã dọn", len(deleted), days)
+    return deleted
+
+
 def run_cleanup(log_dir: Optional[str] = None, record_event: bool = True) -> CleanupReport:
     """
     Chạy trọn một lượt dọn: bảng nhật ký + phiên hết hạn + tệp log.

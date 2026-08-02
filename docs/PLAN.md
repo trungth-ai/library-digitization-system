@@ -88,6 +88,36 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
 ---
 
 
+## Sprint vừa xong: V9 vận hành dài hạn ✅  *(02/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-VH-07 🔴** `scripts/ops/backup.sh` — pg_dump + tệp tài liệu + **bản kê số bản ghi**; kiểm dung lượng trước, dọn bản cũ SAU | script (cần chạy trên máy chủ) |
+| **YC-VH-08 🔴** `scripts/ops/restore-drill.sh` — khôi phục vào CSDL **tạm** rồi **đối chiếu số bản ghi** với bản kê | script |
+| **YC-VH-09** Dọn tệp trung gian — chỉ thư mục tên đúng dạng uuid VÀ tài liệu đã kết thúc quá hạn; có `dry_run` | 4 pytest |
+| **YC-VH-10** CI GitHub Actions: pytest + UI build + **migration chạy hai lần trên PostgreSQL thật** + **đối chiếu schema `init.sql` với migrations** | `.github/workflows/ci.yml` |
+| **YC-TB (còn nợ từ V8)** Bộ hẹn giờ cảnh báo gắn vào worker, giữ một `Dispatcher` cho cả vòng đời | 2 pytest |
+
+**539 pytest PASS** · UI build exit 0.
+
+Ba điểm đáng ghi:
+- **"Sao lưu chưa từng khôi phục thử thì chưa phải sao lưu."** `restore-drill.sh` không chỉ chạy
+  `pg_restore` — nó **đối chiếu số bản ghi** với bản kê ghi lúc sao lưu. `pg_restore` vẫn trả về 0
+  khi khôi phục một CSDL rỗng.
+- **CI đối chiếu `init.sql` với migrations.** Suốt 6 migration tôi phải đồng bộ tay hai nơi; lệch
+  nhau sẽ tạo ra hai hệ thống hành xử khác nhau tùy theo cài lúc nào — loại lỗi rất khó lần ra.
+  Giờ CI bắt được.
+- **Worker không tự đánh giá "không có worker nào".** Chính sự tồn tại của nó bác bỏ điều đó
+  (`rules.WORKER_BLIND_SPOTS`). Quy tắc đó do API/bảng điều khiển đánh giá.
+
+### Còn nợ của V9
+- **YC-TK** tài khoản dịch vụ + API key: chưa làm.
+- **YC-VH-11** kiểm thử E2E Playwright: chưa làm.
+- **YC-VH-12** trang trợ giúp tiếng Việt trong ứng dụng: chưa làm.
+- `scripts/ops/*.sh` **chưa chạy thật lần nào** — cần máy chủ có Docker + PostgreSQL.
+
+---
+
 ## Sprint vừa xong: V8 không gian duyệt + cảnh báo ✅  *(02/08/2026)*
 
 | Việc | Kiểm chứng |
