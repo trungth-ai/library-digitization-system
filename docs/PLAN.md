@@ -88,7 +88,246 @@ docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
 ---
 
 
+## Sprint vừa xong: V9 vận hành dài hạn ✅  *(02/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-VH-07 🔴** `scripts/ops/backup.sh` — pg_dump + tệp tài liệu + **bản kê số bản ghi**; kiểm dung lượng trước, dọn bản cũ SAU | script (cần chạy trên máy chủ) |
+| **YC-VH-08 🔴** `scripts/ops/restore-drill.sh` — khôi phục vào CSDL **tạm** rồi **đối chiếu số bản ghi** với bản kê | script |
+| **YC-VH-09** Dọn tệp trung gian — chỉ thư mục tên đúng dạng uuid VÀ tài liệu đã kết thúc quá hạn; có `dry_run` | 4 pytest |
+| **YC-VH-10** CI GitHub Actions: pytest + UI build + **migration chạy hai lần trên PostgreSQL thật** + **đối chiếu schema `init.sql` với migrations** | `.github/workflows/ci.yml` |
+| **YC-TB (còn nợ từ V8)** Bộ hẹn giờ cảnh báo gắn vào worker, giữ một `Dispatcher` cho cả vòng đời | 2 pytest |
+
+**539 pytest PASS** · UI build exit 0.
+
+Ba điểm đáng ghi:
+- **"Sao lưu chưa từng khôi phục thử thì chưa phải sao lưu."** `restore-drill.sh` không chỉ chạy
+  `pg_restore` — nó **đối chiếu số bản ghi** với bản kê ghi lúc sao lưu. `pg_restore` vẫn trả về 0
+  khi khôi phục một CSDL rỗng.
+- **CI đối chiếu `init.sql` với migrations.** Suốt 6 migration tôi phải đồng bộ tay hai nơi; lệch
+  nhau sẽ tạo ra hai hệ thống hành xử khác nhau tùy theo cài lúc nào — loại lỗi rất khó lần ra.
+  Giờ CI bắt được.
+- **Worker không tự đánh giá "không có worker nào".** Chính sự tồn tại của nó bác bỏ điều đó
+  (`rules.WORKER_BLIND_SPOTS`). Quy tắc đó do API/bảng điều khiển đánh giá.
+
+### Còn nợ của V9
+- **YC-TK** tài khoản dịch vụ + API key: chưa làm.
+- **YC-VH-11** kiểm thử E2E Playwright: chưa làm.
+- **YC-VH-12** trang trợ giúp tiếng Việt trong ứng dụng: chưa làm.
+- `scripts/ops/*.sh` **chưa chạy thật lần nào** — cần máy chủ có Docker + PostgreSQL.
+
+---
+
+## Sprint vừa xong: V8 không gian duyệt + cảnh báo ✅  *(02/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-RV-01/02** Trang `/duyet` hai cột — PDF bên trái, metadata bên phải, **tô màu trường điểm thấp** | UI build exit 0 |
+| **YC-RV-03** Phím tắt J/K chuyển tài liệu, Ctrl+Enter xác nhận, Esc đóng | UI build exit 0 |
+| **YC-RV-04 🔴** Xác nhận ghi `audit_log` với tên thật + chốt **chưa duyệt không đẩy DSpace** | migration 008, van lùi `REQUIRE_CONFIRM_BEFORE_DSPACE=0` |
+| **YC-RV-05** Trang `/thung-rac` — phục hồi + xóa vĩnh viễn có **xác nhận hai bước** | UI build exit 0 |
+| **YC-RV-06** Duyệt hàng loạt, trần cứng ở máy chủ; giao diện **khóa chọn** tài liệu có trường điểm thấp | pytest |
+| **YC-TB-01/04** Kênh cảnh báo cắm được (log/email/webhook) + **chống spam** theo thời gian nguội | 38 pytest |
+| **YC-TB-02/03** Quy tắc: không worker, đĩa sắp đầy, hàng đợi tồn đọng, hàng đợi chết, quá hạn SLA, lô lỗi cao | pytest thuần, không cần DB |
+| **YC-TB-06 🔴 / KT-BM-21** Chặn webhook trỏ ra ngoài mạng nội bộ | pytest |
+
+**533 pytest PASS** · UI build exit 0.
+
+> ⚠️ **Cần chạy `database/migrations/008_review_workflow.sql`** (sau 007).
+> Chốt `REQUIRE_CONFIRM_BEFORE_DSPACE` **mặc định TẮT** — tài liệu cũ đều chưa có `confirmed_at`
+> (quy trình xác nhận chưa từng tồn tại), bật ngay sẽ chặn toàn bộ tồn đọng cũ. Bật sau khi đã
+> xử lý xong tồn đọng. **Không** tự đánh dấu tài liệu cũ là "đã duyệt": đó là bịa ra một sự kiện
+> chưa từng xảy ra, và nó sẽ nằm vĩnh viễn trong dữ liệu với tên một cán bộ không hề bấm nút nào.
+
+### Còn nợ của V8
+- `/luoc-do` (YC-RV-08) vẫn dùng dữ liệu mẫu — chưa nối `/api/v2/schemas`.
+- Phân công tài liệu (YC-RV-07) có API, chưa có giao diện.
+- `ALERTS_ENABLED` chưa có tiến trình chạy định kỳ — quy tắc và kênh đã sẵn sàng, còn thiếu bộ hẹn giờ
+  gọi `rules.collect_snapshot()` → `Dispatcher.send()`. Dự kiến gắn vào worker ở V9.
+
+---
+
+## Sprint vừa xong: V7 bảng điều khiển theo dõi công việc ✅  *(02/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-DB-01** "Việc của tôi" — chờ duyệt / đang xử lý / bị lỗi / đã duyệt hôm nay | 15 pytest |
+| **YC-DB-02 🔴** Số liệu **không vênh** với `/api/v2/stats` và `/bao-cao` — dùng chung hằng `NOT_DELETED` | pytest chốt bộ lọc ở cả 3 truy vấn |
+| **YC-DB-04** Cảnh báo SLA — ngưỡng riêng theo trạng thái, đo bằng `updated_at` | pytest chốt không dùng `created_at` |
+| **YC-DB-05** Năng suất theo cán bộ (**công khai** — QĐ-06), kèm **bối cảnh** (số trang, số trường đã sửa) | pytest chốt ghi chú nằm trong dữ liệu, không chỉ ở giao diện |
+| **YC-DB-03** Tiến độ lô đang chạy · **YC-DB-08** xuất bảng tính | UI build exit 0 |
+| Trang `/bang-dieu-khien` — trang đầu tiên trên sidebar | UI build exit 0 |
+
+**495 pytest PASS** · UI build exit 0. Không cần migration mới (dùng dữ liệu sẵn có).
+
+Ba điểm thiết kế đáng ghi:
+- **Một nguồn hỏng không làm trắng cả trang**: API trả 200 kèm `phan_loi` liệt kê thẻ nào chưa
+  đọc được, thay vì 500. Bảng điều khiển gộp 5 nguồn — chưa chạy migration 006 không được làm mất
+  4 nguồn còn lại.
+- **Chưa đăng nhập → trả số toàn hệ thống** kèm cờ `theo_ca_nhan=False`, thay vì rỗng. Ở nấc
+  `AUTH_MODE=off` trang vẫn có ích và nói rõ đây không phải số của riêng ai.
+- **Không có worker thì nói thẳng** trên bảng điều khiển (kế thừa ADR-009).
+
+---
+
+## Sprint vừa xong: V6 hàng đợi — kiểm soát tải, lấy mẫu, giao diện ✅  *(02/08/2026)*
+
+Phần lõi của hàng đợi (`BLMOVE`, thu hồi, thử lại, hàng đợi chết, ưu tiên) đã xong từ ADR-011.
+Sprint này làm phần còn lại để nó **dùng được**, không chỉ chạy đúng.
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-BU-17** Kiểm soát tải — từ chối **mềm** (429) khi hàng đợi quá sâu; đếm cả job đang chờ thử lại | 5 pytest |
+| **YC-BU-18** Lấy mẫu độ sâu hàng đợi mỗi phút + API lịch sử (lấy `MAX` theo khoảng, không phải trung bình) | migration 007 |
+| **Trang `/hang-doi`** — hàng đợi chết thành thứ **nhìn thấy và bấm được**; cảnh báo khi đang chạy `QUEUE_MODE=blpop` | UI build exit 0 |
+| Chạy lại một job / toàn bộ hàng đợi chết từ giao diện, giữ nguyên mã tài liệu | có sẵn từ ADR-011, nay có nút |
+
+**480 pytest PASS** · UI build exit 0.
+
+> ⚠️ **Cần chạy `database/migrations/007_queue_samples.sql`** (sau 006).
+
+### ⛔ YC-BU-19 (đẩy DSpace theo lô phía máy chủ) — CẦN QUYẾT ĐỊNH, chưa làm
+
+Hiện việc đẩy DSpace dùng **phiên đăng nhập DSpace của từng cán bộ** trong trình duyệt (766 dòng JS
+trong `ui/src/app/api/dspace/*`, REST 6.3 dạng XML). Chuyển sang chạy phía máy chủ đòi hỏi một trong hai:
+
+| Phương án | Hệ quả |
+|---|---|
+| **(a) Tài khoản dịch vụ DSpace** — lưu thông tin đăng nhập của một tài khoản chung | DSpace sẽ ghi nhận **mọi** item do một tài khoản đẩy lên → mất dấu vết ai thực sự đẩy, ở phía DSpace. `audit_log` của DocuFlow vẫn ghi đúng người, nhưng hai hệ thống sẽ nói khác nhau |
+| **(b) Mượn phiên của cán bộ** cho tác vụ nền | Phiên DSpace hết hạn giữa chừng → lô 100 item đang đẩy dở dừng lại, cần cán bộ đăng nhập lại |
+
+Đây là quyết định về **trách nhiệm giải trình**, không phải kỹ thuật — cần Trung tâm chốt (đề xuất
+ghi thành `QĐ-09`). Tôi khuyến nghị **(a)** kèm bắt buộc ghi `dc.description.provenance` chứa tên cán
+bộ thật, để dấu vết không mất ở phía DSpace.
+
+---
+
+## Sprint vừa xong: V5 nạp tài liệu khối lượng lớn (đường vào) ✅  *(02/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-BU-02/03** Bỏ trần 10 tệp → hạn mức cấu hình theo *số tệp* và *tổng dung lượng*; khái niệm **lô** | migration 006 + 28 pytest |
+| **YC-BU-04** Chống trùng SHA-256 — báo rõ trùng với tài liệu nào | hash đã có sẵn từ ADR-010 |
+| **YC-BU-09** Kiểm tệp **thật sự là PDF** (chữ ký tệp), tệp rỗng, PDF có mật khẩu, tải lên đứt giữa chừng | pytest từng ca, mỗi ca một thông báo tiếng Việt riêng |
+| **YC-BU-05** Kiểm dung lượng đĩa **trước khi** nhận byte nào | pytest |
+| **YC-BU-07 🔴** Nạp từ ZIP — chống **zip-slip** và **zip bomb**, kiểm trên siêu dữ liệu trước khi giải nén | 14 pytest |
+| **YC-BU-16** Tạm dừng / tiếp tục / hủy lô; tài liệu đang xử lý dở vẫn chạy xong | 5 pytest, gồm ca tạm dừng lâu không đẩy job vào hàng đợi chết |
+| Trang `/lo` — nạp lô, theo dõi tiến độ, **liệt kê từng tệp bị bỏ qua kèm lý do** | UI build exit 0 |
+
+**475 pytest PASS** · UI build exit 0. Endpoint nạp cũ **giữ nguyên** (ADR-003).
+
+> ⚠️ **Cần chạy `database/migrations/006_batches.sql`** (sau 005). Trước khi chạy: `pg_dump`.
+
+### Còn nợ của V5
+- **Thư mục theo dõi** (`YC-BU-06`) và **upload chia mảnh** (`YC-BU-08`) chưa làm.
+- Chưa đo `KT-HN-08` (thông lượng nạp 500 tệp) — cần bộ BD-06 và môi trường thật.
+
+---
+
+## Sprint vừa xong: V2 phân tích chi tiết kết quả AI ✅  *(02/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-AN-05 🔴** Độ chính xác **đo trên việc thật** — so giá trị AI với giá trị cán bộ đã duyệt | 15 pytest công thức so sánh (khoảng trắng, ngày tháng, rỗng, Unicode) |
+| **Cỡ mẫu tối thiểu** — dưới 30 quan sát trả `null` + "chưa đủ dữ liệu", KHÔNG trả % | pytest chốt hành vi |
+| **YC-AN-01/04** Token + chi phí **VNĐ số nguyên**; tại chỗ = 0 đ; chưa biết ≠ 0 đ | 13 pytest, gồm ca tỉ giá hỏng và đơn giá theo tiền tố tên model |
+| **YC-AN-02** `model_call_fields` — kết quả từng trường + cờ `grounded` (chống ảo giác) | migration 005 + nối vào `extraction.py` |
+| **YC-AN-03** `ocr_runs` — số trang **không có lớp text** = chỉ báo scan xấu cần quét lại | 14 pytest với trang giả |
+| **YC-AN-08** Phát hiện suy giảm chất lượng (7 ngày so 30 ngày trước) | chỉ kết luận khi cả hai kỳ đủ mẫu |
+| **YC-AN-10** Xuất bảng tính — XLSX nếu có `openpyxl`, không thì **CSV UTF-8 có BOM** | 15 pytest, gồm ca Excel hiển thị sai dấu tiếng Việt |
+| **YC-AN-09** Trang `/phan-tich-ai` — ghi chú phương pháp đặt ngay đầu trang | UI build exit 0 |
+
+**429 pytest PASS** · UI build exit 0. Van lùi: `AI_ANALYTICS_DETAIL=0` · `OCR_METRICS_ENABLED=0`.
+
+> ⚠️ **Cần chạy `database/migrations/005_ai_analytics.sql`** (sau 004). Trước khi chạy: `pg_dump`.
+> Số liệu độ chính xác **tích lũy dần** — chỉ có ý nghĩa sau khi cán bộ đã duyệt ≥ 30 tài liệu.
+
+---
+
+## Sprint vừa xong: V1 log có cấu trúc + V4 nhật ký người dùng ✅  *(01/08/2026)*
+
+| Việc | Kiểm chứng |
+|---|---|
+| **YC-LG-01/04** Log JSON một dòng, có `request_id`/`job_id`/`actor`; middleware ghi tổng kết mỗi request | 27 pytest với handler dựng đúng như production |
+| **YC-LG-05 🔴** Bộ lọc **che khóa API/mật khẩu** ở tầng logging — YC-BM-03 trước đây *không có cơ chế nào cưỡng chế* | 11 pytest gồm khóa Anthropic/Google/Groq/HF, `Bearer`, cookie phiên |
+| **YC-LG-02/03** `contextvars` cho `request_id` (nhận `X-Request-Id` từ giao diện) và `job_id` xuyên suốt vòng đời một tài liệu | pytest ngữ cảnh lồng nhau |
+| **YC-LG-06/07** Tệp JSONL luân chuyển + **dọn theo tuổi** — trả nợ "`system_events` sẽ lớn dần" | 17 pytest |
+| **YC-NK-01→05** Bảng `user_activity` không sửa được; ghi đăng nhập/đăng xuất/sai mật khẩu/**bị từ chối quyền**/thiếu xác thực | migration 004 + pytest |
+| **YC-NK-07** Dòng thời gian một tài liệu: gộp `audit_log` + `user_activity` + `model_calls` + `ocr_runs` | pytest |
+| Endpoint `/api/v2/user-activity`, `/api/v2/jobs/{id}/timeline` | py_compile + test phân quyền |
+
+**374 pytest PASS** · UI build exit 0. Van lùi: `LOG_FORMAT=text` · `USER_ACTIVITY_ENABLED=0`.
+
+> ⚠️ **Cần chạy `database/migrations/004_user_activity.sql`** (sau 003). Trước khi chạy: `pg_dump`.
+> `audit_log` **không** nằm trong danh sách bảng được dọn theo tuổi — có test chốt điều đó.
+
+---
+
+## Sprint vừa xong: VÁ BA LỖ HỔNG N-01/N-02/N-03 ✅  *(01/08/2026)*
+
+Ba vấn đề của hệ đang chạy, phát hiện khi rà mã cho đợt nâng cấp. Chi tiết quyết định: ADR-010/011/012.
+
+| Việc | Kiểm chứng |
+|---|---|
+| **N-03** Ghi tệp tải lên theo mảnh, không chặn event loop; băm SHA-256 trong cùng lượt đọc (ADR-010) | 7 pytest, gồm test **tái hiện lỗi cũ** (bản đồng bộ = 0 nhịp event loop) |
+| **N-02** Hàng đợi tin cậy `BLMOVE` + thu hồi việc mồ côi + thử lại có khoảng lùi + hàng đợi chết + 3 mức ưu tiên (ADR-011) | 47 pytest, gồm **KT-BU-15** kill worker giữa chừng → 0 job mất |
+| **N-01** Danh tính & phân quyền: 4 vai trò, phiên trong PostgreSQL, ba nấc `AUTH_MODE`, khóa sau N lần sai (ADR-012) | 52 pytest, gồm **KT-QT-09** quét AST bắt endpoint ghi thiếu `require()` |
+| Giao diện: trang `/dang-nhap`, `/quan-tri/nguoi-dung`, chuyển tiếp cookie qua 12 route proxy | UI build exit 0 |
+| Sửa kèm: CORS `allow_origins=["*"]` + cookie (trình duyệt sẽ không gửi cookie) | test AST chặn tái diễn |
+| Sửa kèm: `update_document_status` thêm `clear_error` — tài liệu thành công ở lần thử lại không mang lỗi cũ | pytest |
+| Sửa kèm: mật khẩu chứa tên tiếng Việt **không dấu** giờ bị chặn (`strip_diacritics`) | pytest |
+
+**330 pytest PASS** (224 cũ + 106 mới) · **0 hồi quy** · UI build exit 0.
+Mặc định `AUTH_MODE=off` → **hành vi hệ thống KHÔNG đổi** sau khi cập nhật mã.
+
+### ⚠️ Cần làm trước khi bật xác thực (theo thứ tự)
+
+| # | Việc | Ai |
+|---|---|---|
+| 1 | `pg_dump` rồi chạy `database/migrations/003_users_rbac.sql` | 👤 |
+| 2 | Đặt `ADMIN_BOOTSTRAP_USER`/`PASSWORD`, khởi động API, đăng nhập, **đổi mật khẩu**, rồi **xóa hai biến đó** | 👤 |
+| 3 | Tạo tài khoản cho từng cán bộ + tập huấn (vẫn ở `AUTH_MODE=off`) | 👤 |
+| 4 | `AUTH_MODE=shadow` → chạy **≥ 1 tuần**, theo dõi `system_events` `kind='auth_missing'` | 👤 |
+| 5 | Chỉ bật `AUTH_MODE=on` khi **48 giờ liên tiếp không còn cảnh báo nào** | 👤 |
+
+> Van lùi mọi lúc: `AUTH_MODE=off` · `QUEUE_MODE=blpop` — đổi biến môi trường, **không build lại image**.
+
+### Việc còn nợ của phần vá này
+- **Chưa kiểm chứng trên PostgreSQL thật**: `users`, `roles`, `role_permissions`, `user_sessions`
+  mới chỉ chạy qua `py_compile` + test logic thuần. Cần chạy migration 003 trên bản sao dữ liệu thật
+  (hai lần liên tiếp) và thử trọn luồng đăng nhập → thao tác → đăng xuất.
+- **Chưa đo hiệu năng** `KT-HN-08` sau khi đổi cách ghi tệp — ADR-010 ghi rõ thông lượng một tệp đơn
+  lẻ *có thể giảm nhẹ*; phải đo chứ không tuyên bố.
+- ~~Nhật ký người dùng (`user_activity`)~~ **ĐÃ LÀM** ở sprint V1+V4 ngay sau đó (xem mục trên).
+- **Giao diện** cho nhật ký người dùng (`/quan-tri/nhat-ky-nguoi-dung`) và dòng thời gian tài liệu
+  chưa có — API đã sẵn (`/api/v2/user-activity`, `/api/v2/jobs/{id}/timeline`).
+
+---
+
+## Sprint kế tiếp: V0 — Chuẩn bị đợt nâng cấp 2  *(cập nhật 31/07/2026)*
+
+Kế hoạch đầy đủ: `docs/UPGRADE_SPRINTS.md`. Yêu cầu: `docs/UPGRADE_REQUIREMENTS.md`.
+Kiểm thử: `docs/UPGRADE_TEST_CASES.md`.
+
+**V0 không viết mã** — bốn việc, bỏ qua sẽ làm hỏng các sprint sau:
+
+| # | Việc | Ai |
+|---|---|---|
+| 1 | Chốt 8 quyết định `QĐ-01→08` (phiên đăng nhập, băm mật khẩu, hạ tầng log, bốn mắt, ai xem năng suất, đường nạp chính, thời hạn lưu) | 👤 + 🤖 tư vấn |
+| 2 | Viết ADR-010→016 vào `DECISIONS.md` cho các quyết định đã chốt — **trước khi** viết mã | 🤖 |
+| 3 | `pg_dump` dữ liệu thật **và khôi phục thử vào DB tạm** | 👤 |
+| 4 | Chuẩn bị BD-06 (500 PDF), BD-07 (8 tài khoản), BD-08 (15 tệp đầu vào xấu) | 👤 |
+
+> ⚠️ **Ba vấn đề của hệ đang chạy** phát hiện khi rà mã (chi tiết ở `UPGRADE_REQUIREMENTS.md` mục 0):
+> **N-01** không có xác thực ở backend → `YC-AU-02` hiện không thỏa mãn (sửa ở V3) ·
+> **N-02** `BLPOP` (`worker.py:223`) mất job khi worker chết (sửa ở V6) ·
+> **N-03** `save_upload_file` (`api.py:142`) chặn event loop (sửa ở V5).
+
 ## Việc code còn nợ (chưa xếp sprint)
+
+> Các mục dưới đây **đã được xếp sprint** trong `docs/UPGRADE_SPRINTS.md`: trang duyệt `needs_review`
+> + thùng rác → **V8** · `/luoc-do` nối API thật → **V8** · `metadata_history` ghi ở tầng ứng dụng →
+> **V4** (chờ có `actor` thật) · dọn `system_events` theo tuổi → **V1**.
 
 - **UI:** trang duyệt tài liệu `needs_review` (tô màu trường điểm thấp bằng `ConfidenceBadge`) và
   thùng rác/phục hồi. API đã sẵn: `GET /api/v2/jobs?needs_review=true`,

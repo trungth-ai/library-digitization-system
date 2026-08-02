@@ -10,11 +10,12 @@ import time
 from datetime import datetime, timezone
 import logging
 import traceback
-from typing import Dict
+from typing import Dict, Optional
 
 from scripts.digitize import DigitizationPipeline, ProcessingConfig
 import scripts.db as db
 from scripts.core import audit
+from scripts.core import queue as jobqueue
 from scripts.core.exceptions import SensitivityViolation
 from scripts.sse import publish_job_event
 
@@ -23,11 +24,10 @@ from scripts.sse import publish_job_event
 # LOGGING
 # =========================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger("worker")
+# Log JSON có cấu trúc + che bí mật (sprint V1). Van lùi: `LOG_FORMAT=text`.
+from scripts.core import context, logging_setup   # noqa: E402
+
+logger = logging_setup.configure("worker")
 
 
 # =========================
@@ -44,7 +44,90 @@ WORKER_HEARTBEAT_PREFIX = "worker:heartbeat:"
 # KHÔNG phải lỗi — xem cách xử lý RedisTimeoutError trong run().
 BLPOP_TIMEOUT = int(os.getenv("BLPOP_TIMEOUT", "5"))
 
+# Hàng đợi TIN CẬY (ADR-011) — mặc định BẬT. `QUEUE_MODE=blpop` là van lùi về vòng lặp cũ mà không
+# cần build lại image. Chế độ cũ MẤT job nếu worker chết giữa lúc xử lý (lỗi N-02) nên chỉ dùng để
+# đối chứng khi gỡ lỗi, không dùng lâu dài.
+QUEUE_MODE = os.getenv("QUEUE_MODE", "reliable").strip().lower()
+RELIABLE_QUEUE = QUEUE_MODE != "blpop"
+# Số lần thử TỐI ĐA cho lỗi hạ tầng (tính cả lần đầu). Lỗi tài liệu không thử lại — xem _classify_failure.
+MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
+RETRY_BACKOFF_SEC = int(os.getenv("RETRY_BACKOFF_SEC", "30"))
+# Quét thu hồi việc mồ côi mỗi N giây (không quét mỗi vòng lặp: `scan_iter` rẻ nhưng không miễn phí)
+RECLAIM_INTERVAL_SEC = int(os.getenv("RECLAIM_INTERVAL_SEC", "60"))
+
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
+
+# Đo chất lượng OCR sau mỗi tài liệu (YC-AN-03). Van lùi `=0` khi chưa chạy migration 005 hoặc khi
+# việc mở lại PDF để đếm trang làm chậm đáng kể trên phần cứng yếu.
+OCR_METRICS_ENABLED = os.getenv("OCR_METRICS_ENABLED", "1").strip() not in ("0", "false", "no")
+
+# Bao lâu thì thử lại một job thuộc lô đang tạm dừng. Không nên quá ngắn (quay vòng nóng trên Redis)
+# cũng không nên quá dài (bấm "tiếp tục" xong phải đợi lâu mới thấy chạy lại).
+BATCH_PAUSE_RECHECK_SEC = int(os.getenv("BATCH_PAUSE_RECHECK_SEC", "30"))
+
+# Chu kỳ lấy mẫu độ sâu hàng đợi (YC-BU-18). Ngắn hơn chu kỳ thu hồi: mẫu thưa quá thì biểu đồ
+# xu hướng không thấy được đỉnh cao điểm — mà cao điểm mới là thứ cần biết.
+QUEUE_SAMPLE_INTERVAL_SEC = int(os.getenv("QUEUE_SAMPLE_INTERVAL_SEC", "60"))
+
+# Cảnh báo (YC-TB, sprint V8/V9). Chu kỳ thưa hơn các phép đo nội bộ vì cảnh báo là việc nhìn ra
+# ngoài (SMTP/webhook). Van lùi `ALERTS_ENABLED=0`.
+ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "1").strip() not in ("0", "false", "no")
+ALERT_INTERVAL_SEC = int(os.getenv("ALERT_INTERVAL_SEC", "300"))
+
+# ── Kết quả xử lý một job (ADR-011 mục 6) ────────────────────────────
+JOB_OK = "ok"
+JOB_FAILED_DOCUMENT = "document"   # lỗi của TÀI LIỆU → không thử lại, vào hàng đợi chết ngay
+JOB_FAILED_INFRA = "infra"         # lỗi HẠ TẦNG → thử lại có khoảng lùi
+
+# Nhận diện lỗi hạ tầng theo TÊN LỚP thay vì `isinstance`, để không phải import psycopg2/redis ở mức
+# module — máy dev không cài hai gói đó vẫn kiểm thử được phần phân loại này. Cùng lý do với
+# `_redis_exception_classes()` (ADR-009).
+_INFRA_EXCEPTION_NAMES = frozenset({
+    "OperationalError",     # psycopg2: mất kết nối / DB không nhận kết nối
+    "InterfaceError",       # psycopg2: kết nối đã đóng
+    "PoolError",            # psycopg2 pool cạn
+    "ConnectionError",      # redis-py + builtin
+    "TimeoutError",         # redis-py + builtin
+    "BrokenPipeError",
+    "OSError",              # đĩa đầy, lỗi I/O — FileNotFoundError đã được loại trước đó
+})
+
+
+class JobResult:
+    """
+    Kết quả xử lý một job. `process_job` trước đây trả `None`; nay trả về đối tượng này để vòng lặp
+    biết nên thử lại hay bỏ vào hàng đợi chết. Nơi gọi cũ không dùng giá trị trả về nên không bị ảnh hưởng.
+    """
+
+    __slots__ = ("status", "error")
+
+    def __init__(self, status: str, error: str = None):
+        self.status = status
+        self.error = error
+
+    @property
+    def ok(self) -> bool:
+        return self.status == JOB_OK
+
+    def __repr__(self) -> str:
+        return f"JobResult(status={self.status!r}, error={self.error!r})"
+
+
+def _classify_failure(exc: BaseException) -> str:
+    """
+    Lỗi này nên THỬ LẠI (hạ tầng) hay BỎ VÀO HÀNG ĐỢI CHẾT (tài liệu)?
+
+    Mặc định là lỗi TÀI LIỆU (không thử lại) — chọn có chủ đích: giữ đúng hành vi hiện tại cho mọi
+    tình huống thất bại đã biết, chỉ thêm việc thử lại cho những lỗi hạ tầng nhận diện được chắc chắn.
+    Mặc định ngược lại (cứ thử lại) sẽ làm một tài liệu hỏng tốn 3 lượt OCR để rồi kết cục y như cũ.
+    """
+    # Tệp không có / không đọc được là lỗi TÀI LIỆU, dù FileNotFoundError là con của OSError
+    if isinstance(exc, (FileNotFoundError, IsADirectoryError, NotADirectoryError, PermissionError)):
+        return JOB_FAILED_DOCUMENT
+    for cls in type(exc).__mro__:
+        if cls.__name__ in _INFRA_EXCEPTION_NAMES:
+            return JOB_FAILED_INFRA
+    return JOB_FAILED_DOCUMENT
 
 # Trích metadata qua lớp trừu tượng hóa mô hình (ADR-008) — mặc định BẬT.
 # Đặt USE_PROVIDER_LAYER=0 để lùi ngay về đường cũ bám Claude mà không cần build lại image:
@@ -85,6 +168,16 @@ class DigitizationWorker:
         self.worker_id = os.getenv("HOSTNAME") or f"pid-{os.getpid()}"
         # Trạng thái kết nối Redis; None = chưa biết, để lần đầu xác định được cũng ghi nhận
         self._redis_ok = None
+        # Lần cuối quét thu hồi việc mồ côi (0 = chưa quét → quét ngay vòng đầu, đúng lúc cần nhất:
+        # worker vừa khởi động lại thường là sau khi worker trước đã chết)
+        self._last_reclaim = 0.0
+        self._last_sample = 0.0
+        self._last_alert_check = 0.0
+        # Giữ MỘT bộ gửi cảnh báo cho cả vòng đời worker — trạng thái chống spam nằm trong nó
+        self._dispatcher = None
+        # Chế độ hàng đợi đặt ở MỨC ĐỐI TƯỢNG, không đọc trực tiếp hằng module trong `run()`:
+        # để kiểm thử bật/tắt được từng worker mà không phải nạp lại module (van lùi vẫn là QUEUE_MODE).
+        self.reliable_queue = RELIABLE_QUEUE
 
         if redis_client is not None:
             self.redis = redis_client
@@ -210,9 +303,112 @@ class DigitizationWorker:
         except Exception as e:  # noqa: BLE001 - nhịp tim hỏng không được làm dừng việc xử lý
             logger.debug("Không ghi được nhịp tim: %s", e)
 
+    def _maintenance(self) -> None:
+        """
+        Việc nền của hàng đợi tin cậy: đưa job đến hạn thử lại về hàng đợi + thu hồi việc mồ côi.
+
+        Chạy trong worker khi rỗi, KHÔNG thêm container. `promote_delayed` rẻ (một lệnh có LIMIT) nên
+        chạy mỗi vòng; `reclaim_orphans` phải quét khóa nên giãn ra theo `RECLAIM_INTERVAL_SEC`.
+        """
+        try:
+            jobqueue.promote_delayed(self.redis, REDIS_QUEUE)
+        except Exception as e:  # noqa: BLE001 - việc nền hỏng không được làm dừng xử lý tài liệu
+            logger.debug("Không chuyển được job đến hạn thử lại: %s", e)
+
+        now = time.time()
+
+        # Lấy mẫu độ sâu hàng đợi (YC-BU-18) — nguồn dữ liệu cho biểu đồ xu hướng.
+        # Chu kỳ riêng, ngắn hơn chu kỳ thu hồi: mẫu thưa quá thì không thấy được đỉnh cao điểm.
+        if now - self._last_sample >= QUEUE_SAMPLE_INTERVAL_SEC:
+            self._last_sample = now
+            self._sample_queue_depth()
+
+        # Đánh giá & gửi cảnh báo (YC-TB-02/03). Chu kỳ riêng, thưa hơn: cảnh báo là việc nhìn ra
+        # ngoài (SMTP/webhook) nên không nên chạy dày như các phép đo nội bộ.
+        if ALERTS_ENABLED and now - self._last_alert_check >= ALERT_INTERVAL_SEC:
+            self._last_alert_check = now
+            self._check_alerts()
+
+        if now - self._last_reclaim < RECLAIM_INTERVAL_SEC:
+            return
+        self._last_reclaim = now
+
+        try:
+            for worker_id, count in jobqueue.reclaim_orphans(self.redis, REDIS_QUEUE):
+                # Đây là sự kiện vận hành QUAN TRỌNG: nó nghĩa là một worker đã chết giữa lúc làm việc.
+                # Trước ADR-011 thì những job này biến mất không dấu vết.
+                self._log_event(
+                    "job_reclaimed", "warning",
+                    f"Thu hồi {count} job từ worker đã chết '{worker_id}' — đã trả về hàng đợi",
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Không thu hồi được việc mồ côi: %s", e)
+
+    def _handle_claimed(self, job: "jobqueue.ClaimedJob") -> None:
+        """
+        Xử lý một job đã nhận, rồi báo kết quả cho hàng đợi.
+
+        Thứ tự QUAN TRỌNG: chỉ `ack` (xóa khỏi danh sách đang-xử-lý) SAU KHI job thực sự xong. Ack
+        sớm là mở lại đúng cửa sổ mất job mà ADR-011 đang đóng.
+        """
+        logger.info("Processing job: %s (ưu tiên=%s, lần thử %d)",
+                    job.job_id, job.priority, job.attempts + 1)
+
+        # Lô bị tạm dừng/hủy: trả job về hàng đợi và KHÔNG xử lý (YC-BU-16). Trả về chứ không bỏ đi —
+        # "tạm dừng" phải nghĩa là hoãn lại, không phải mất tài liệu.
+        batch_id = job.data.get("batch_id")
+        if batch_id and self._batch_paused(batch_id):
+            logger.info("Lô %s đang tạm dừng — hoãn job %s", batch_id[:8], job.job_id)
+            jobqueue.fail(self.redis, REDIS_QUEUE, self.worker_id, job,
+                          reason="Lô đang tạm dừng", retryable=True,
+                          max_attempts=10 ** 6,       # tạm dừng không tính là lần thử thất bại
+                          backoff_sec=BATCH_PAUSE_RECHECK_SEC)
+            return
+
+        # `process_job` trước ADR-011 trả `None`. Nơi nào còn theo hợp đồng cũ (lớp con, mã kiểm thử)
+        # thì hiểu là "đã tự xử lý xong" → ack. Không normalize ở đây sẽ ném AttributeError trên None.
+        result = self.process_job(job.data) or JobResult(JOB_OK)
+
+        if result.status == JOB_OK:
+            jobqueue.ack(self.redis, self.worker_id, job)
+            self._bump_batch(batch_id, done=1)
+            return
+
+        retryable = result.status == JOB_FAILED_INFRA
+        action, attempts = jobqueue.fail(
+            self.redis, REDIS_QUEUE, self.worker_id, job,
+            reason=result.error or "không rõ nguyên nhân",
+            retryable=retryable, max_attempts=MAX_ATTEMPTS, backoff_sec=RETRY_BACKOFF_SEC,
+        )
+
+        if action == "retry":
+            # Trả tài liệu về "Chờ xử lý" với lý do đọc được: người dùng thấy nó đang được thử lại,
+            # không phải đã thất bại hẳn. `process_job` vừa đặt trạng thái 'failed' cho lần thử này.
+            self._update_status(
+                job.job_id, "queued", 10, job.data.get("filename", ""),
+                error_message=f"Thử lại lần {attempts}/{MAX_ATTEMPTS} (lỗi hạ tầng): {result.error}",
+            )
+        else:
+            self._log_event(
+                "job_dead", "error",
+                f"Job {job.job_id} vào hàng đợi chết sau {attempts} lần thử: {result.error}",
+                document_id=job.job_id,
+            )
+            # Chỉ đếm là thất bại khi ĐÃ HẾT đường thử lại — đếm ở mỗi lần thử sẽ làm tiến độ lô
+            # vượt quá tổng số tệp và tự đánh dấu "hoàn thành" quá sớm.
+            self._bump_batch(batch_id, failed=1)
+
     def run(self):
         logger.info("Worker started (id=%s). Waiting for jobs on queue '%s'...",
                     self.worker_id, REDIS_QUEUE)
+
+        if self.reliable_queue:
+            logger.info("Hàng đợi TIN CẬY BẬT (BLMOVE + thu hồi việc mồ côi, ADR-011) — "
+                        "job không mất khi worker chết. Tối đa %d lần thử, khoảng lùi %ds.",
+                        MAX_ATTEMPTS, RETRY_BACKOFF_SEC)
+        else:
+            logger.warning("Hàng đợi chế độ CŨ (QUEUE_MODE=blpop) — ⚠️ job sẽ MẤT nếu worker chết "
+                           "giữa lúc xử lý (lỗi N-02). Chỉ dùng để đối chứng khi gỡ lỗi.")
 
         RedisTimeoutError, RedisConnectionError = _redis_exception_classes()
 
@@ -220,6 +416,18 @@ class DigitizationWorker:
             while True:
                 try:
                     self._beat()
+
+                    if self.reliable_queue:
+                        self._maintenance()
+                        claimed = jobqueue.claim(self.redis, REDIS_QUEUE, self.worker_id,
+                                                 timeout=BLPOP_TIMEOUT)
+                        self._set_redis_state(True)
+                        if claimed is None:
+                            continue    # hết giờ chờ, hàng đợi rỗng — chuyện bình thường
+                        self._handle_claimed(claimed)
+                        continue
+
+                    # ── Đường CŨ (van lùi QUEUE_MODE=blpop) — giữ nguyên từng dòng ──
                     job = self.redis.blpop(REDIS_QUEUE, timeout=BLPOP_TIMEOUT)
 
                     self._set_redis_state(True)
@@ -263,12 +471,15 @@ class DigitizationWorker:
 
     def _update_status(self, job_id: str, status: str, progress: int,
                        filename: str = "", pdf_path: str = None,
-                       error_message: str = None):
+                       error_message: str = None, clear_error: bool = False):
         """
         Ghi trạng thái đồng thời vào 3 nơi:
         1. Redis hash  — API polling cũ vẫn hoạt động
         2. PostgreSQL  — nguồn dữ liệu chính
         3. Redis Pub/Sub — SSE push xuống frontend ngay lập tức
+
+        `clear_error=True` xóa thông báo lỗi cũ — cần khi một tài liệu thất bại rồi thành công ở lần
+        thử lại, nếu không nó sẽ hiện "Hoàn thành" kèm lỗi của lần trước (xem `db.update_document_status`).
         """
         # 1. Redis hash (backward compat)
         mapping = {"status": status, "progress": str(progress)}
@@ -284,6 +495,7 @@ class DigitizationWorker:
                 progress=progress,
                 pdf_path=pdf_path,
                 error_message=error_message,
+                clear_error=clear_error,
             )
         except Exception as e:
             logger.error(f"DB update failed for {job_id}: {e}")
@@ -298,6 +510,129 @@ class DigitizationWorker:
             error=error_message,
         )
 
+    def _sample_queue_depth(self) -> None:
+        """
+        Ghi một mẫu độ sâu hàng đợi. Không ném lỗi ra ngoài.
+
+        ⚠️ NHIỀU WORKER cùng lấy mẫu sẽ ghi trùng thời điểm. Chấp nhận được: truy vấn lịch sử dùng
+        `MAX` theo khoảng thời gian nên các mẫu trùng cho cùng kết quả. Bầu chọn một worker "chủ" để
+        lấy mẫu sẽ phức tạp hơn nhiều so với giá trị nhận được.
+        """
+        try:
+            depth = jobqueue.depth(self.redis, REDIS_QUEUE)
+
+            try:
+                workers_alive = sum(
+                    1 for _ in self.redis.scan_iter(f"{WORKER_HEARTBEAT_PREFIX}*", count=100))
+            except Exception:  # noqa: BLE001
+                workers_alive = None      # None = KHÔNG BIẾT, khác hẳn 0 = không có worker nào
+
+            db.log_queue_sample(depth.as_dict(), workers_alive=workers_alive)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Không lấy được mẫu độ sâu hàng đợi: %s", e)
+
+    def _check_alerts(self) -> None:
+        """
+        Đánh giá trạng thái hệ thống và gửi cảnh báo cần thiết (YC-TB-02/03).
+
+        VÌ SAO CHẠY TRONG WORKER chứ không thêm một container: worker là tiến trình duy nhất chạy
+        liên tục và có sẵn cả kết nối Redis lẫn PostgreSQL. Thêm một dịch vụ nữa chỉ để hẹn giờ là
+        thêm một thứ phải triển khai, giám sát và khởi động lại — với một đội hai người thì không đáng.
+        (Đánh đổi: nhiều worker sẽ cùng đánh giá; chống spam theo `key` xử lý phần trùng lặp.)
+
+        ⚠️ NGHỊCH LÝ CẦN BIẾT: cảnh báo "không có worker nào" chạy TRONG worker, nên khi nó đúng nhất
+        thì không ai gửi được. Đó là lý do trang `/cong-cu` và `/bang-dieu-khien` vẫn hiển thị trạng
+        thái worker độc lập — cảnh báo là lớp bổ sung, không thay thế việc quan sát.
+        """
+        try:
+            from scripts.notify import rules
+
+            snapshot = rules.collect_snapshot(self.redis)
+            # Bỏ qua quy tắc "không có worker nào": worker này đang chạy nên nó KHÔNG thể tự kết luận
+            # điều đó — xem `rules.WORKER_BLIND_SPOTS`. Quy tắc đó do API/bảng điều khiển đánh giá.
+            alerts = rules.evaluate(snapshot, skip=rules.WORKER_BLIND_SPOTS)
+            if not alerts:
+                return
+
+            dispatcher = self._alert_dispatcher()
+            for alert in alerts:
+                sent = dispatcher.send(alert)
+                if sent:
+                    logger.warning("Đã gửi cảnh báo '%s' qua %s",
+                                   alert.key, ", ".join(k for k, v in sent.items() if v) or "(không kênh nào)")
+        except Exception as e:  # noqa: BLE001 - cảnh báo hỏng không được làm dừng xử lý tài liệu
+            logger.warning("Không đánh giá được cảnh báo: %s", e)
+
+    def _alert_dispatcher(self):
+        """
+        Dựng bộ gửi cảnh báo MỘT LẦN và giữ lại — trạng thái chống spam nằm trong bộ nhớ của nó.
+
+        Dựng lại mỗi lần sẽ làm mất lịch sử "đã gửi lúc nào", và mọi cảnh báo đều được gửi lại ở
+        mỗi chu kỳ — đúng cái mà chống spam đang cố tránh.
+        """
+        if self._dispatcher is None:
+            from scripts.notify.base import Dispatcher
+            from scripts.notify.channels import build_channels
+
+            self._dispatcher = Dispatcher(channels=build_channels())
+            logger.info("Cảnh báo BẬT — kênh: %s",
+                        ", ".join(c.name for c in self._dispatcher.channels))
+        return self._dispatcher
+
+    def _batch_paused(self, batch_id: str) -> bool:
+        """Lô có đang tạm dừng không? Lỗi truy vấn → coi như không, để tài liệu vẫn được xử lý."""
+        try:
+            from scripts.core import batches
+            return batches.is_paused(batch_id)
+        except Exception as e:  # noqa: BLE001 - chưa chạy migration 006 thì cứ xử lý bình thường
+            logger.debug("Không đọc được trạng thái lô %s: %s", batch_id, e)
+            return False
+
+    def _bump_batch(self, batch_id: Optional[str], done: int = 0, failed: int = 0) -> None:
+        """Cập nhật tiến độ lô. Số liệu tiến độ không bao giờ được chặn việc xử lý tài liệu."""
+        if not batch_id:
+            return
+        try:
+            from scripts.core import batches
+            batches.bump_counters(batch_id, done=done, failed=failed)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Không cập nhật được tiến độ lô %s: %s", batch_id, e)
+
+    def _record_ocr_metrics(self, job_id: str, input_file: str, summary: dict,
+                            config, language: Optional[str], stage_timings: dict) -> None:
+        """
+        Ghi chỉ số chất lượng OCR (YC-AN-03). Không bao giờ ném lỗi ra ngoài.
+
+        Đo trên PDF ĐẦU RA, không phải đầu vào: câu hỏi là "sau khi OCR, tài liệu này có tra cứu được
+        không", mà chỉ bản đầu ra mới trả lời được.
+        """
+        if not OCR_METRICS_ENABLED:
+            return
+
+        try:
+            from scripts.core import ocr_metrics
+
+            metrics_row = ocr_metrics.collect(
+                document_id=job_id,
+                input_pdf=input_file,
+                output_pdf=summary.get("output_pdf"),
+                duration_ms=stage_timings.get("ocr_and_extract"),
+                language=language,
+                dpi_pre=getattr(config, "pre_compress_dpi", None),
+                dpi_post=getattr(config, "post_compress_dpi", None),
+            )
+            db.log_ocr_run(job_id, **metrics_row)
+
+            # Cảnh báo ngay trong log worker: cán bộ thấy sớm thì còn kịp lấy lại bản giấy để quét lại
+            without_text = metrics_row.get("pages_without_text") or 0
+            if without_text:
+                logger.warning(
+                    "Job %s: %d/%s trang KHÔNG có lớp text sau OCR — bản scan có thể cần quét lại",
+                    job_id, without_text, metrics_row.get("pages"),
+                )
+        except Exception as e:  # noqa: BLE001 - số liệu không được làm hỏng tài liệu đã xử lý xong
+            logger.warning("Không ghi được chỉ số OCR cho %s: %s", job_id, e)
+
     def _save_timing(self, job_id: str, duration_ms: int, stage_timings: dict) -> None:
         """Lưu thời gian xử lý. Không được làm gãy job nếu ghi thất bại — đây chỉ là số liệu."""
         try:
@@ -309,7 +644,21 @@ class DigitizationWorker:
     # MAIN JOB PROCESSOR
     # ─────────────────────────────────────────────────────────────
 
-    def process_job(self, job_data: Dict):
+    def process_job(self, job_data: Dict) -> JobResult:
+        """
+        Xử lý trọn một tài liệu. Trả về `JobResult` để vòng lặp quyết định thử lại hay không (ADR-011).
+
+        MỌI hiệu ứng phụ giữ nguyên như trước: cập nhật trạng thái, ghi audit, ghi sự kiện, lưu thời
+        gian. Chỉ thêm giá trị trả về.
+        """
+        # Đặt `job_id` vào ngữ cảnh cho TOÀN BỘ vòng đời xử lý (YC-LG-03): mọi dòng log sinh ra từ
+        # đây trở xuống — kể cả từ digitize.py, extraction.py, quality.py — đều mang mã này, nên
+        # grep một job_id ra được đủ chuỗi thay vì phải lần theo dấu thời gian giữa nhiều tài liệu
+        # đang chạy song song trên nhiều worker.
+        with context.job_context(job_data.get("job_id", "unknown"), actor="worker"):
+            return self._process_job_inner(job_data)
+
+    def _process_job_inner(self, job_data: Dict) -> JobResult:
         job_id        = job_data.get("job_id", "unknown")
         filename      = job_data.get("filename", "")
         input_file    = job_data["input_file"]
@@ -361,6 +710,11 @@ class DigitizationWorker:
             if summary.get("status") == "failed":
                 raise RuntimeError(summary.get("error", "Processing failed"))
 
+            # Chỉ số chất lượng OCR (YC-AN-03). Đặt SAU khi biết pipeline thành công, và bọc riêng:
+            # đo đạc hỏng không được làm hỏng một tài liệu đã OCR xong.
+            self._record_ocr_metrics(job_id, input_file, summary, config,
+                                     job_data.get("language"), stage_timings)
+
             # ── extracting (60%) ─────────────────────────────────
             self._update_status(job_id, "extracting", 60, filename)
 
@@ -378,7 +732,9 @@ class DigitizationWorker:
             pdf_path     = summary.get("output_pdf", "")
             finished_at  = datetime.now(timezone.utc).isoformat()
 
-            self._update_status(job_id, "completed", 100, filename, pdf_path=pdf_path)
+            # `clear_error=True`: tài liệu thành công ở lần thử lại không được mang lỗi của lần trước
+            self._update_status(job_id, "completed", 100, filename, pdf_path=pdf_path,
+                                clear_error=True)
 
             # Ghi thêm finished_at vào Redis (không có trong _update_status)
             self.redis.hset(f"job:{job_id}", mapping={
@@ -411,6 +767,8 @@ class DigitizationWorker:
             logger.info("Job %s completed successfully trong %.1fs %s",
                         job_id, duration_ms / 1000, stage_timings)
 
+            return JobResult(JOB_OK)
+
         except SensitivityViolation as e:
             # YC-DR-03: ràng buộc cứng — KHÔNG xử lý tạm, KHÔNG âm thầm đổi chế độ.
             # Job thất bại có mô tả tiếng Việt để cán bộ biết phải sửa cấu hình, và audit giữ
@@ -431,6 +789,10 @@ class DigitizationWorker:
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             })
 
+            # Ràng buộc cứng bị vi phạm là lỗi CẤU HÌNH/TÀI LIỆU, không phải sự cố tạm thời:
+            # thử lại sẽ bị từ chối y như vậy. Vào hàng đợi chết ngay để người phụ trách sửa lược đồ.
+            return JobResult(JOB_FAILED_DOCUMENT, error_msg)
+
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Job {job_id} failed: {e}")
@@ -449,6 +811,12 @@ class DigitizationWorker:
             self.redis.hset(f"job:{job_id}", mapping={
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             })
+
+            kind = _classify_failure(e)
+            if kind == JOB_FAILED_INFRA:
+                logger.warning("Job %s thất bại vì LỖI HẠ TẦNG (%s) — sẽ thử lại",
+                               job_id, type(e).__name__)
+            return JobResult(kind, error_msg)
 
     def _read_metadata(self, output_dir: str) -> list:
         """

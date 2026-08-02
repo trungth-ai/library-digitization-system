@@ -33,6 +33,42 @@ export function siteBase() {
 }
 
 /**
+ * Header cần chuyển tiếp khi route proxy gọi FastAPI (ADR-012).
+ *
+ * VÌ SAO BẮT BUỘC: giao diện gọi API qua proxy same-origin của Next (commit 440f550), nên cookie
+ * phiên của trình duyệt dừng lại ở Next — FastAPI KHÔNG nhận được. Ở `AUTH_MODE=off` không sao,
+ * nhưng khi chuyển sang `shadow`/`on` thì mọi request sẽ bị coi là chưa xác thực và cán bộ không
+ * làm được gì. Đây là loại lỗi chỉ lộ ra đúng lúc bật xác thực, nên phải chuyển tiếp ngay từ đầu.
+ *
+ * Cũng chuyển tiếp `x-request-id` để lần được một thao tác từ trình duyệt xuyên xuống worker.
+ */
+export async function forwardHeaders(extra = {}) {
+  const { headers: nextHeaders } = await import("next/headers");
+  const incoming = await nextHeaders();
+
+  const out = { ...extra };
+  const cookie = incoming.get("cookie");
+  if (cookie) out.cookie = cookie;
+  const requestId = incoming.get("x-request-id");
+  if (requestId) out["x-request-id"] = requestId;
+  return out;
+}
+
+/**
+ * Chuyển tiếp `Set-Cookie` từ FastAPI về trình duyệt.
+ *
+ * Đăng nhập/đăng xuất đặt cookie phiên ở FastAPI; không chuyển tiếp thì trình duyệt không bao giờ
+ * nhận được cookie và người dùng đăng nhập xong vẫn như chưa đăng nhập.
+ */
+export function passThroughSetCookie(upstream, response) {
+  const setCookie = upstream.headers.getSetCookie?.() ?? [];
+  for (const value of setCookie) {
+    response.headers.append("set-cookie", value);
+  }
+  return response;
+}
+
+/**
  * Gọi API, luôn lấy dữ liệu mới (trang quản trị không được cache trạng thái cũ).
  * Trả về { ok, data, error } — KHÔNG ném lỗi, để trang còn dựng được và hiện thông báo
  * tiếng Việt thay vì trắng màn hình khi backend chưa chạy.

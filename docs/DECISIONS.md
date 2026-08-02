@@ -5,6 +5,193 @@
 
 ---
 
+## ADR-012: Danh tính & phân quyền — phiên phía máy chủ, bật theo ba nấc
+**Status:** Accepted · **Date:** 2026-07-31 · **Decided by:** Người phụ trách (QĐ-05, QĐ-06) + đội phát triển
+
+**Context:** Rà mã nguồn tại commit `50dd3bd` phát hiện **backend không có một cơ chế xác thực nào**:
+`scripts/api.py` không có `Depends` xác thực, và `actor` là **query param** mặc định `"api"`
+(`api.py:703`, `api.py:743`). Hệ quả không phải chỉ là tiện ích:
+
+- Bất kỳ ai vào được mạng nội bộ đều xóa/sửa được tài liệu.
+- `audit_log` đã đúng về thiết kế (bất biến, có trigger chặn) nhưng cột `actor` **không có nguồn tin
+  cậy** → **YC-AU-02 "ghi rõ ai thực hiện" hiện KHÔNG thỏa mãn** dù bảng đã sẵn sàng từ GĐ2.
+- **YC-DR-04** ("chỉ quản trị viên đổi được độ nhạy cảm" — yêu cầu **BB của GĐ1**) và **YC-RG-10**
+  ("tra cứu tuân theo phân quyền" — GĐ3) **không thể hiện thực** khi chưa có khái niệm người dùng.
+
+Ràng buộc chi phối: hệ thống **đang phục vụ thật** tại Trung tâm Thông tin Thư viện. Bật xác thực
+sai cách sẽ làm gián đoạn công việc, và không ai biết hết những chỗ đang gọi API (script cá nhân,
+luồng n8n, tab trình duyệt mở từ tuần trước).
+
+**Decision:**
+1. **Phiên phía máy chủ + cookie `HttpOnly`** (QĐ-01), **lưu trong PostgreSQL** (QĐ-02) — không JWT,
+   không lưu phiên trong Redis. Lý do Redis: trong hệ này Redis là **hàng đợi**, không bật
+   `appendonly`; Redis restart sẽ đăng xuất toàn bộ người dùng. Số phiên rất nhỏ (một Trung tâm),
+   PostgreSQL thừa sức và cho **thu hồi phiên ngay lập tức** — điều JWT không trạng thái không làm được.
+2. **Ba nấc bật `AUTH_MODE=off → shadow → on`**, đổi bằng biến môi trường, **không build lại image**.
+   Nấc `shadow` phục vụ request thiếu xác thực **nhưng ghi cảnh báo** kèm endpoint + IP + user-agent.
+   Điều kiện chuyển sang `on`: **0 cảnh báo trong 48 giờ liên tiếp**. Đây là điểm quan trọng nhất của
+   ADR này — xem Rationale.
+3. **Bốn vai trò** `admin` / `approver` / `librarian` / `viewer` + loại tài khoản `service`.
+   Quyền lưu **dạng dữ liệu** trong `roles` + `role_permissions` (cùng triết lý YC-SC-01: cấu hình
+   được, không phải hằng số trong mã).
+4. **QĐ-05: quyền duyệt do phân quyền quyết định, KHÔNG do quan hệ sở hữu.** Ai có
+   `document:approve` thì duyệt được mọi tài liệu, **kể cả tài liệu do chính mình tải lên**. Cấu hình
+   `REQUIRE_SEPARATE_APPROVER` được hiện thực nhưng **mặc định `0`**. Hệ quả: kiểm tra quyền là **một**
+   phép thử (`require("document:approve")`), không phải phép thử kép "có quyền VÀ không phải người tải lên".
+5. **QĐ-06: năng suất duyệt là số liệu công khai** — mọi người dùng đăng nhập xem được theo từng cán bộ;
+   `admin` thêm phần tổng thể. Bắt buộc hiện kèm **bối cảnh** (số trang, tỉ lệ trường phải sửa) và ghi
+   chú "số liệu vận hành, không phải xếp hạng thi đua", vì tài liệu có độ khó rất khác nhau nên số
+   tài liệu/ngày không so sánh trực tiếp được.
+6. **Cưỡng chế ở máy chủ, không ở giao diện.** Ẩn nút là tiện ích. Có một test **liệt kê tự động** mọi
+   route POST/PUT/PATCH/DELETE và khẳng định từng route có dependency phân quyền — test này **hỏng khi
+   thêm endpoint mới mà quên gắn**, đó chính là mục đích của nó.
+7. **Nền tảng xác thực cắm được** (`AUTH_BACKEND=local|ldap|oidc`) — viết interface trước, hiện thực
+   `local` trước. Cùng mẫu đã dùng thành công cho lớp provider (YC-MP-08): thêm LDAP/AD của Nhà trường
+   về sau chỉ cần một lớp hiện thực, không sửa lớp gọi.
+8. **`actor` lấy từ `contextvars`**, không truyền qua tham số. Một chỗ duy nhất được điền → `audit_log`,
+   `model_calls`, nhật ký người dùng tự có tên thật mà không phải sửa từng nơi gọi.
+
+**Rationale:** Nấc `shadow` là phần đắt nhất về thời gian và cũng là phần **không được rút gọn**. Câu
+hỏi "còn chỗ nào đang gọi API mà chưa biết?" không trả lời được bằng phỏng đoán hay bằng đọc mã — chỉ
+trả lời được bằng cách chạy thật và đo. Bỏ nấc này thì gần như chắc chắn có một luồng công việc bị chặn
+đột ngột, và niềm tin của cán bộ vào hệ thống mất nhanh hơn nhiều so với thời gian tiết kiệm được.
+
+Về QĐ-05: chốt bốn mắt là kiểm soát tốt về nguyên tắc, nhưng Trung tâm hiện ít nhân sự — áp mặc định
+sẽ tạo ra tình huống tài liệu không ai duyệt được, và cách người dùng vượt qua rào cản đó (dùng chung
+tài khoản) tệ hơn nhiều so với việc không có rào cản.
+
+**Consequences:** ✅ Đóng ba khoảng trống SRS: YC-AU-02, YC-DR-04, YC-RG-10.
+✅ `audit_log` ghi tên thật → nhật ký kiểm toán có giá trị giải trình.
+✅ Thu hồi phiên tức thời; khóa tài khoản sau N lần sai.
+✅ Van lùi `AUTH_MODE=off` khôi phục hành vi trước đây mà không cần rollback DB (bảng mới không ảnh
+hưởng đường cũ).
+⚠️ Cần chạy migration `003_users_rbac.sql`.
+⚠️ **Phải chạy nấc `shadow` ≥ 1 tuần trước khi bật `on`** — bỏ bước này là rủi ro vận hành, không phải
+tiết kiệm thời gian.
+⚠️ Mất mật khẩu quản trị sẽ khóa cả hệ thống → có lệnh CLI cứu hộ chạy từ trong container, có ghi audit.
+⚠️ `LoginForm.jsx` hiện là đăng nhập **DSpace**, không phải DocuFlow. Hai thứ phải giữ tách bạch và
+đặt tên rõ trên giao diện ("Đăng nhập DocuFlow" / "Kết nối DSpace"), nếu trộn sẽ làm cán bộ nhầm mật khẩu.
+
+**Alternatives:** (a) **JWT không trạng thái** — không thu hồi được phiên ngay, phải thêm danh sách
+thu hồi (tức là lại có trạng thái), và cần quản lý khóa; không đáng cho một tổ chức đơn lẻ. (b) **Lưu
+phiên trong Redis** — Redis ở đây là hàng đợi không bền vững, restart là đăng xuất toàn bộ. (c) **Bật
+xác thực một lần (không có nấc `shadow`)** — nhanh hơn vài ngày nhưng đánh cược vào giả định "đã biết
+hết chỗ gọi API", giả định này không kiểm chứng được trước khi bật. (d) **Dùng luôn tài khoản DSpace
+làm tài khoản DocuFlow** — buộc mọi cán bộ phải có tài khoản DSpace (không đúng thực tế: người quét
+tài liệu không cần quyền DSpace), và làm DocuFlow phụ thuộc vào DSpace sống mới đăng nhập được.
+
+---
+
+## ADR-011: Hàng đợi tin cậy — `BLMOVE` + thu hồi việc mồ côi, thay cho `BLPOP`
+**Status:** Accepted · **Date:** 2026-07-31 · **Decided by:** Đội phát triển
+
+**Context:** `worker.py:223` dùng `redis.blpop(REDIS_QUEUE)`. `BLPOP` lấy job **ra khỏi** hàng đợi rồi
+job chỉ tồn tại trong bộ nhớ tiến trình worker trong **toàn bộ** thời gian xử lý — với OCR hai pha
+150→120 DPI, đó là vài phút cho một tài liệu vài trăm trang. Trong cửa sổ đó, nếu worker bị `kill`,
+OOM, hay `docker compose restart`, **job biến mất im lặng**: không có trong hàng đợi, không có worker
+nào xử lý, và tài liệu treo mãi ở "Chờ xử lý" mà không ai biết vì sao.
+
+Ở quy mô hiện tại (trần 10 tệp/lần, xử lý theo đợt nhỏ, có người ngồi canh) lỗi này gần như không
+gặp. Ở quy mô đang chuẩn bị (lô hàng trăm tệp chạy đêm) thì xác suất gặp là **gần như chắc chắn** —
+và đúng lúc không có ai ngồi canh.
+
+Ngoài ra hàng đợi hiện tại không có: thử lại, hàng đợi chết, ưu tiên. Một tài liệu lẻ mà cán bộ đang
+chờ sẽ nằm sau 500 tệp của lô chạy đêm.
+
+**Decision:**
+1. **`BLMOVE` thay `BLPOP`**: job được chuyển **nguyên tử** từ hàng đợi sang danh sách đang-xử-lý
+   riêng của từng worker (`worker:processing:{worker_id}`). Job **luôn** nằm ở đúng một chỗ — hàng đợi
+   hoặc danh sách đang-xử-lý — không bao giờ chỉ nằm trong RAM. Hoàn tất mới `LREM` khỏi danh sách đó.
+2. **Ưu tiên bằng cách đặt tên khóa, giữ tương thích ngược:** `{base}:high`, **`{base}` (mức normal —
+   chính là khóa đang dùng hôm nay)**, `{base}:low`. Nghĩa là mọi thứ đang đẩy vào `digitization_jobs`
+   tiếp tục chạy đúng, được coi là mức normal. Tương thích ngược **do cấu trúc**, không do lớp chuyển đổi.
+3. **Thăm dò không chặn theo thứ tự ưu tiên, rồi chặn trên mức normal.** Khi cả ba hàng đợi rỗng thì
+   `BLMOVE` chặn trên khóa normal với `BLPOP_TIMEOUT`. Đánh đổi được ghi nhận rõ: job `high` đến trong
+   lúc đang chặn có thể chờ tối đa `BLPOP_TIMEOUT` (5s) — **chỉ khi hệ thống đang rỗi**. Redis không có
+   `BLMOVE` nhiều khóa, và 5s khi rỗi là cái giá rẻ so với việc thăm dò liên tục làm nóng Redis.
+4. **Thu hồi việc mồ côi dựa trên nhịp tim đã có** (ADR-009): quét `worker:processing:*`, worker nào
+   **không còn khóa nhịp tim** (TTL 60s) thì trả job của nó về hàng đợi bằng `RPUSH` (vào đầu bên phải
+   = được nhận ngay lượt sau, vì `BLMOVE` lấy từ bên phải) + ghi `system_events` `kind='job_reclaimed'`.
+5. **Thử lại có khoảng lùi qua ZSET `{base}:delayed`** (score = thời điểm đến hạn), **không phải bằng
+   cách cho worker ngủ**. Worker ngủ để chờ thử lại là biến một job lỗi thành một worker bị chiếm dụng.
+6. **Phân biệt lỗi hạ tầng với lỗi tài liệu.** Mất Redis/PostgreSQL/công cụ mô hình → thử lại. PDF hỏng,
+   tệp không tồn tại, vi phạm ràng buộc độ nhạy cảm (`SensitivityViolation`) → **vào hàng đợi chết ngay**,
+   không thử lại 3 lần vô ích. Thử lại một tài liệu hỏng chỉ tốn thời gian và làm nhiễu nhật ký.
+7. **Van lùi `QUEUE_MODE=blpop`** khôi phục chính xác vòng lặp cũ.
+8. **Job phải idempotent.** Điều kiện để (4) an toàn. Đã thỏa mãn sẵn: `save_metadata` dùng
+   `ON CONFLICT (document_id, key, value) DO NOTHING`, và `_update_status` là ghi đè trạng thái.
+
+**Rationale:** Đây là **lỗi mất dữ liệu**, không phải thiếu tính năng — nên nó không thể chờ tới khi
+làm phần khối lượng lớn. `BLMOVE` là mẫu chuẩn (reliable queue) của Redis cho đúng vấn đề này, và
+điều kiện tiên quyết của nó — biết worker nào còn sống — **đã có sẵn** từ ADR-009. Nói cách khác:
+phần khó đã làm xong từ trước, phần còn lại chỉ là dùng nó đúng chỗ.
+
+Chọn thứ tự khóa `{base}` = mức normal (thay vì tạo `{base}:normal` mới) là quyết định nhỏ nhưng bỏ đi
+được toàn bộ nhu cầu di trú dữ liệu và toàn bộ nguy cơ "job nằm trong khóa cũ mà không worker nào đọc".
+
+**Consequences:** ✅ Khởi động lại máy chủ giữa lúc chạy lô không mất tài liệu nào.
+✅ Job lỗi có nơi để nhìn thấy (hàng đợi chết có lý do tiếng Việt) thay vì biến mất.
+✅ Tài liệu lẻ không bị kẹt sau lô chạy đêm.
+✅ Đẩy được sang phần khối lượng lớn (V5/V6) mà không phải làm lại.
+⚠️ Hàng đợi chết nằm trong Redis (không bền vững) → **bản ghi có thẩm quyền vẫn là `documents` trong
+PostgreSQL** với `status='failed'` + `error_message`; danh sách trong Redis chỉ để tiện chạy lại.
+⚠️ Thêm một tiến trình nền (thu hồi) chạy trong worker khi rỗi — không thêm container.
+⚠️ Trễ tối đa 5s cho job `high` khi hệ thống đang rỗi (mục 3).
+
+**Alternatives:** (a) **Giữ `BLPOP`, chấp nhận mất job** — không chấp nhận được với hệ đang phục vụ
+thật. (b) **Celery/RQ/Dramatiq** — có sẵn mọi thứ này, nhưng thêm một phụ thuộc lớn vào hệ đang chạy
+ổn, và trái nguyên tắc "bổ sung không viết lại"; chi phí di trú cao hơn nhiều so với ~200 dòng mã.
+(c) **`LPOS`/khóa riêng cho từng job** — phức tạp hơn mà không nguyên tử bằng. (d) **Hàng đợi trong
+PostgreSQL (`SELECT FOR UPDATE SKIP LOCKED`)** — bền vững hơn thật, nhưng đánh đổi bằng việc bỏ hẳn
+Redis pub/sub đang dùng cho SSE, và biến một sửa lỗi thành một lần viết lại.
+
+---
+
+## ADR-010: Ghi tệp tải lên không chặn event loop, băm trong cùng một lượt đọc
+**Status:** Accepted · **Date:** 2026-07-31 · **Decided by:** Đội phát triển
+
+**Context:** `save_upload_file` (`api.py:142`) dùng `shutil.copyfileobj` — **đồng bộ** — và được gọi
+bên trong `async def` (`api.py:206` và `api.py:257`). Trong suốt thời gian ghi một tệp xuống đĩa,
+event loop của FastAPI **bị chặn hoàn toàn**: SSE của mọi client đang mở bị ngắt, mọi request khác
+treo. Một tệp 200 MB trên đĩa chậm là vài giây API "chết". `batch_upload` ghi tuần tự tối đa 10 tệp
+trong **một** request, nên hiệu ứng cộng dồn.
+
+Đây là loại lỗi không ai báo: nó biểu hiện thành "giao diện thỉnh thoảng chậm" và "SSE hay bị đứt",
+không thành thông báo lỗi.
+
+**Decision:**
+1. **Ghi theo mảnh, mỗi mảnh qua `run_in_threadpool`.** Đọc `await upload_file.read(CHUNK)` (bất đồng
+   bộ, sẵn có của Starlette), ghi trong thread pool → event loop luôn rảnh giữa các mảnh.
+2. **Băm SHA-256 trong CÙNG lượt đọc**, và **cùng lời gọi thread pool** với phép ghi. Hai lý do:
+   không đọc tệp lần thứ hai chỉ để băm, và `hashlib.update` trên mảnh 1 MB tốn vài ms CPU — đủ để
+   không nên chạy trên event loop. Hash này là điều kiện của việc chống trùng tài liệu (YC-BU-04) ở
+   V5, nên làm luôn: lấy nó **miễn phí** khi đã đang đọc tệp, đắt hơn nhiều nếu thêm sau.
+3. **Trả về `(sha256, số_byte)`** để nơi gọi ghi được `file_hash`/`file_size` — chưa dùng ngay ở
+   sprint này nhưng không phải đọc lại tệp về sau.
+4. **Giữ nguyên `save_upload_file` cũ** (đánh dấu deprecated) — có nơi khác và có test đang dùng;
+   xóa đi là vi phạm "bổ sung không viết lại" mà không đổi lấy gì.
+5. **Kích thước mảnh cấu hình được** (`UPLOAD_CHUNK_MB`, mặc định 1 MB) — đủ nhỏ để event loop mượt,
+   đủ lớn để không tạo quá nhiều lượt chuyển thread.
+
+**Rationale:** Sửa đúng chỗ, không đổi kiến trúc. Phần khó là **nhận ra** đây là lỗi; bản vá chỉ vài
+chục dòng. Việc gộp băm vào cùng lượt đọc là ví dụ của nguyên tắc "làm cái rẻ khi đang mở đúng tệp
+đó" — tách ra làm sau sẽ tốn một lượt đọc toàn bộ tệp cho mỗi tài liệu.
+
+**Consequences:** ✅ SSE không còn bị ngắt khi có người tải tệp lớn; API phản hồi trong suốt quá trình
+ghi. ✅ Có sẵn `file_hash` cho chống trùng ở V5 mà không cần đọc lại tệp. ✅ Không đổi giao diện API
+(ADR-003 — endpoint cũ giữ nguyên định dạng phản hồi).
+⚠️ Thông lượng ghi một tệp đơn lẻ có thể **giảm nhẹ** do chi phí chuyển thread mỗi mảnh — đánh đổi có
+chủ đích: đổi một chút thông lượng của người đang tải lấy khả năng phục vụ của toàn hệ thống. Cần **đo**
+ở `KT-HN-08`, không tuyên bố trước.
+
+**Alternatives:** (a) **`aiofiles`** — thêm một phụ thuộc để làm đúng việc `run_in_threadpool` đã làm
+được. (b) **Ghi toàn bộ trong một lời gọi thread pool** (`copyfileobj` trong threadpool) — đơn giản
+hơn, nhưng không có cơ hội băm theo mảnh và không cho theo dõi tiến độ về sau. (c) **Chuyển endpoint
+upload sang `def` đồng bộ** để Starlette tự đẩy vào thread pool — sửa được việc chặn, nhưng mất
+`await upload_file.read()` và làm endpoint lệch mẫu với phần còn lại của `api.py`.
+
+---
+
 ## ADR-009: Theo dõi vận hành — sự kiện hạ tầng tách khỏi nhật ký kiểm toán
 **Status:** Accepted · **Date:** 2026-07-29 · **Decided by:** Đội phát triển
 

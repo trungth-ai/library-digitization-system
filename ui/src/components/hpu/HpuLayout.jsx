@@ -5,13 +5,20 @@ import { formatNumber } from "@/lib/format";
 // Điều hướng: `href` chỉ đặt cho trang ĐÃ CÓ. Mục chưa làm để href=null và hiện mờ — thà nói rõ
 // "chưa có" còn hơn để người dùng bấm vào một liên kết không đi đâu cả.
 const NAV = [
+  { key: "dashboard", label: "Bảng điều khiển", icon: "🏠", href: "/bang-dieu-khien" },
   { key: "upload", label: "Tải tài liệu", icon: "⬆️", href: "/" },
+  { key: "batches", label: "Lô tài liệu", icon: "📦", href: "/lo" },
   { key: "jobs", label: "Hàng đợi OCR", icon: "⏳", href: "/" },
+  { key: "queue", label: "Tình trạng hàng đợi", icon: "🔁", href: "/hang-doi" },
+  { key: "review", label: "Duyệt tài liệu", icon: "✅", href: "/duyet" },
   { key: "dspace", label: "Đẩy DSpace", icon: "📤", href: null },
+  { key: "trash", label: "Thùng rác", icon: "🗑️", href: "/thung-rac" },
   { key: "schemas", label: "Lược đồ", icon: "🧩", href: "/luoc-do" },
   { key: "reports", label: "Báo cáo", icon: "📊", href: "/bao-cao" },
+  { key: "ai", label: "Phân tích AI", icon: "🔬", href: "/phan-tich-ai" },
   { key: "tools", label: "Công cụ mô hình", icon: "🧠", href: "/cong-cu" },
   { key: "audit", label: "Nhật ký kiểm toán", icon: "🔒", href: null },
+  { key: "users", label: "Quản trị người dùng", icon: "👥", href: "/quan-tri/nguoi-dung" },
 ];
 
 export function HpuSidebar({ appName = "DocuFlow HP", activeKey = null }) {

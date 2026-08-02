@@ -402,5 +402,334 @@ INSERT INTO dspace_upload_statuses (code, label, is_terminal, color, sort_order)
 ON CONFLICT (code) DO NOTHING;
 
 -- =====================================================================
+-- 9. DANH TÍNH & PHÂN QUYỀN (ADR-012 — vá lỗ hổng N-01 "không có xác thực")
+--    Giữ ĐỒNG BỘ với database/migrations/003_users_rbac.sql: file này cho cài MỚI, migration cho DB
+--    đã tồn tại. Lệch nhau sẽ tạo ra hai hệ thống hành xử khác nhau tùy theo cài lúc nào.
+--
+--    Sau khi tạo, hệ thống VẪN chạy như cũ vì AUTH_MODE=off là mặc định. Quy trình bật ba nấc
+--    off → shadow → on xem ADR-012 và docs/DEPLOY.md.
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS roles (
+    code        VARCHAR(50)  PRIMARY KEY,
+    label       VARCHAR(150) NOT NULL,
+    description TEXT,
+    is_system   BOOLEAN      NOT NULL DEFAULT FALSE,   -- không cho xóa/đổi tên vai trò hệ thống
+    sort_order  INTEGER      NOT NULL DEFAULT 0,
+    status      VARCHAR(20)  NOT NULL DEFAULT 'active',
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- Quyền là DỮ LIỆU, không phải hằng số trong mã (YC-QT-09) — cùng triết lý với extraction_schemas
+CREATE TABLE IF NOT EXISTS role_permissions (
+    id         BIGSERIAL PRIMARY KEY,
+    role_code  VARCHAR(50)  NOT NULL REFERENCES roles(code) ON DELETE CASCADE,
+    permission VARCHAR(100) NOT NULL,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_role_permission UNIQUE (role_code, permission)
+);
+CREATE INDEX IF NOT EXISTS idx_role_permissions_role ON role_permissions(role_code);
+
+CREATE TABLE IF NOT EXISTS users (
+    id                   BIGSERIAL PRIMARY KEY,
+    username             VARCHAR(100) NOT NULL UNIQUE,
+    email                VARCHAR(200),
+    full_name            VARCHAR(200) NOT NULL,
+    -- Băm tự mô tả `pbkdf2_sha256$<vòng>$<salt>$<hash>` — cho phép nâng số vòng lặp / đổi thuật toán
+    -- về sau mà không phải đặt lại mật khẩu hàng loạt (scripts/core/passwords.py)
+    password_hash        TEXT         NOT NULL,
+    role                 VARCHAR(50)  NOT NULL DEFAULT 'viewer' REFERENCES roles(code),
+    must_change_password BOOLEAN      NOT NULL DEFAULT FALSE,   -- YC-QT-05
+    failed_attempts      INTEGER      NOT NULL DEFAULT 0,       -- YC-QT-06 khóa sau N lần sai
+    locked_until         TIMESTAMPTZ,
+    last_login_at        TIMESTAMPTZ,
+    last_login_ip        VARCHAR(64),
+    -- Xóa MỀM (YC-QT-08): audit_log tham chiếu tới người dùng, xóa cứng là mất khả năng truy trách nhiệm
+    status               VARCHAR(20)  NOT NULL DEFAULT 'active',
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    created_by           BIGINT,
+    CONSTRAINT ck_users_status CHECK (status IN ('active', 'disabled', 'deleted'))
+);
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_active   ON users(username) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_users_role     ON users(role);
+
+DROP TRIGGER IF EXISTS trg_users_touch ON users;
+CREATE TRIGGER trg_users_touch BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+DROP TRIGGER IF EXISTS trg_roles_touch ON roles;
+CREATE TRIGGER trg_roles_touch BEFORE UPDATE ON roles
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- Phiên lưu ở PostgreSQL, KHÔNG ở Redis (QĐ-02): Redis ở hệ này là hàng đợi không bền vững, restart
+-- là đăng xuất toàn bộ. Lưu ở đây còn cho phép THU HỒI phiên ngay lập tức — điều JWT không làm được.
+CREATE TABLE IF NOT EXISTS user_sessions (
+    -- Băm SHA-256 của token, KHÔNG lưu token thô: rò CSDL không đồng nghĩa với chiếm được phiên
+    token_hash   CHAR(64)     PRIMARY KEY,
+    user_id      BIGINT       NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    ip           VARCHAR(64),
+    user_agent   TEXT,
+    expires_at   TIMESTAMPTZ  NOT NULL,
+    last_seen_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    revoked_at   TIMESTAMPTZ,
+    status       VARCHAR(20)  NOT NULL DEFAULT 'active',
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user    ON user_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON user_sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_active  ON user_sessions(user_id) WHERE status = 'active';
+
+DROP TRIGGER IF EXISTS trg_sessions_touch ON user_sessions;
+CREATE TRIGGER trg_sessions_touch BEFORE UPDATE ON user_sessions
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- 9.1 Seed vai trò & quyền — phải khớp scripts/auth/policy.py
+INSERT INTO roles (code, label, description, is_system, sort_order) VALUES
+    ('admin',     'Quản trị hệ thống', 'Toàn quyền: quản lý người dùng, cấu hình, độ nhạy cảm lược đồ', TRUE, 1),
+    ('approver',  'Cán bộ duyệt',      'Duyệt tài liệu và đẩy DSpace, kể cả tài liệu do mình tải lên',  TRUE, 2),
+    ('librarian', 'Cán bộ nghiệp vụ',  'Tải lên, sửa metadata, gửi duyệt',                              TRUE, 3),
+    ('viewer',    'Người xem',         'Chỉ xem tài liệu và báo cáo',                                   TRUE, 4),
+    ('service',   'Tài khoản dịch vụ', 'Dùng cho tích hợp qua API key; không có quyền mặc định nào',     TRUE, 5)
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO role_permissions (role_code, permission) VALUES
+    ('viewer', 'document:read'), ('viewer', 'report:read'),
+    ('librarian', 'document:read'), ('librarian', 'report:read'),
+    ('librarian', 'document:upload'), ('librarian', 'document:edit'),
+    ('librarian', 'document:download'), ('librarian', 'schema:read'),
+    ('approver', 'document:read'), ('approver', 'report:read'),
+    ('approver', 'document:upload'), ('approver', 'document:edit'),
+    ('approver', 'document:download'), ('approver', 'schema:read'),
+    ('approver', 'document:approve'), ('approver', 'document:delete'),
+    ('approver', 'dspace:push'), ('approver', 'queue:manage'), ('approver', 'audit:read'),
+    ('admin', 'document:read'), ('admin', 'report:read'), ('admin', 'document:upload'),
+    ('admin', 'document:edit'), ('admin', 'document:download'), ('admin', 'document:approve'),
+    ('admin', 'document:delete'), ('admin', 'document:purge'), ('admin', 'dspace:push'),
+    ('admin', 'schema:read'), ('admin', 'schema:write'), ('admin', 'schema:sensitivity'),
+    ('admin', 'audit:read'), ('admin', 'log:read'), ('admin', 'queue:manage'),
+    ('admin', 'user:manage'), ('admin', 'system:config')
+ON CONFLICT (role_code, permission) DO NOTHING;
+
+-- =====================================================================
+-- 10. NHẬT KÝ HÀNH VI NGƯỜI DÙNG (YC-NK — sprint V4)
+--     Giữ ĐỒNG BỘ với database/migrations/004_user_activity.sql.
+--
+--     Lớp thứ BA trong bốn lớp nhật ký. KHÁC `audit_log`: bảng kia ghi thao tác NGHIỆP VỤ trên TÀI
+--     LIỆU và giữ vĩnh viễn; bảng này ghi HÀNH VI truy cập (đăng nhập, sai mật khẩu, bị từ chối
+--     quyền, kết xuất) và giữ 365 ngày. Trộn hai loại sẽ làm nhật ký kiểm toán ngập những lần đăng
+--     nhập thường ngày, và buộc giữ vĩnh viễn cả dữ liệu chỉ có giá trị điều tra trong một năm.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS user_activity (
+    id            BIGSERIAL PRIMARY KEY,
+    -- Giữ CẢ user_id lẫn username: username để nhật ký còn đọc được sau khi tài khoản bị xóa mềm
+    user_id       BIGINT,
+    username      VARCHAR(100),
+    action        VARCHAR(50)  NOT NULL,   -- login|logout|login_failed|permission_denied|view|export
+    resource_type VARCHAR(50),
+    resource_id   TEXT,
+    ip            VARCHAR(64),
+    user_agent    TEXT,
+    request_id    VARCHAR(64),             -- nối với tệp log JSONL (YC-LG-02)
+    result        VARCHAR(20)  NOT NULL DEFAULT 'ok',   -- ok | denied | failed
+    detail        JSONB,
+    status        VARCHAR(20)  NOT NULL DEFAULT 'active',
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_activity_user    ON user_activity(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_activity_created ON user_activity(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_user_activity_action  ON user_activity(action);
+CREATE INDEX IF NOT EXISTS idx_user_activity_ip      ON user_activity(ip);
+-- Bị từ chối quyền là tín hiệu an ninh quan trọng nhất trong bảng này → index riêng
+CREATE INDEX IF NOT EXISTS idx_user_activity_denied  ON user_activity(created_at DESC)
+    WHERE result <> 'ok';
+
+-- Chặn SỬA (YC-NK-01), KHÔNG chặn xóa: thời hạn lưu 365 ngày cần xóa được bản ghi quá hạn qua
+-- `scripts/core/retention.py` (việc dọn có ghi số lượng vào system_events).
+DROP TRIGGER IF EXISTS trg_user_activity_no_update ON user_activity;
+CREATE TRIGGER trg_user_activity_no_update BEFORE UPDATE ON user_activity
+    FOR EACH ROW EXECUTE FUNCTION prevent_audit_mutation();
+
+-- =====================================================================
+-- 11. PHÂN TÍCH CHI TIẾT KẾT QUẢ AI (YC-AN — sprint V2)
+--     Giữ ĐỒNG BỘ với database/migrations/005_ai_analytics.sql.
+--
+--     `model_calls` gốc chỉ đếm `n_fields` — biết model trả BAO NHIÊU trường, không biết trả CÁI GÌ.
+--     Hai bảng dưới đây cho phép đo độ chính xác trên VIỆC THẬT: so giá trị AI trả về với giá trị
+--     cán bộ duyệt sau đó. Nguồn đáp án chuẩn miễn phí, tích lũy mỗi ngày.
+-- =====================================================================
+
+-- Cột phân tích bổ sung cho model_calls (xem migration 005 để biết lý do từng cột)
+ALTER TABLE model_calls
+    ADD COLUMN IF NOT EXISTS prompt_tokens     INTEGER,
+    ADD COLUMN IF NOT EXISTS completion_tokens INTEGER,
+    ADD COLUMN IF NOT EXISTS total_tokens      INTEGER,
+    -- Tiền là SỐ NGUYÊN (chuẩn HPU): micro-USD giữ độ chính xác đơn giá, VNĐ là thứ người dùng đọc
+    ADD COLUMN IF NOT EXISTS cost_micro_usd    BIGINT,
+    ADD COLUMN IF NOT EXISTS cost_vnd          BIGINT,
+    ADD COLUMN IF NOT EXISTS prompt_version    VARCHAR(50),
+    ADD COLUMN IF NOT EXISTS prompt_hash       CHAR(64),
+    ADD COLUMN IF NOT EXISTS context_chars     INTEGER,
+    ADD COLUMN IF NOT EXISTS context_pages     INTEGER,
+    ADD COLUMN IF NOT EXISTS retry_reason      TEXT,
+    ADD COLUMN IF NOT EXISTS confidence_avg    NUMERIC(4,3),
+    ADD COLUMN IF NOT EXISTS confidence_min    NUMERIC(4,3),
+    ADD COLUMN IF NOT EXISTS grounded_ratio    NUMERIC(4,3),
+    ADD COLUMN IF NOT EXISTS request_id        VARCHAR(64);
+
+CREATE INDEX IF NOT EXISTS idx_model_calls_schema ON model_calls(schema_code, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS model_call_fields (
+    id            BIGSERIAL PRIMARY KEY,
+    model_call_id BIGINT       REFERENCES model_calls(id) ON DELETE CASCADE,
+    document_id   TEXT,
+    field_key     VARCHAR(100) NOT NULL,
+    -- CẮT NGẮN: đủ để đối chiếu, không biến bảng nhật ký thành bản sao nội dung tài liệu
+    value_preview TEXT,
+    confidence    NUMERIC(4,3),
+    grounded      BOOLEAN,       -- giá trị có trong văn bản gốc không (YC-CF-05, chống ảo giác)
+    attempt       INTEGER      NOT NULL DEFAULT 1,
+    status        VARCHAR(20)  NOT NULL DEFAULT 'active',
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_mcf_confidence CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1))
+);
+CREATE INDEX IF NOT EXISTS idx_mcf_document ON model_call_fields(document_id);
+CREATE INDEX IF NOT EXISTS idx_mcf_field    ON model_call_fields(field_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mcf_call     ON model_call_fields(model_call_id);
+
+DROP TRIGGER IF EXISTS trg_mcf_touch ON model_call_fields;
+CREATE TRIGGER trg_mcf_touch BEFORE UPDATE ON model_call_fields
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- `pages_without_text` là chỉ báo scan xấu: OCR chạy xong nhưng trang đó không có lớp text, nghĩa là
+-- nội dung KHÔNG tra cứu được sau khi lên DSpace — hỏng một cách im lặng.
+CREATE TABLE IF NOT EXISTS ocr_runs (
+    id                 BIGSERIAL PRIMARY KEY,
+    document_id        TEXT         NOT NULL,
+    engine             VARCHAR(50)  NOT NULL DEFAULT 'ocrmypdf',
+    language           VARCHAR(20),
+    pages              INTEGER,
+    pages_without_text INTEGER,
+    dpi_pre            INTEGER,
+    dpi_post           INTEGER,
+    size_in_bytes      BIGINT,
+    size_out_bytes     BIGINT,
+    text_chars         INTEGER,
+    duration_ms        INTEGER,
+    warnings           TEXT,
+    status             VARCHAR(20)  NOT NULL DEFAULT 'success',
+    created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ocr_runs_document ON ocr_runs(document_id);
+CREATE INDEX IF NOT EXISTS idx_ocr_runs_created  ON ocr_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ocr_runs_bad      ON ocr_runs(created_at DESC)
+    WHERE pages_without_text > 0;
+
+DROP TRIGGER IF EXISTS trg_ocr_runs_touch ON ocr_runs;
+CREATE TRIGGER trg_ocr_runs_touch BEFORE UPDATE ON ocr_runs
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- =====================================================================
+-- 12. LÔ NẠP TÀI LIỆU (YC-BU — sprint V5)
+--     Giữ ĐỒNG BỘ với database/migrations/006_batches.sql.
+--
+--     Không có khái niệm lô thì tải 300 tệp là 300 job rời rạc: không biết còn bao nhiêu, tệp nào
+--     lỗi, và không dừng/chạy lại cả mẻ được. `file_hash` được tính SẴN ở đường tải lên (ADR-010)
+--     nên chống trùng chỉ là một truy vấn.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS batches (
+    id            TEXT PRIMARY KEY,
+    name          VARCHAR(200) NOT NULL,
+    source        VARCHAR(20)  NOT NULL DEFAULT 'web',    -- web|folder|zip|watch|api
+    created_by    BIGINT,
+    priority      VARCHAR(10)  NOT NULL DEFAULT 'normal',
+    -- Bộ đếm thay vì COUNT mỗi lần hiển thị: lô đang chạy được mở xem liên tục
+    total_files   INTEGER      NOT NULL DEFAULT 0,
+    done_files    INTEGER      NOT NULL DEFAULT 0,
+    failed_files  INTEGER      NOT NULL DEFAULT 0,
+    skipped_files INTEGER      NOT NULL DEFAULT 0,
+    status        VARCHAR(20)  NOT NULL DEFAULT 'running',
+    note          TEXT,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    finished_at   TIMESTAMPTZ,
+    CONSTRAINT ck_batches_status CHECK (
+        status IN ('running', 'paused', 'completed', 'cancelled', 'deleted')),
+    CONSTRAINT ck_batches_priority CHECK (priority IN ('high', 'normal', 'low'))
+);
+CREATE INDEX IF NOT EXISTS idx_batches_created ON batches(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_batches_status  ON batches(status)
+    WHERE status IN ('running', 'paused');
+CREATE INDEX IF NOT EXISTS idx_batches_creator ON batches(created_by);
+
+DROP TRIGGER IF EXISTS trg_batches_touch ON batches;
+CREATE TRIGGER trg_batches_touch BEFORE UPDATE ON batches
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+ALTER TABLE documents
+    ADD COLUMN IF NOT EXISTS batch_id    TEXT REFERENCES batches(id),
+    ADD COLUMN IF NOT EXISTS file_hash   CHAR(64),      -- SHA-256, nền tảng chống trùng (YC-BU-04)
+    ADD COLUMN IF NOT EXISTS file_size   BIGINT,
+    ADD COLUMN IF NOT EXISTS page_count  INTEGER,
+    ADD COLUMN IF NOT EXISTS priority    VARCHAR(10) NOT NULL DEFAULT 'normal',
+    ADD COLUMN IF NOT EXISTS attempts    INTEGER     NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS uploaded_by BIGINT,
+    ADD COLUMN IF NOT EXISTS assigned_to BIGINT;       -- ai chịu trách nhiệm duyệt (YC-RV-07)
+
+CREATE INDEX IF NOT EXISTS idx_documents_batch    ON documents(batch_id);
+-- KHÔNG dùng UNIQUE: cùng một tệp có thể cần xử lý lại có chủ đích (DEDUP_MODE=reprocess)
+CREATE INDEX IF NOT EXISTS idx_documents_hash     ON documents(file_hash)
+    WHERE file_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_documents_uploader ON documents(uploaded_by);
+CREATE INDEX IF NOT EXISTS idx_documents_assignee ON documents(assigned_to)
+    WHERE assigned_to IS NOT NULL;
+
+-- =====================================================================
+-- 13. LẤY MẪU ĐỘ SÂU HÀNG ĐỢI (YC-BU-18, YC-DB-06 — sprint V6)
+--     Giữ ĐỒNG BỘ với database/migrations/007_queue_samples.sql.
+--
+--     `/api/v2/stats` chỉ cho biết độ sâu NGAY LÚC NÀY. Câu hỏi vận hành thật lại là câu về thời
+--     gian: "giờ nào dồn nhất", "thêm worker có giảm tồn đọng không". Không có lịch sử thì không
+--     trả lời được câu nào.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS queue_samples (
+    id            BIGSERIAL PRIMARY KEY,
+    -- Tách theo mức ưu tiên: gộp thành một số sẽ che mất tình huống đáng lo nhất — hàng đợi `high`
+    -- bị dồn trong khi tổng số trông bình thường vì `low` đã vơi.
+    high          INTEGER NOT NULL DEFAULT 0,
+    normal        INTEGER NOT NULL DEFAULT 0,
+    low           INTEGER NOT NULL DEFAULT 0,
+    delayed       INTEGER NOT NULL DEFAULT 0,
+    dead          INTEGER NOT NULL DEFAULT 0,
+    processing    INTEGER NOT NULL DEFAULT 0,
+    workers_alive INTEGER,     -- NULL = không đọc được Redis, KHÁC 0 = không có worker nào
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_queue_samples_created ON queue_samples(created_at DESC);
+
+-- =====================================================================
+-- 14. QUY TRÌNH DUYỆT TÀI LIỆU (YC-RV — sprint V8)
+--     Giữ ĐỒNG BỘ với database/migrations/008_review_workflow.sql.
+--
+--     `needs_review` cho biết tài liệu CẦN xem lại, nhưng không có chỗ nào ghi tài liệu ĐÃ ĐƯỢC
+--     DUYỆT — nên không chốt được điều kiện "chưa duyệt thì không đẩy DSpace" (YC-RV-04), tức là
+--     nguyên tắc SRS "con người giữ quyền quyết định" không cưỡng chế được.
+-- =====================================================================
+ALTER TABLE documents
+    -- NULL = chưa ai xác nhận. Không dùng BOOLEAN vì cần biết xác nhận LÚC NÀO và BỞI AI
+    ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS confirmed_by VARCHAR(150);
+
+CREATE INDEX IF NOT EXISTS idx_documents_unconfirmed ON documents(updated_at ASC)
+    WHERE confirmed_at IS NULL AND status = 'completed';
+
+-- =====================================================================
 -- END OF SCHEMA
 -- =====================================================================

@@ -114,9 +114,35 @@
 > truy cập tài liệu theo id, dù không multi-tenant.
 
 ## D. Nhóm "Báo cáo & Log chi tiết" (yêu cầu bổ sung — gom để triển khai)
+
+> 📌 **Nhóm này đã được mở rộng thành một bản mô tả yêu cầu riêng** —
+> xem `docs/UPGRADE_REQUIREMENTS.md` (đợt nâng cấp 08–11/2026, 78 yêu cầu, 10 nhóm mới).
+> Bốn mục dưới đây là bản tóm tắt ban đầu, giữ lại để truy vết nguồn gốc.
+
 1. **Structured logging** (nền tảng): log JSON có `request_id`/`job_id` tương quan; middleware log mọi
    request (method, path, status, thời gian); không lộ secret (YC-BM-03).
 2. **Model-call log** (YC-MP-06): provider/model/version/latency mỗi lần trích xuất — lưu bảng riêng.
 3. **Audit log bất biến** (YC-AU): bảng append-only, chặn UPDATE/DELETE bằng trigger + phân quyền DB.
 4. **Báo cáo/Dashboard**: throughput OCR theo thời gian, tỉ lệ thành công/thất bại, tài liệu theo chế
    độ (YC-DR-06), tỉ lệ trường bị sửa (YC-CF-07), kết xuất kiểm toán (YC-AU-05) — có xuất Excel.
+
+## E. Nhóm yêu cầu nâng cấp đợt 2 (08–11/2026) — `docs/UPGRADE_REQUIREMENTS.md`
+
+Mười họ mã mới, bổ sung (không thay thế) các họ YC ở mục A. Chi tiết từng yêu cầu, thiết kế cơ sở
+dữ liệu và tiêu chí nghiệm thu nằm trong tài liệu riêng; bảng này để tra cứu nhanh.
+
+| Họ | Nội dung | Số YC | Sprint |
+|---|---|---|---|
+| **YC-LG** | Log hệ thống có cấu trúc (JSON, `request_id`, che bí mật, dọn theo tuổi, trang xem log) | 11 | V1 |
+| **YC-AN** | Phân tích chi tiết kết quả AI (token, chi phí, từng trường, chỉ số OCR, độ chính xác vận hành) | 11 | V2 |
+| **YC-QT** | Quản trị người dùng & phân quyền (4 vai trò, phiên, chính sách mật khẩu, ba nấc bật) | 12 | V3 |
+| **YC-NK** | Nhật ký người dùng (append-only, đăng nhập, từ chối quyền, dòng thời gian tài liệu) | 9 | V4 |
+| **YC-BU** | Nạp & xử lý khối lượng lớn (lô, chống trùng, hàng đợi tin cậy, ưu tiên, thử lại) | 20 | V5–V6 |
+| **YC-DB** | Bảng điều khiển theo dõi công việc (việc của tôi, hàng đợi, lô, SLA, năng suất) | 10 | V7 |
+| **YC-RV** | Không gian duyệt tài liệu + thùng rác *(đề xuất chủ động)* | 8 | V8 |
+| **YC-TB** | Thông báo & cảnh báo *(đề xuất chủ động)* | 6 | V8 |
+| **YC-VH-07→12** | Vận hành dài hạn: sao lưu, dọn dữ liệu, CI/E2E, trợ giúp *(mở rộng họ YC-VH)* | 6 | V9 |
+| **YC-TK** | Tích hợp & tài khoản dịch vụ *(đề xuất chủ động)* | 5 | V9 |
+
+**Ba yêu cầu SRS sẵn có được đợt này mở nút** (hiện **không thể hiện thực** vì thiếu khái niệm người dùng):
+`YC-AU-02` (ghi rõ ai) · `YC-DR-04` (chỉ quản trị viên đổi độ nhạy cảm) · `YC-RG-10` (tra cứu theo phân quyền).

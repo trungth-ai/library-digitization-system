@@ -57,8 +57,34 @@ cd ui && npm run build                     # UI build (KHÔNG cần TLS flag sau
 | **Chọn công cụ tại chỗ cho GĐ1 bằng số liệu** (ollama vs vllm vs llamacpp) | server + `run_eval --providers` | 👤 bạn chạy, 🤖 đọc kết quả |
 | Bảng giấy phép (YC-PL) + video ngắt mạng + văn bản pháp lý | rà soát + quay + pháp chế | 👤 bạn |
 
+## 3b. ✅ ĐÃ VÁ BA LỖ HỔNG (01/08/2026)
+
+| # | Lỗ hổng | Bản vá | ADR | Kiểm chứng |
+|---|---|---|---|---|
+| **N-01** | Backend **không có xác thực nào**; `actor` là query param → YC-AU-02 không thỏa mãn | 4 vai trò + phiên trong PostgreSQL + ba nấc `AUTH_MODE=off→shadow→on`; `require()` trên mọi endpoint ghi; khóa sau 5 lần sai; CLI cứu hộ mật khẩu | ADR-012 | 52 pytest, gồm **KT-QT-09** quét AST bắt endpoint ghi thiếu phân quyền |
+| **N-02** | `BLPOP` làm **mất job** khi worker chết giữa lúc OCR | `BLMOVE` + danh sách đang-xử-lý + thu hồi việc mồ côi theo nhịp tim + thử lại có khoảng lùi + hàng đợi chết + 3 mức ưu tiên | ADR-011 | 47 pytest, gồm **KT-BU-15** kill worker → **0 job mất** |
+| **N-03** | Upload đồng bộ trong `async def` → **chặn event loop**, SSE đứt | Ghi theo mảnh qua thread pool + băm SHA-256 cùng lượt đọc | ADR-010 | 7 pytest, gồm test **tái hiện lỗi cũ** (bản đồng bộ = 0 nhịp) |
+
+**330 pytest PASS** (224 cũ + 106 mới) · **0 hồi quy** · UI build exit 0.
+Mặc định `AUTH_MODE=off` + `QUEUE_MODE=reliable` → cập nhật mã **không đổi hành vi** với người dùng.
+
+Ba sửa lỗi kèm theo, phát hiện trong lúc vá: CORS `allow_origins=["*"]` không dùng được cùng cookie ·
+`update_document_status` không xóa được `error_message` cũ khi thử lại thành công · mật khẩu chứa tên
+tiếng Việt **không dấu** không bị chặn.
+
+**Chưa kiểm chứng trên PostgreSQL thật** — xem `docs/PLAN.md` mục "Việc còn nợ của phần vá này".
+
 ## 4. 🚀 Bước tiếp theo cho LẦN NÂNG CẤP TIẾP THEO
-Thứ tự đề xuất (bắt đầu từ đây):
+
+> 📌 **Cập nhật 31/07/2026 — đã có kế hoạch nâng cấp đợt 2 đầy đủ.** Đọc theo thứ tự:
+> `docs/UPGRADE_REQUIREMENTS.md` (yêu cầu + 3 vấn đề nghiêm trọng phát hiện khi rà mã) →
+> `docs/UPGRADE_SPRINTS.md` (9 sprint V1–V9) → `docs/UPGRADE_TEST_CASES.md` (145 trường hợp kiểm thử).
+>
+> ✅ **Ba lỗ hổng N-01/N-02/N-03 ĐÃ VÁ** (01/08/2026) — xem mục 3b ở trên. Việc còn lại của V0:
+> chốt các quyết định `QĐ-01/02/03/04/07/08` còn treo, sao lưu + **khôi phục thử**, chuẩn bị BD-06/07/08.
+> (`QĐ-05` và `QĐ-06` đã được người phụ trách chốt ngày 31/07 — xem ADR-012.)
+
+Thứ tự đề xuất trước đây (vẫn đúng cho phần hồ sơ dự thi, chạy song song với V0–V3):
 
 1. **[Ưu tiên hồ sơ]** Deploy lên server theo `docs/DEPLOY.md` → chạy `docs/EVAL.md` lấy bảng so sánh 2 chế độ; rà giấy phép (`docs/LICENSES.md`); quay video ngắt mạng.
 2. ~~Tích hợp pipeline~~ **ĐÃ XONG** (ADR-008). Khi deploy: chạy migration 001 trước, theo dõi log
@@ -75,7 +101,11 @@ Thứ tự đề xuất (bắt đầu từ đây):
 - `docs/PLAN.md` — sprint đang chạy + việc code còn nợ.
 - `docs/PRODUCT.md` — mô tả sản phẩm + kiến trúc hai chế độ + RAG.
 - `docs/REQUIREMENTS.md` — bảng yêu cầu YC-* + chuẩn HPU.
-- `docs/ROADMAP.md` — lộ trình chia sprint (GĐ0-3).
+- `docs/ROADMAP.md` — lộ trình chia sprint (GĐ0-3 + GĐ2B nhánh nâng cấp).
+- `docs/UPGRADE_REQUIREMENTS.md` — **yêu cầu nâng cấp đợt 2** (log, AI analytics, khối lượng lớn,
+  dashboard, phân quyền, nhật ký người dùng + 4 nhóm đề xuất). Có mục "3 vấn đề nghiêm trọng".
+- `docs/UPGRADE_SPRINTS.md` — 9 sprint V1–V9: việc, DoD, van lùi, cổng đi tiếp, thứ tự cắt phạm vi.
+- `docs/UPGRADE_TEST_CASES.md` — 145 trường hợp kiểm thử + ma trận truy vết YC ↔ KT ↔ Sprint.
 - `docs/DECISIONS.md` — ADR-001..009 (quyết định kiến trúc).
 - `docs/DEPLOY.md` — hướng dẫn triển khai + checklist.
 - `docs/LOCAL_MODE.md` — chọn/bật công cụ mô hình (Ollama, vLLM, llama.cpp...) + kiểm chứng ngắt mạng.

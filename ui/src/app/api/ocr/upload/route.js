@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { apiBase } from '@/lib/api';
+import { apiBase, forwardHeaders } from '@/lib/api';
 
 export const runtime = 'nodejs';
 
@@ -26,6 +26,7 @@ export async function POST(req) {
     const res = await fetch(`${ocrApiUrl}/api/v1/process`, {
       method: 'POST',
       body: uploadFormData,
+      headers: await forwardHeaders(),
     });
 
     if (!res.ok) {

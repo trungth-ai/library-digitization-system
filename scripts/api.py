@@ -17,17 +17,27 @@ import zipfile
 import io
 
 import redis
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Query
+from fastapi import Depends, FastAPI, UploadFile, File, Form, HTTPException, Request, Query, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 import scripts.db as db
 from scripts.sse import job_event_stream
 
 # Module GĐ1-2 + envelope HPU (endpoints MỚI dùng envelope; route cũ giữ nguyên — ADR-003)
-from scripts.core import reports, audit, schema_store, provider_view
+from scripts.core import reports, audit, schema_store, provider_view, uploads, analytics
+from scripts.core import queue as jobqueue
+from scripts.core import users as user_store
+from scripts.core import user_log
 from scripts.core.responses import success, error as err_envelope
+
+# Danh tính & phân quyền (ADR-012). `require(...)` cưỡng chế ở MÁY CHỦ; ẩn nút trên giao diện chỉ là
+# tiện ích. Ba nấc AUTH_MODE quyết định có chặn hay không — xem scripts/auth/deps.py.
+from scripts.auth import bootstrap, local as auth_local, policy, sessions
+from scripts.auth.deps import Principal, current_principal, require, require_authenticated
+from scripts.middleware.request_log import RequestContextMiddleware
 
 
 # ---------------------------------------------------------------------
@@ -39,15 +49,19 @@ REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_QUEUE = "digitization_jobs"
 
+# Kích thước mảnh khi ghi tệp tải lên (ADR-010). Đủ nhỏ để event loop mượt, đủ lớn để không tạo quá
+# nhiều lượt chuyển thread. Đổi được khi đĩa/hạ tầng khác nhau, không phải sửa mã.
+UPLOAD_CHUNK_SIZE = int(float(os.getenv("UPLOAD_CHUNK_MB", "1")) * 1024 * 1024)
+
 # ---------------------------------------------------------------------
 # LOGGING
 # ---------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger("library-api")
+# Log JSON có cấu trúc + che bí mật + request_id (sprint V1). Van lùi `LOG_FORMAT=text` khôi phục
+# đúng định dạng chữ thuần trước đây. Bộ lọc che khóa API/mật khẩu chạy ở MỌI chế độ (YC-BM-03).
+from scripts.core import logging_setup   # noqa: E402 - phải cấu hình log trước khi có logger nào
+
+logger = logging_setup.configure("api")
 
 # ---------------------------------------------------------------------
 # MODELS
@@ -91,13 +105,25 @@ app = FastAPI(
     description="FastAPI + PostgreSQL + SSE"
 )
 
+# CORS: `allow_origins=["*"]` KHÔNG dùng được cùng `allow_credentials=True` — trình duyệt từ chối
+# gửi cookie tới nguồn dùng ký tự thay thế, nên khi bật xác thực bằng cookie thì cấu hình cũ sẽ làm
+# đăng nhập không hoạt động. Giao diện đã gọi API qua proxy same-origin (commit 440f550) nên mặc định
+# không cần mở nguồn nào; đặt `CORS_ORIGINS` (phân tách bằng dấu phẩy) nếu có client khác nguồn.
+# Gắn TRƯỚC CORS: middleware của Starlette chạy theo thứ tự ngược lại khi thêm, nên đặt ở đây thì
+# lớp ghi log bao ngoài cùng và ghi được cả những request bị CORS từ chối.
+app.add_middleware(RequestContextMiddleware)
+
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+if not _cors_origins:
+    logger.info("CORS: không mở nguồn ngoài (giao diện dùng proxy same-origin). "
+                "Đặt CORS_ORIGINS nếu cần client khác nguồn.")
 
 # ---------------------------------------------------------------------
 # STARTUP / SHUTDOWN
@@ -108,6 +134,20 @@ async def startup():
     # API chạy 2 uvicorn workers → pool cần đủ cho cả hai
     db.init_pool(min_conn=2, max_conn=10)
     logger.info("DB pool initialized")
+
+    # Nấc xác thực hiện tại — ghi rõ ra log vì đây là thông tin vận hành quan trọng nhất khi gỡ lỗi
+    # "vì sao gọi API không cần đăng nhập" hoặc "vì sao bị 401" (ADR-012).
+    auth_mode = policy.resolve_auth_mode()
+    if auth_mode == policy.AUTH_OFF:
+        logger.warning("AUTH_MODE=off — API KHÔNG yêu cầu xác thực (hành vi như trước ADR-012). "
+                       "Chuyển sang 'shadow' khi đã tạo tài khoản và tập huấn xong.")
+    elif auth_mode == policy.AUTH_SHADOW:
+        logger.warning("AUTH_MODE=shadow — vẫn phục vụ request thiếu xác thực nhưng CÓ GHI NHẬN. "
+                       "Theo dõi sự kiện kind='auth_missing'; chỉ bật 'on' khi 48 giờ liền không có.")
+    else:
+        logger.info("AUTH_MODE=on — bắt buộc đăng nhập. Van lùi: đặt lại AUTH_MODE=shadow.")
+
+    bootstrap.ensure_admin()
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -140,12 +180,44 @@ def create_job_dirs(job_id: str) -> dict:
 
 
 def save_upload_file(upload_file: UploadFile, destination: Path):
+    """
+    ⚠️ ĐỒNG BỘ — chỉ dùng ngoài ngữ cảnh async (CLI, script, test).
+
+    Trong endpoint `async def` PHẢI dùng `save_upload_stream()`: hàm này chặn event loop suốt thời
+    gian ghi đĩa (xem ADR-010). Giữ lại để không phá nơi gọi cũ, không xóa.
+    """
     with destination.open("wb") as buffer:
         shutil.copyfileobj(upload_file.file, buffer)
 
 
-def enqueue_job(job_id: str, filename: str, payload: dict):
-    """Ghi Redis hash + đẩy vào queue + tạo document trong DB"""
+async def save_upload_stream(upload_file: UploadFile, destination: Path) -> tuple:
+    """
+    Ghi tệp tải lên KHÔNG chặn event loop, băm SHA-256 trong cùng lượt đọc (ADR-010).
+
+    Logic nằm ở `scripts/core/uploads.py` để kiểm thử được mà không cần fastapi/redis; ở đây chỉ tiêm
+    `run_in_threadpool` của Starlette vào — dùng thread pool CÓ GIỚI HẠN của web server thay vì
+    executor mặc định, để nhiều người tải lên cùng lúc không sinh thread vô hạn.
+
+    Trả về: `(sha256_hex, so_byte)`.
+    """
+    result = await uploads.save_stream(
+        read=upload_file.read,
+        destination=destination,
+        chunk_size=UPLOAD_CHUNK_SIZE,
+        offload=run_in_threadpool,
+    )
+    return result.sha256, result.size_bytes
+
+
+def enqueue_job(job_id: str, filename: str, payload: dict,
+                priority: str = jobqueue.PRIORITY_NORMAL):
+    """
+    Ghi Redis hash + đẩy vào queue + tạo document trong DB.
+
+    Đẩy qua `scripts.core.queue.push` để dùng đúng khóa theo mức ưu tiên (ADR-011). Mức `normal` là
+    CHÍNH khóa `digitization_jobs` đang dùng, nên hành vi mặc định không đổi — chỉ khác là `LPUSH`
+    thay `RPUSH` để khớp chiều nhận từ bên phải của `BLMOVE` (vẫn là FIFO).
+    """
     redis_client.hset(
         f"job:{job_id}",
         mapping={
@@ -155,7 +227,7 @@ def enqueue_job(job_id: str, filename: str, payload: dict):
             "progress":   "10",
         },
     )
-    redis_client.rpush(REDIS_QUEUE, json.dumps(payload))
+    jobqueue.push(redis_client, REDIS_QUEUE, payload, priority=priority)
 
     # Tạo document trong DB
     db.create_document(
@@ -200,6 +272,387 @@ async def health():
 
 
 # ---------------------------------------------------------------------
+# ROUTES - XÁC THỰC (ADR-012)
+# ---------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class CreateUserRequest(BaseModel):
+    username:  str
+    full_name: str
+    password:  str
+    role:      str
+    email:     Optional[str] = None
+
+
+class UpdateUserRequest(BaseModel):
+    full_name: Optional[str] = None
+    email:     Optional[str] = None
+    role:      Optional[str] = None
+    status:    Optional[str] = None
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    """
+    Đặt cookie phiên. `HttpOnly` để JavaScript không đọc được (chống XSS lấy phiên);
+    `SameSite=Lax` chống CSRF cho thao tác nguy hiểm mà vẫn cho điều hướng thường hoạt động.
+
+    `Secure` bật theo `SESSION_COOKIE_SECURE` — mặc định TẮT vì hệ đang chạy HTTP nội bộ; bật khi đã
+    có HTTPS. Mặc định bật sẽ làm đăng nhập im lặng không hoạt động trên HTTP, một lỗi rất khó lần ra.
+    """
+    secure = os.getenv("SESSION_COOKIE_SECURE", "0").strip() not in ("0", "false", "no", "")
+    response.set_cookie(
+        key=sessions.SESSION_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+        max_age=sessions.SESSION_TTL_HOURS * 3600,
+        path="/",
+    )
+
+
+@app.post("/api/v2/auth/login")
+async def api_login(payload: LoginRequest, request: Request, response: Response):
+    """
+    Đăng nhập vào DocuFlow.
+
+    ⚠️ KHÁC HOÀN TOÀN với `/api/dspace/login` của giao diện — đó là đăng nhập vào DSpace. Hai hệ
+    thống, hai bộ tài khoản; trộn lẫn sẽ làm cán bộ nhầm mật khẩu nào dùng ở đâu (ADR-012).
+    """
+    client_ip = request.client.host if request.client else None
+    outcome = auth_local.get_backend()(payload.username, payload.password, ip=client_ip)
+
+    if not outcome.ok:
+        # Ghi vào nhật ký NGƯỜI DÙNG, không vào `audit_log`: đăng nhập sai là hành vi truy cập, không
+        # phải thao tác nghiệp vụ trên tài liệu. Trộn vào audit sẽ làm nhật ký kiểm toán ngập những
+        # lần gõ nhầm mật khẩu (xem migration 004).
+        user_log.log_activity(
+            action=(user_log.ACTION_LOCKED if outcome.reason == "locked"
+                    else user_log.ACTION_LOGIN_FAILED),
+            username=payload.username, ip=client_ip,
+            user_agent=request.headers.get("user-agent"),
+            result=user_log.RESULT_FAILED, detail={"reason": outcome.reason},
+        )
+        # 401 cho mọi lý do: mã lý do nằm trong body để giao diện hiển thị đúng thông báo tiếng Việt
+        return JSONResponse(status_code=401, content=err_envelope(
+            outcome.message, code=(outcome.reason or "UNAUTHORIZED").upper()))
+
+    token = sessions.create_session(
+        outcome.user["id"], ip=client_ip,
+        user_agent=request.headers.get("user-agent"),
+    )
+    _set_session_cookie(response, token)
+    user_log.log_activity(
+        action=user_log.ACTION_LOGIN, username=outcome.user["username"],
+        user_id=outcome.user["id"], ip=client_ip,
+        user_agent=request.headers.get("user-agent"),
+    )
+
+    return success({
+        "user": {
+            "user_id": outcome.user["id"],
+            "username": outcome.user["username"],
+            "full_name": outcome.user["full_name"],
+            "role": outcome.user["role"],
+            "role_label": policy.ROLE_LABELS.get(outcome.user["role"], outcome.user["role"]),
+            "permissions": sorted(user_store.get_role_permissions(outcome.user["role"])),
+            "must_change_password": outcome.must_change_password,
+        },
+    }, "Đăng nhập thành công")
+
+
+@app.post("/api/v2/auth/logout")
+async def api_logout(request: Request, response: Response):
+    """Đăng xuất: thu hồi phiên ở máy chủ VÀ xóa cookie. Chỉ xóa cookie là chưa thu hồi được phiên."""
+    token = request.cookies.get(sessions.SESSION_COOKIE_NAME)
+    actor = policy.LEGACY_ACTOR
+    if token:
+        row = sessions.resolve_session(token)
+        if row:
+            actor = row["username"]
+        sessions.revoke_session(token)
+
+    response.delete_cookie(sessions.SESSION_COOKIE_NAME, path="/")
+    user_log.log_activity(action=user_log.ACTION_LOGOUT, username=actor,
+                          ip=request.client.host if request.client else None)
+    return success(None, "Đã đăng xuất")
+
+
+@app.get("/api/v2/auth/me")
+async def api_me(principal: Principal = Depends(current_principal)):
+    """
+    Ai đang đăng nhập + có những quyền gì. Giao diện dùng để ẩn/hiện menu.
+
+    KHÔNG chặn: ở nấc off/shadow trả về chủ thể "(chưa xác thực)" để giao diện cũ vẫn chạy được.
+    """
+    return success({**principal.as_dict(), "auth_mode": policy.resolve_auth_mode()},
+                   "Thông tin phiên hiện tại")
+
+
+@app.post("/api/v2/auth/change-password")
+async def api_change_password(payload: ChangePasswordRequest, request: Request,
+                              principal: Principal = Depends(require_authenticated())):
+    """
+    Tự đổi mật khẩu. Bắt buộc nhập mật khẩu HIỆN TẠI — nếu không, ai chiếm được phiên sẽ đổi được
+    mật khẩu và chiếm luôn tài khoản.
+    """
+    if not principal.is_authenticated:
+        return JSONResponse(status_code=401, content=err_envelope(
+            "Bạn cần đăng nhập để đổi mật khẩu", code="UNAUTHORIZED"))
+
+    check = auth_local.authenticate(principal.username, payload.current_password,
+                                    ip=request.client.host if request.client else None)
+    if not check.ok:
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Mật khẩu hiện tại không đúng", code="BAD_CURRENT_PASSWORD"))
+
+    try:
+        user_store.set_password(principal.user_id, payload.new_password, must_change=False)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content=err_envelope(
+            str(e), code="WEAK_PASSWORD"))
+
+    audit.log_action(action="password_change", actor=principal.actor)
+    # `set_password` đã thu hồi mọi phiên (kể cả phiên hiện tại) → giao diện phải đăng nhập lại
+    return success({"must_login_again": True},
+                   "Đã đổi mật khẩu. Vui lòng đăng nhập lại.")
+
+
+# ---------------------------------------------------------------------
+# ROUTES - QUẢN TRỊ NGƯỜI DÙNG (YC-QT-07)
+# ---------------------------------------------------------------------
+
+@app.get("/api/v2/users")
+async def api_list_users(status: Optional[str] = Query(None), role: Optional[str] = Query(None),
+                         page: int = Query(1, ge=1), per_page: int = Query(50, ge=1, le=200),
+                         principal: Principal = Depends(require(policy.USER_MANAGE))):
+    rows = user_store.list_users(status=status, role=role,
+                                 limit=per_page, offset=(page - 1) * per_page)
+    for r in rows:
+        for field in ("created_at", "updated_at", "last_login_at", "locked_until"):
+            if r.get(field):
+                r[field] = r[field].isoformat()
+    return success(rows, f"{len(rows)} người dùng")
+
+
+@app.get("/api/v2/roles")
+async def api_list_roles(principal: Principal = Depends(require(policy.USER_MANAGE))):
+    """Vai trò + quyền, kèm nhãn tiếng Việt để người cấp quyền không phải đọc mã quyền."""
+    try:
+        roles = user_store.list_roles()
+    except Exception as e:  # noqa: BLE001 - bảng chưa di trú thì lùi về bảng trong mã
+        logger.warning("Không đọc được vai trò từ DB (%s) → dùng bảng trong mã", e)
+        roles = [{"code": code, "label": policy.ROLE_LABELS.get(code, code),
+                  "permissions": sorted(policy.permissions_for_role(code)), "is_system": True}
+                 for code in policy.ALL_ROLES]
+
+    return success({"roles": roles, "permission_labels": policy.PERMISSION_LABELS}, "Vai trò & quyền")
+
+
+@app.post("/api/v2/users")
+async def api_create_user(payload: CreateUserRequest,
+                          principal: Principal = Depends(require(policy.USER_MANAGE))):
+    try:
+        user = user_store.create_user(
+            username=payload.username, full_name=payload.full_name,
+            password=payload.password, role=payload.role, email=payload.email,
+            must_change_password=True, created_by=principal.user_id,
+        )
+    except ValueError as e:
+        return JSONResponse(status_code=400, content=err_envelope(str(e), code="INVALID_INPUT"))
+    except Exception as e:  # noqa: BLE001 - trùng tên đăng nhập là ca phổ biến nhất
+        logger.warning("Không tạo được người dùng: %s", e)
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Không tạo được người dùng — có thể tên đăng nhập đã tồn tại",
+            code="CREATE_FAILED"))
+
+    audit.log_action(action="user_create", actor=principal.actor,
+                     detail={"target_user": payload.username, "role": payload.role})
+    return success({"user_id": user["id"], "username": user["username"]},
+                   f"Đã tạo người dùng '{user['username']}'. Người dùng phải đổi mật khẩu khi đăng nhập.")
+
+
+@app.put("/api/v2/users/{user_id}")
+async def api_update_user(user_id: int, payload: UpdateUserRequest,
+                          principal: Principal = Depends(require(policy.USER_MANAGE))):
+    before = user_store.get_user(user_id)
+    if not before:
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy người dùng", code="NOT_FOUND"))
+
+    # Chốt tự bảo vệ: không cho quản trị viên tự hạ quyền/vô hiệu hóa chính mình. Đây là cách phổ biến
+    # nhất để một hệ thống mất hết quản trị viên, và không có đường quay lại qua giao diện.
+    if principal.user_id == user_id and (payload.role or payload.status):
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Không thể tự đổi vai trò hoặc tự vô hiệu hóa tài khoản của mình. "
+            "Hãy nhờ một quản trị viên khác thực hiện.", code="SELF_MODIFY_DENIED"))
+
+    try:
+        after = user_store.update_user(user_id, full_name=payload.full_name, email=payload.email,
+                                       role=payload.role, status=payload.status)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content=err_envelope(str(e), code="INVALID_INPUT"))
+
+    for field in ("role", "status", "full_name", "email"):
+        old, new = before.get(field), (after or {}).get(field)
+        if getattr(payload, field, None) is not None and old != new:
+            audit.log_action(action="user_update", actor=principal.actor,
+                             field_key=field, old_value=str(old), new_value=str(new),
+                             detail={"target_user": before["username"]})
+
+    return success({"user_id": user_id}, "Đã cập nhật người dùng")
+
+
+@app.post("/api/v2/users/{user_id}/reset-password")
+async def api_admin_reset_password(user_id: int,
+                                   principal: Principal = Depends(require(policy.USER_MANAGE))):
+    """
+    Quản trị viên đặt lại mật khẩu: sinh mật khẩu tạm, buộc người dùng đổi khi đăng nhập.
+
+    Trả mật khẩu tạm MỘT LẦN trong phản hồi — quản trị viên đọc cho người dùng. Không gửi email vì
+    hệ thống phải chạy được khi ngắt Internet (YC-BM-02).
+    """
+    from scripts.core import passwords
+
+    user = user_store.get_user(user_id)
+    if not user:
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy người dùng", code="NOT_FOUND"))
+
+    temp_password = passwords.generate_password()
+    try:
+        user_store.set_password(user_id, temp_password, must_change=True)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content=err_envelope(str(e), code="WEAK_PASSWORD"))
+
+    user_store.unlock_user(user_id)
+    audit.log_action(action="password_reset", actor=principal.actor,
+                     detail={"target_user": user["username"]})
+
+    return success({"temp_password": temp_password, "username": user["username"]},
+                   "Đã đặt lại mật khẩu. Mật khẩu tạm chỉ hiện MỘT LẦN — hãy chuyển cho người dùng.")
+
+
+@app.post("/api/v2/users/{user_id}/unlock")
+async def api_unlock_user(user_id: int,
+                          principal: Principal = Depends(require(policy.USER_MANAGE))):
+    user = user_store.get_user(user_id)
+    if not user:
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy người dùng", code="NOT_FOUND"))
+
+    user_store.unlock_user(user_id)
+    audit.log_action(action="user_unlock", actor=principal.actor,
+                     detail={"target_user": user["username"]})
+    return success({"user_id": user_id}, f"Đã mở khóa '{user['username']}'")
+
+
+@app.delete("/api/v2/users/{user_id}")
+async def api_delete_user(user_id: int,
+                          principal: Principal = Depends(require(policy.USER_MANAGE))):
+    """
+    Vô hiệu hóa người dùng bằng XÓA MỀM (YC-QT-08).
+
+    Không xóa cứng: `audit_log` tham chiếu tới người này, và nhật ký kiểm toán phải truy được trách
+    nhiệm kể cả với người đã rời cơ quan.
+    """
+    if principal.user_id == user_id:
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Không thể tự xóa tài khoản của mình", code="SELF_DELETE_DENIED"))
+
+    user = user_store.get_user(user_id)
+    if not user:
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy người dùng", code="NOT_FOUND"))
+
+    user_store.soft_delete_user(user_id)
+    audit.log_action(action="user_delete", actor=principal.actor,
+                     detail={"target_user": user["username"], "soft_delete": True})
+    return success({"user_id": user_id},
+                   f"Đã vô hiệu hóa '{user['username']}'. Nhật ký của người này vẫn được giữ.")
+
+
+@app.get("/api/v2/user-activity")
+async def api_user_activity(
+    username:  Optional[str] = Query(None),
+    action:    Optional[str] = Query(None),
+    result:    Optional[str] = Query(None, description="ok | denied | failed"),
+    ip:        Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    page:      int           = Query(1, ge=1),
+    per_page:  int           = Query(100, ge=1, le=1000),
+    principal: Principal     = Depends(require(policy.AUDIT_READ)),
+):
+    """
+    Nhật ký hành vi người dùng (YC-NK-05): đăng nhập, đăng xuất, sai mật khẩu, **bị từ chối quyền**,
+    tải tệp, kết xuất báo cáo.
+
+    Khác `/api/v2/audit` (thao tác nghiệp vụ trên tài liệu) — xem migration 004 để biết vì sao tách.
+    """
+    rows = user_log.list_activity(
+        username=username, action=action, result=result, ip=ip,
+        date_from=date_from, date_to=date_to,
+        limit=per_page, offset=(page - 1) * per_page,
+    )
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+    return success(rows, f"{len(rows)} bản ghi hoạt động")
+
+
+@app.get("/api/v2/jobs/{job_id}/timeline")
+async def api_document_timeline(job_id: str,
+                                principal: Principal = Depends(require(policy.AUDIT_READ))):
+    """
+    Dòng thời gian đầy đủ của một tài liệu (YC-NK-07): gộp nhật ký kiểm toán + hành vi người dùng +
+    lượt gọi model + lượt OCR thành MỘT danh sách theo thời gian.
+
+    Trả lời trong một màn hình: tài liệu này đã qua tay ai, model nào trích, ai sửa trường gì, ai duyệt.
+    """
+    rows = user_log.document_timeline(job_id)
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+    return success(rows, f"{len(rows)} sự kiện trong vòng đời tài liệu")
+
+
+@app.get("/api/v2/sessions")
+async def api_list_sessions(user_id: Optional[int] = Query(None),
+                            principal: Principal = Depends(require(policy.USER_MANAGE))):
+    """Phiên đang hoạt động — để thấy ai đang đăng nhập, từ IP nào."""
+    rows = sessions.list_sessions(user_id=user_id)
+    for r in rows:
+        for field in ("created_at", "last_seen_at", "expires_at"):
+            if r.get(field):
+                r[field] = r[field].isoformat()
+    return success(rows, f"{len(rows)} phiên đang hoạt động")
+
+
+@app.delete("/api/v2/sessions/{session_ref}")
+async def api_revoke_session(session_ref: str,
+                             principal: Principal = Depends(require(policy.USER_MANAGE))):
+    """Thu hồi một phiên — có hiệu lực NGAY ở request kế tiếp của người đó (YC-QT-02)."""
+    count = sessions.revoke_by_ref(session_ref)
+    if not count:
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy phiên đang hoạt động này", code="NOT_FOUND"))
+
+    audit.log_action(action="session_revoke", actor=principal.actor,
+                     detail={"session_ref": session_ref})
+    return success({"revoked": count}, "Đã thu hồi phiên")
+
+
+# ---------------------------------------------------------------------
 # ROUTES - UPLOAD
 # ---------------------------------------------------------------------
 
@@ -210,6 +663,7 @@ async def process_document(
     collection: str = Form("default"),
     language:   str = Form("vie"),
     doc_type:   str = Form("book"),
+    principal:  Principal = Depends(require(policy.DOCUMENT_UPLOAD)),
 ):
     """Single file upload"""
     if not file.filename.endswith(".pdf"):
@@ -222,11 +676,15 @@ async def process_document(
     input_file_path = paths["input_dir"] / file.filename
 
     try:
-        save_upload_file(file, input_file_path)
+        # ADR-010: ghi theo mảnh, không chặn event loop; băm luôn trong cùng lượt đọc
+        file_hash, file_size = await save_upload_stream(file, input_file_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to save file") from e
     finally:
         await file.close()
+
+    logger.info("Job %s: đã nhận '%s' (%.1f MB, sha256=%s)",
+                job_id, file.filename, file_size / 1024 / 1024, file_hash[:12])
 
     job_payload = {
         "job_id":        job_id,
@@ -236,6 +694,8 @@ async def process_document(
         "collection_id": collection,
         "language":      language,
         "document_type": doc_type,
+        "file_hash":     file_hash,
+        "file_size":     file_size,
     }
 
     try:
@@ -261,6 +721,7 @@ async def batch_upload(
     collection: str = Form("default"),
     language:   str = Form("vie"),
     doc_type:   str = Form("book"),
+    principal:  Principal = Depends(require(policy.DOCUMENT_UPLOAD)),
 ):
     """Batch upload (max 10 files)"""
     if len(files) > 10:
@@ -277,7 +738,9 @@ async def batch_upload(
         input_file_path = paths["input_dir"] / file.filename
 
         try:
-            save_upload_file(file, input_file_path)
+            # ADR-010: ghi theo mảnh — quan trọng hơn ở đây vì batch ghi tối đa 10 tệp TRONG MỘT
+            # request, nên hiệu ứng chặn event loop cộng dồn
+            file_hash, file_size = await save_upload_stream(file, input_file_path)
         except Exception:
             logger.exception(f"Failed to save {file.filename}")
             continue
@@ -292,6 +755,8 @@ async def batch_upload(
             "collection_id": collection,
             "language":      language,
             "document_type": doc_type,
+            "file_hash":     file_hash,
+            "file_size":     file_size,
         }
 
         try:
@@ -305,6 +770,338 @@ async def batch_upload(
         jobs=jobs, total=len(jobs),
         message=f"Successfully queued {len(jobs)} jobs"
     )
+
+
+# ---------------------------------------------------------------------
+# ROUTES - NẠP THEO LÔ (YC-BU, sprint V5)
+# ---------------------------------------------------------------------
+
+class BatchStatusUpdate(BaseModel):
+    status: str      # running | paused | cancelled
+
+
+@app.post("/api/v2/batches")
+async def create_batch_upload(
+    request:    Request,
+    files:      List[UploadFile] = File(...),
+    name:       str = Form(""),
+    collection: str = Form("default"),
+    language:   str = Form("vie"),
+    doc_type:   str = Form("book"),
+    priority:   str = Form("normal"),
+    principal:  Principal = Depends(require(policy.DOCUMENT_UPLOAD)),
+):
+    """
+    Nạp nhiều tệp thành MỘT LÔ theo dõi được (YC-BU-02/03/04).
+
+    Khác `/api/v2/batch-upload` cũ (trần cứng 10 tệp, không có khái niệm lô): endpoint này nhận tới
+    `MAX_BATCH_FILES` tệp, chống trùng bằng SHA-256, kiểm tệp thật sự là PDF, và trả về danh sách
+    tệp bị bỏ qua **kèm lý do từng tệp** — nạp 500 tệp mà chỉ báo "30 tệp lỗi" là vô dụng.
+
+    Endpoint cũ **giữ nguyên**, không đụng tới (ADR-003).
+    """
+    from scripts.core import batches, file_check
+
+    # Kiểm đĩa TRƯỚC khi ghi byte nào: đĩa đầy giữa lô lớn làm cả hệ thống hỏng khó gỡ
+    disk = file_check.check_disk_space(str(BASE_DIR))
+    if not disk.ok:
+        db.log_system_event(source="api", kind="disk_low", level="error", message=disk.reason)
+        return JSONResponse(status_code=507, content=err_envelope(disk.reason, code=disk.code))
+
+    # Kiểm soát tải (YC-BU-17): từ chối MỀM khi hàng đợi đã quá sâu. Trả 429 chứ không phải lỗi —
+    # đây là "hãy thử lại sau", không phải "yêu cầu của bạn sai".
+    can_accept, queue_reason = jobqueue.check_capacity(redis_client, REDIS_QUEUE)
+    if not can_accept:
+        db.log_system_event(source="api", kind="queue_full", level="warning", message=queue_reason)
+        return JSONResponse(status_code=429, content=err_envelope(
+            queue_reason, code="QUEUE_FULL"))
+
+    limits = file_check.check_batch_limits(len(files), 0)
+    if not limits.ok:
+        return JSONResponse(status_code=400, content=err_envelope(limits.reason, code=limits.code))
+
+    batch_name = name.strip() or f"Lô ngày {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    batch_id = batches.create_batch(
+        name=batch_name, source=batches.SOURCE_WEB, created_by=principal.user_id,
+        priority=priority if priority in jobqueue.PRIORITIES else "normal",
+    )
+
+    dedup_mode = os.getenv("DEDUP_MODE", batches.DEDUP_SKIP).strip().lower()
+    accepted, skipped = [], []
+    total_bytes = 0
+
+    for file in files:
+        name_check = file_check.check_filename(file.filename or "")
+        if not name_check.ok:
+            skipped.append({"filename": file.filename, "ly_do": name_check.reason,
+                            "code": name_check.code})
+            await file.close()
+            continue
+
+        job_id = str(uuid.uuid4())
+        paths = create_job_dirs(job_id)
+        input_file_path = paths["input_dir"] / file.filename
+
+        try:
+            file_hash, file_size = await save_upload_stream(file, input_file_path)
+        except Exception:
+            logger.exception("Không ghi được '%s'", file.filename)
+            skipped.append({"filename": file.filename, "ly_do": "Không ghi được tệp xuống đĩa",
+                            "code": "write_failed"})
+            continue
+        finally:
+            await file.close()
+
+        content_check = file_check.check_pdf_content(input_file_path, expected_size=file_size)
+        if not content_check.ok:
+            skipped.append({"filename": file.filename, "ly_do": content_check.reason,
+                            "code": content_check.code})
+            shutil.rmtree(paths["job_dir"], ignore_errors=True)   # không giữ tệp không dùng được
+            continue
+
+        if dedup_mode != batches.DEDUP_REPROCESS:
+            existing = batches.find_by_hash(file_hash)
+            if existing:
+                skipped.append({
+                    "filename": file.filename, "code": "duplicate",
+                    "ly_do": f"Trùng nội dung với tài liệu đã có: '{existing['filename']}'",
+                    "trung_voi": existing["id"],
+                })
+                shutil.rmtree(paths["job_dir"], ignore_errors=True)
+                continue
+
+        total_bytes += file_size
+        job_payload = {
+            "job_id": job_id, "filename": file.filename,
+            "input_file": str(input_file_path), "output_dir": str(paths["output_dir"]),
+            "collection_id": collection, "language": language, "document_type": doc_type,
+            "file_hash": file_hash, "file_size": file_size, "batch_id": batch_id,
+        }
+
+        try:
+            enqueue_job(job_id, file.filename, job_payload,
+                        priority=priority if priority in jobqueue.PRIORITIES else "normal")
+            db.set_document_batch_info(job_id, batch_id=batch_id, file_hash=file_hash,
+                                       file_size=file_size, uploaded_by=principal.user_id,
+                                       priority=priority)
+            accepted.append({"job_id": job_id, "filename": file.filename})
+        except Exception:
+            logger.exception("Không đưa được '%s' vào hàng đợi", file.filename)
+            skipped.append({"filename": file.filename, "ly_do": "Không đưa được vào hàng đợi",
+                            "code": "enqueue_failed"})
+
+    batches.bump_counters(batch_id, total=len(accepted), skipped=len(skipped))
+    audit.log_action(action="batch_upload", actor=principal.actor,
+                     detail={"batch_id": batch_id, "accepted": len(accepted),
+                             "skipped": len(skipped), "bytes": total_bytes})
+
+    return success(
+        {"batch_id": batch_id, "name": batch_name,
+         "da_nhan": accepted, "bo_qua": skipped,
+         "so_da_nhan": len(accepted), "so_bo_qua": len(skipped)},
+        f"Đã nhận {len(accepted)} tệp vào lô '{batch_name}'"
+        + (f", bỏ qua {len(skipped)} tệp" if skipped else ""),
+    )
+
+
+@app.post("/api/v2/batches/zip")
+async def create_batch_from_zip(
+    request:    Request,
+    file:       UploadFile = File(...),
+    name:       str = Form(""),
+    collection: str = Form("default"),
+    language:   str = Form("vie"),
+    doc_type:   str = Form("book"),
+    priority:   str = Form("low"),
+    principal:  Principal = Depends(require(policy.DOCUMENT_UPLOAD)),
+):
+    """
+    Nạp một lô từ tệp ZIP (YC-BU-07).
+
+    Mặc định ưu tiên `low`: lô ZIP thường là mẻ lớn chạy nền, không nên chen trước tài liệu lẻ mà
+    cán bộ đang ngồi chờ (ADR-011).
+
+    Tệp nén được kiểm **trên siêu dữ liệu trước khi giải nén** — chống zip bomb và zip-slip
+    (xem `scripts/core/ingest_zip.py`).
+    """
+    from scripts.core import batches, file_check, ingest_zip
+
+    disk = file_check.check_disk_space(str(BASE_DIR))
+    if not disk.ok:
+        return JSONResponse(status_code=507, content=err_envelope(disk.reason, code=disk.code))
+
+    can_accept, queue_reason = jobqueue.check_capacity(redis_client, REDIS_QUEUE)
+    if not can_accept:
+        return JSONResponse(status_code=429, content=err_envelope(queue_reason, code="QUEUE_FULL"))
+
+    if not (file.filename or "").lower().endswith(".zip"):
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Chỉ nhận tệp .zip ở đường nạp này", code="not_zip"))
+
+    # Ghi tệp nén vào thư mục tạm riêng của lô — dọn sạch sau khi giải nén xong
+    staging = BASE_DIR / "_zip_staging" / uuid.uuid4().hex
+    staging.mkdir(parents=True, exist_ok=True)
+    zip_path = staging / "upload.zip"
+
+    try:
+        await save_upload_stream(file, zip_path)
+    except Exception:
+        logger.exception("Không ghi được tệp nén")
+        shutil.rmtree(staging, ignore_errors=True)
+        return JSONResponse(status_code=500, content=err_envelope(
+            "Không ghi được tệp nén xuống đĩa", code="write_failed"))
+    finally:
+        await file.close()
+
+    extracted = await run_in_threadpool(ingest_zip.extract_pdfs, zip_path, staging / "files")
+    if not extracted.ok:
+        shutil.rmtree(staging, ignore_errors=True)
+        return JSONResponse(status_code=400, content=err_envelope(
+            extracted.error, code="invalid_zip"))
+
+    batch_name = name.strip() or f"Lô từ {file.filename}"
+    batch_id = batches.create_batch(
+        name=batch_name, source=batches.SOURCE_ZIP, created_by=principal.user_id,
+        priority=priority if priority in jobqueue.PRIORITIES else "low",
+    )
+
+    dedup_mode = os.getenv("DEDUP_MODE", batches.DEDUP_SKIP).strip().lower()
+    accepted = []
+    skipped = list(extracted.skipped)
+
+    for entry in extracted.entries:
+        file_hash = uploads.hash_file(entry.path)
+
+        if dedup_mode != batches.DEDUP_REPROCESS:
+            existing = batches.find_by_hash(file_hash)
+            if existing:
+                skipped.append({"filename": entry.filename, "code": "duplicate",
+                                "ly_do": f"Trùng nội dung với '{existing['filename']}'",
+                                "trung_voi": existing["id"]})
+                continue
+
+        job_id = str(uuid.uuid4())
+        paths = create_job_dirs(job_id)
+        target = paths["input_dir"] / entry.filename
+        try:
+            await run_in_threadpool(shutil.move, str(entry.path), str(target))
+        except Exception:
+            logger.exception("Không chuyển được '%s' vào thư mục job", entry.filename)
+            skipped.append({"filename": entry.filename, "code": "move_failed",
+                            "ly_do": "Không chuyển được tệp vào thư mục xử lý"})
+            continue
+
+        job_payload = {
+            "job_id": job_id, "filename": entry.filename,
+            "input_file": str(target), "output_dir": str(paths["output_dir"]),
+            # Thư mục trong ZIP là GỢI Ý bộ sưu tập; con người vẫn quyết định (nguyên tắc SRS)
+            "collection_id": collection, "language": language, "document_type": doc_type,
+            "file_hash": file_hash, "file_size": entry.size, "batch_id": batch_id,
+            "zip_folder": entry.folder,
+        }
+        try:
+            enqueue_job(job_id, entry.filename, job_payload,
+                        priority=priority if priority in jobqueue.PRIORITIES else "low")
+            db.set_document_batch_info(job_id, batch_id=batch_id, file_hash=file_hash,
+                                       file_size=entry.size, uploaded_by=principal.user_id,
+                                       priority=priority)
+            accepted.append({"job_id": job_id, "filename": entry.filename})
+        except Exception:
+            logger.exception("Không đưa được '%s' vào hàng đợi", entry.filename)
+            skipped.append({"filename": entry.filename, "code": "enqueue_failed",
+                            "ly_do": "Không đưa được vào hàng đợi"})
+
+    shutil.rmtree(staging, ignore_errors=True)
+    batches.bump_counters(batch_id, total=len(accepted), skipped=len(skipped))
+    audit.log_action(action="batch_upload_zip", actor=principal.actor,
+                     detail={"batch_id": batch_id, "accepted": len(accepted),
+                             "skipped": len(skipped), "zip": file.filename})
+
+    return success(
+        {"batch_id": batch_id, "name": batch_name, "da_nhan": accepted, "bo_qua": skipped,
+         "so_da_nhan": len(accepted), "so_bo_qua": len(skipped)},
+        f"Đã nhận {len(accepted)} tài liệu từ tệp nén"
+        + (f", bỏ qua {len(skipped)}" if skipped else ""),
+    )
+
+
+@app.get("/api/v2/batches")
+async def api_list_batches(
+    status:    Optional[str] = Query(None),
+    page:      int           = Query(1, ge=1),
+    per_page:  int           = Query(50, ge=1, le=200),
+    principal: Principal     = Depends(require(policy.DOCUMENT_READ)),
+):
+    """Danh sách lô nạp, mới nhất trước."""
+    from scripts.core import batches
+
+    try:
+        rows = batches.list_batches(status=status, limit=per_page, offset=(page - 1) * per_page)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có bảng lô. Đã chạy migration 006 chưa?", code="BATCHES_UNAVAILABLE"))
+
+    for row in rows:
+        for field in ("created_at", "updated_at", "finished_at"):
+            if row.get(field):
+                row[field] = row[field].isoformat()
+        # Tiến độ tính sẵn: giao diện không nên phải tự tính rồi mỗi nơi tính một kiểu
+        total = row.get("total_files") or 0
+        xong = (row.get("done_files") or 0) + (row.get("failed_files") or 0) \
+            + (row.get("skipped_files") or 0)
+        row["tien_do_phan_tram"] = round(xong * 100 / total) if total else 0
+
+    return success(rows, f"{len(rows)} lô")
+
+
+@app.get("/api/v2/batches/{batch_id}")
+async def api_get_batch(batch_id: str,
+                        principal: Principal = Depends(require(policy.DOCUMENT_READ))):
+    """Chi tiết một lô + danh sách tài liệu trong lô."""
+    from scripts.core import batches
+
+    batch = batches.get_batch(batch_id)
+    if not batch:
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy lô này", code="NOT_FOUND"))
+
+    documents = batches.batch_documents(batch_id)
+    for row in [batch] + documents:
+        for field in ("created_at", "updated_at", "finished_at"):
+            if row.get(field):
+                row[field] = row[field].isoformat()
+
+    return success({"batch": batch, "documents": documents}, f"Lô '{batch['name']}'")
+
+
+@app.put("/api/v2/batches/{batch_id}/status")
+async def api_set_batch_status(batch_id: str, body: BatchStatusUpdate,
+                               principal: Principal = Depends(require(policy.QUEUE_MANAGE))):
+    """
+    Tạm dừng / tiếp tục / hủy một lô (YC-BU-16).
+
+    Tài liệu đang xử lý dở **vẫn chạy xong** — dừng giữa chừng OCR là vứt bỏ công đã làm. Chỉ những
+    tài liệu chưa bắt đầu mới bị giữ lại.
+    """
+    from scripts.core import batches
+
+    try:
+        changed = batches.set_batch_status(batch_id, body.status, actor=principal.actor)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content=err_envelope(str(e), code="INVALID_STATUS"))
+
+    if not changed:
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy lô đang hoạt động với id này", code="NOT_FOUND"))
+
+    audit.log_action(action="batch_status", actor=principal.actor,
+                     detail={"batch_id": batch_id, "status": body.status})
+
+    nhan = {"paused": "Đã tạm dừng lô. Tài liệu đang xử lý dở vẫn chạy xong.",
+            "running": "Đã tiếp tục lô.",
+            "cancelled": "Đã hủy lô. Tài liệu đã xử lý vẫn được giữ nguyên."}
+    return success({"batch_id": batch_id, "status": body.status},
+                   nhan.get(body.status, "Đã cập nhật"))
 
 
 # ---------------------------------------------------------------------
@@ -476,7 +1273,8 @@ async def get_metadata(job_id: str):
 
 
 @app.put("/api/v2/jobs/{job_id}/metadata")
-async def update_metadata(job_id: str, body: MetadataUpdate):
+async def update_metadata(job_id: str, body: MetadataUpdate,
+                          principal: Principal = Depends(require(policy.DOCUMENT_EDIT))):
     """
     Cập nhật metadata — thủ thư hiệu chỉnh trước khi đẩy lên DSpace.
     Trigger DB tự ghi history.
@@ -520,7 +1318,8 @@ async def get_metadata_history(job_id: str):
 # ---------------------------------------------------------------------
 
 @app.put("/api/v2/jobs/{job_id}/dspace-collection")
-async def set_dspace_collection(job_id: str, body: DSpaceCollectionUpdate):
+async def set_dspace_collection(job_id: str, body: DSpaceCollectionUpdate,
+                                principal: Principal = Depends(require(policy.DOCUMENT_EDIT))):
     """
     Lưu collection người dùng đã chọn trên UI.
     Gọi khi người dùng confirm collection, trước khi bấm upload lên DSpace.
@@ -542,7 +1341,8 @@ async def set_dspace_collection(job_id: str, body: DSpaceCollectionUpdate):
 
 
 @app.put("/api/v2/jobs/{job_id}/dspace-status")
-async def update_dspace_status(job_id: str, body: DSpaceStatusUpdate):
+async def update_dspace_status(job_id: str, body: DSpaceStatusUpdate,
+                               principal: Principal = Depends(require(policy.DSPACE_PUSH))):
     """
     Cập nhật trạng thái upload DSpace — gọi từ frontend sau mỗi bước upload.
 
@@ -561,6 +1361,33 @@ async def update_dspace_status(job_id: str, body: DSpaceStatusUpdate):
     if body.dspace_status not in allowed:
         raise HTTPException(status_code=400, detail=f"Invalid dspace_status. Allowed: {allowed}")
 
+    # 🔴 CHỐT YC-RV-04: chưa có cán bộ xác nhận thì KHÔNG được ghi vào hệ đích.
+    #
+    # Hiện thực hóa nguyên tắc SRS "con người giữ quyền quyết định — không tự ghi vào DSpace khi chưa
+    # có cán bộ xác nhận". Chặn ở bước `uploading` (bắt đầu đẩy) chứ không ở `uploaded`: chặn sau khi
+    # đã đẩy xong là vô nghĩa, item đã nằm trên DSpace rồi.
+    #
+    # Mặc định TẮT vì tài liệu cũ đều chưa có `confirmed_at` (quy trình xác nhận chưa từng tồn tại) —
+    # bật ngay sẽ chặn toàn bộ tồn đọng cũ. Xem migration 008.
+    if REQUIRE_CONFIRM_BEFORE_DSPACE and body.dspace_status == "uploading":
+        confirmation = db.confirmation_status(job_id)
+
+        if confirmation is None:
+            # KHÔNG đọc được trạng thái xác nhận → CHẶN, không cho qua. Một chốt an toàn mà im lặng
+            # cho qua khi không đọc được dữ liệu là một chốt nói dối.
+            return JSONResponse(status_code=503, content=err_envelope(
+                "Không kiểm tra được trạng thái xác nhận của tài liệu. "
+                "Nếu vừa bật REQUIRE_CONFIRM_BEFORE_DSPACE, hãy chạy migration 008 trước.",
+                code="CONFIRM_CHECK_FAILED"))
+
+        if not confirmation.get("confirmed_at"):
+            logger.warning("Chặn đẩy DSpace tài liệu chưa xác nhận: %s (bởi %s)",
+                           job_id, principal.actor)
+            return JSONResponse(status_code=409, content=err_envelope(
+                "Tài liệu chưa được cán bộ xác nhận nên chưa đẩy lên DSpace được. "
+                "Vui lòng mở trang Duyệt tài liệu, kiểm tra metadata rồi bấm Xác nhận.",
+                code="NOT_CONFIRMED"))
+
     db.update_dspace_status(
         job_id=job_id,
         dspace_status=body.dspace_status,
@@ -573,7 +1400,8 @@ async def update_dspace_status(job_id: str, body: DSpaceStatusUpdate):
 
 
 @app.post("/api/v2/jobs/{job_id}/dspace-reset")
-async def reset_dspace_upload(job_id: str):
+async def reset_dspace_upload(job_id: str,
+                              principal: Principal = Depends(require(policy.DSPACE_PUSH))):
     """Reset để thử upload lại sau khi thất bại"""
     doc = db.get_document(job_id)
     if not doc:
@@ -600,13 +1428,15 @@ async def list_pending_dspace():
 # ---------------------------------------------------------------------
 
 @app.get("/api/v2/download/batch")
-async def download_batch_get(ids: List[str] = Query(...)):
+async def download_batch_get(ids: List[str] = Query(...),
+                             principal: Principal = Depends(require(policy.DOCUMENT_DOWNLOAD))):
     """Download nhiều jobs thành 1 ZIP qua GET ?ids=x&ids=y (dung voi window.location.href)"""
     return await _download_batch_impl(ids)
 
 
 @app.get("/api/v2/download/{job_id}")
-async def download_job(job_id: str):
+async def download_job(job_id: str,
+                       principal: Principal = Depends(require(policy.DOCUMENT_DOWNLOAD))):
     """Download ZIP chứa PDF đã xử lý + metadata.json"""
     doc = db.get_document(job_id)
     if not doc:
@@ -653,7 +1483,8 @@ async def download_job(job_id: str):
 
 
 @app.post("/api/v2/download/batch")
-async def download_batch(job_ids: List[str]):
+async def download_batch(job_ids: List[str],
+                         principal: Principal = Depends(require(policy.DOCUMENT_DOWNLOAD))):
     """Download nhiều jobs thành 1 ZIP qua POST body"""
     return await _download_batch_impl(job_ids)
 
@@ -700,7 +1531,8 @@ async def _download_batch_impl(job_ids: List[str]):
 # ---------------------------------------------------------------------
 
 @app.delete("/api/v2/jobs/{job_id}")
-async def delete_job(job_id: str, purge: bool = Query(False), actor: str = Query("api")):
+async def delete_job(job_id: str, purge: bool = Query(False),
+                     principal: Principal = Depends(require(policy.DOCUMENT_DELETE))):
     """
     XÓA MỀM job: đặt status='deleted', **giữ nguyên** file PDF/OCR và metadata (chuẩn HPU).
 
@@ -716,9 +1548,16 @@ async def delete_job(job_id: str, purge: bool = Query(False), actor: str = Query
         raise HTTPException(status_code=404, detail="Job not found")
 
     if purge:
+        # Xóa VẬT LÝ đòi quyền riêng, cao hơn xóa mềm (chỉ `admin` có `document:purge`). Trước đây
+        # bất kỳ ai gọi được API đều thêm `?purge=true` là xóa vĩnh viễn tài liệu — không phục hồi được.
+        if not principal.can(policy.DOCUMENT_PURGE):
+            return JSONResponse(status_code=403, content=err_envelope(
+                "Chỉ quản trị viên được xóa vĩnh viễn. Bạn có thể xóa mềm (tài liệu vào thùng rác).",
+                code="FORBIDDEN"))
+
         # Ghi bằng chứng trước, vì sau khi xóa thì không còn tài liệu để gắn bản ghi kiểm toán
         audit.log_action(
-            action=audit.ACTION_DELETE, document_id=job_id, actor=actor,
+            action=audit.ACTION_DELETE, document_id=job_id, actor=principal.actor,
             detail={"purge": True, "filename": (doc or {}).get("filename"),
                     "note": "Xóa vật lý theo yêu cầu — không phục hồi được"},
         )
@@ -733,19 +1572,20 @@ async def delete_job(job_id: str, purge: bool = Query(False), actor: str = Query
     db.delete_document(job_id)          # xóa mềm: chỉ đổi status
     redis_client.delete(f"job:{job_id}")   # trạng thái tạm trong Redis — DB là nguồn sự thật
     audit.log_action(
-        action=audit.ACTION_DELETE, document_id=job_id, actor=actor,
+        action=audit.ACTION_DELETE, document_id=job_id, actor=principal.actor,
         detail={"purge": False, "filename": (doc or {}).get("filename")},
     )
     return {"message": "Job deleted (xóa mềm — có thể phục hồi)", "job_id": job_id, "purged": False}
 
 
 @app.post("/api/v2/jobs/{job_id}/restore")
-async def restore_job(job_id: str, actor: str = Query("api")):
+async def restore_job(job_id: str,
+                      principal: Principal = Depends(require(policy.DOCUMENT_DELETE))):
     """Phục hồi job đã xóa mềm. Có xóa mềm thì phải có đường về."""
     if not db.restore_document(job_id):
         raise HTTPException(status_code=404,
                             detail="Không tìm thấy job đã xóa mềm với id này")
-    audit.log_action(action="restore", document_id=job_id, actor=actor)
+    audit.log_action(action="restore", document_id=job_id, actor=principal.actor)
     return success({"job_id": job_id}, "Đã phục hồi tài liệu")
 
 
@@ -760,6 +1600,15 @@ async def get_stats():
     """
     stats = db.get_stats()
     stats["queue_length"] = redis_client.llen(REDIS_QUEUE)
+
+    # Độ sâu ĐẦY ĐỦ mọi hàng đợi (ADR-011): `queue_length` ở trên chỉ đếm mức normal nên giữ nguyên
+    # cho client cũ, còn `queue` mới cho biết cả job đang thử lại, job chết, job đang xử lý — trước
+    # đây những job này "vô hình" trên giao diện.
+    try:
+        stats["queue"] = jobqueue.depth(redis_client, REDIS_QUEUE).as_dict()
+    except Exception as e:  # noqa: BLE001 - Redis lỗi không được làm sập trang thống kê
+        logger.warning("Không đọc được độ sâu hàng đợi: %s", e)
+        stats["queue"] = None
 
     try:
         # Keyspace nhỏ (một khóa/worker) nên scan rẻ; dùng scan_iter để không chặn Redis
@@ -831,7 +1680,8 @@ async def api_report_actions(date_from: Optional[str] = Query(None), date_to: Op
 
 
 @app.get("/api/v2/jobs/{job_id}/audit")
-async def api_document_audit(job_id: str):
+async def api_document_audit(job_id: str,
+                             principal: Principal = Depends(require(policy.AUDIT_READ))):
     """Nhật ký kiểm toán toàn vòng đời 1 tài liệu (YC-AU-01)."""
     return success(audit.get_document_audit_trail(job_id), "Nhật ký tài liệu")
 
@@ -843,6 +1693,7 @@ async def api_list_audit(
     date_from: Optional[str] = Query(None),
     date_to:   Optional[str] = Query(None),
     limit:     int           = Query(500, ge=1, le=5000),
+    principal: Principal     = Depends(require(policy.AUDIT_READ)),
 ):
     """Kết xuất nhật ký kiểm toán theo bộ lọc thời gian/người/loại (YC-AU-05)."""
     rows = audit.list_audit(actor=actor, action=action, date_from=date_from, date_to=date_to, limit=limit)
@@ -975,6 +1826,498 @@ async def api_system_events(
         if r.get("created_at"):
             r["created_at"] = r["created_at"].isoformat()
     return success(rows, "Sự kiện hệ thống")
+
+
+# ---------------------------------------------------------------------
+# ROUTES - DUYỆT TÀI LIỆU (YC-RV, sprint V8)
+# ---------------------------------------------------------------------
+
+class AssignRequest(BaseModel):
+    user_id: Optional[int] = None
+
+
+class BulkConfirmRequest(BaseModel):
+    job_ids: List[str]
+
+
+# Chốt "chưa xác nhận thì không đẩy DSpace" (YC-RV-04) — hiện thực hóa nguyên tắc SRS "con người giữ
+# quyền quyết định". MẶC ĐỊNH TẮT: bật ngay sẽ chặn toàn bộ tài liệu cũ (chúng có `confirmed_at`
+# NULL vì quy trình xác nhận chưa từng tồn tại). Bật sau khi đã xử lý xong tồn đọng — xem migration 008.
+REQUIRE_CONFIRM_BEFORE_DSPACE = os.getenv(
+    "REQUIRE_CONFIRM_BEFORE_DSPACE", "0").strip() not in ("0", "false", "no", "")
+
+
+@app.get("/api/v2/review/pending")
+async def api_review_pending(
+    mine_only: bool      = Query(False, description="Chỉ tài liệu giao cho tôi hoặc chưa giao"),
+    page:      int       = Query(1, ge=1),
+    per_page:  int       = Query(50, ge=1, le=200),
+    principal: Principal = Depends(require(policy.DOCUMENT_READ)),
+):
+    """
+    Tài liệu chờ duyệt (YC-RV-01), tài liệu chờ LÂU NHẤT lên đầu.
+
+    Sắp theo mới nhất trước sẽ đẩy tài liệu tồn đọng xuống cuối và chúng không bao giờ được xử lý —
+    đúng cái mà cảnh báo SLA của V7 đang cố phát hiện.
+    """
+    try:
+        rows = db.list_pending_review(
+            assigned_to=principal.user_id if mine_only else None,
+            limit=per_page, offset=(page - 1) * per_page,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được danh sách chờ duyệt: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa đọc được danh sách chờ duyệt. Đã chạy migration 008 chưa?",
+            code="REVIEW_UNAVAILABLE"))
+
+    for row in rows:
+        for field in ("created_at", "updated_at"):
+            if row.get(field):
+                row[field] = row[field].isoformat()
+        row["gio_cho"] = int(row.get("gio_cho") or 0)
+
+    return success(rows, f"{len(rows)} tài liệu chờ duyệt")
+
+
+@app.post("/api/v2/jobs/{job_id}/confirm")
+async def api_confirm_document(job_id: str,
+                               principal: Principal = Depends(require(policy.DOCUMENT_APPROVE))):
+    """
+    Cán bộ xác nhận tài liệu đã đúng (YC-RV-04).
+
+    QĐ-05: quyền duyệt do **phân quyền** quyết định, không do quan hệ sở hữu — người có
+    `document:approve` duyệt được cả tài liệu do chính mình tải lên.
+    """
+    doc = db.get_document(job_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu")
+
+    if doc["status"] != "completed":
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Chỉ xác nhận được tài liệu đã xử lý xong", code="NOT_COMPLETED"))
+
+    if not db.confirm_document(job_id, principal.actor):
+        return JSONResponse(status_code=409, content=err_envelope(
+            f"Tài liệu này đã được duyệt bởi '{doc.get('confirmed_by') or 'người khác'}'",
+            code="ALREADY_CONFIRMED"))
+
+    audit.log_action(action=audit.ACTION_CONFIRM, document_id=job_id, actor=principal.actor,
+                     detail={"filename": doc.get("filename")})
+    return success({"job_id": job_id, "confirmed_by": principal.actor}, "Đã xác nhận tài liệu")
+
+
+@app.post("/api/v2/review/bulk-confirm")
+async def api_bulk_confirm(body: BulkConfirmRequest,
+                           principal: Principal = Depends(require(policy.DOCUMENT_APPROVE))):
+    """
+    Xác nhận nhiều tài liệu một lần (YC-RV-06).
+
+    ⚠️ Trần cứng để duyệt hàng loạt không thành "bấm một nút duyệt cả kho": xác nhận là hành vi chịu
+    trách nhiệm, cán bộ phải thực sự nhìn qua từng tài liệu. Giao diện chỉ cho chọn tài liệu điểm
+    tin cậy cao, nhưng ràng buộc thật phải ở máy chủ.
+    """
+    max_bulk = int(os.getenv("MAX_BULK_CONFIRM", "50"))
+    if len(body.job_ids) > max_bulk:
+        return JSONResponse(status_code=400, content=err_envelope(
+            f"Chỉ xác nhận tối đa {max_bulk} tài liệu mỗi lần (bạn chọn {len(body.job_ids)})",
+            code="TOO_MANY"))
+
+    confirmed, skipped = [], []
+    for job_id in body.job_ids:
+        try:
+            if db.confirm_document(job_id, principal.actor):
+                confirmed.append(job_id)
+                audit.log_action(action=audit.ACTION_CONFIRM, document_id=job_id,
+                                 actor=principal.actor, detail={"bulk": True})
+            else:
+                skipped.append(job_id)
+        except Exception as e:  # noqa: BLE001 - một tài liệu lỗi không được làm hỏng cả mẻ
+            logger.warning("Không xác nhận được %s: %s", job_id, e)
+            skipped.append(job_id)
+
+    return success({"da_xac_nhan": confirmed, "bo_qua": skipped,
+                    "so_da_xac_nhan": len(confirmed), "so_bo_qua": len(skipped)},
+                   f"Đã xác nhận {len(confirmed)} tài liệu"
+                   + (f", bỏ qua {len(skipped)} (đã duyệt trước đó hoặc chưa xong)" if skipped else ""))
+
+
+@app.put("/api/v2/jobs/{job_id}/assign")
+async def api_assign_document(job_id: str, body: AssignRequest,
+                              principal: Principal = Depends(require(policy.DOCUMENT_APPROVE))):
+    """Giao tài liệu cho một cán bộ duyệt (YC-RV-07). `user_id=null` để bỏ phân công."""
+    if not db.get_document(job_id):
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài liệu")
+
+    db.assign_document(job_id, body.user_id)
+    audit.log_action(action="assign", document_id=job_id, actor=principal.actor,
+                     new_value=str(body.user_id) if body.user_id else "(bỏ phân công)")
+    return success({"job_id": job_id, "assigned_to": body.user_id},
+                   "Đã giao tài liệu" if body.user_id else "Đã bỏ phân công")
+
+
+# ---------------------------------------------------------------------
+# ROUTES - BẢNG ĐIỀU KHIỂN (YC-DB, sprint V7)
+# ---------------------------------------------------------------------
+
+@app.get("/api/v2/dashboard/summary")
+async def api_dashboard_summary(principal: Principal = Depends(require(policy.DOCUMENT_READ))):
+    """
+    Tổng quan điều hành: hôm nay + tồn đọng + hàng đợi + lô đang chạy + cảnh báo SLA.
+
+    Gộp trong MỘT lời gọi thay vì để giao diện gọi năm lần: bảng điều khiển tự làm mới mỗi vài giây,
+    và năm request song song mỗi nhịp là tải không cần thiết cho một trang chỉ để nhìn.
+    """
+    from scripts.core import dashboard
+
+    data: dict = {}
+    loi: list = []
+
+    try:
+        data["tong_quan"] = dashboard.summary()
+    except Exception as e:  # noqa: BLE001
+        loi.append(f"tổng quan: {e}")
+        data["tong_quan"] = None
+
+    try:
+        data["viec_cua_toi"] = dashboard.my_work(principal.user_id, principal.username)
+    except Exception as e:  # noqa: BLE001
+        loi.append(f"việc của tôi: {e}")
+        data["viec_cua_toi"] = None
+
+    try:
+        data["sla"] = dashboard.sla_breaches()
+    except Exception as e:  # noqa: BLE001
+        loi.append(f"SLA: {e}")
+        data["sla"] = None
+
+    data["lo_dang_chay"] = dashboard.active_batches()
+
+    # Hàng đợi lấy từ Redis, không phải PostgreSQL — nguồn khác, lỗi khác, nên bọc riêng
+    try:
+        data["hang_doi"] = jobqueue.depth(redis_client, REDIS_QUEUE).as_dict()
+        data["hang_doi"]["workers_alive"] = sum(
+            1 for _ in redis_client.scan_iter("worker:heartbeat:*", count=100))
+    except Exception as e:  # noqa: BLE001
+        loi.append(f"hàng đợi: {e}")
+        data["hang_doi"] = None
+
+    # Trả 200 kèm danh sách phần lỗi thay vì 500: một thẻ hỏng không nên làm trắng cả bảng điều khiển
+    data["phan_loi"] = loi or None
+    return success(data, "Bảng điều khiển")
+
+
+@app.get("/api/v2/dashboard/workload")
+async def api_dashboard_workload(
+    days:      int       = Query(7, ge=1, le=90),
+    principal: Principal = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Năng suất duyệt theo từng cán bộ (YC-DB-05).
+
+    Theo `QĐ-06` đây là số liệu **công khai** cho mọi người dùng đăng nhập. Phản hồi luôn kèm
+    `ghi_chu` nói rõ đây là số liệu vận hành, không phải bảng xếp hạng — giao diện không được bỏ.
+    """
+    from scripts.core import dashboard
+
+    try:
+        return success(dashboard.staff_workload(days=days), f"Năng suất {days} ngày gần nhất")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được năng suất: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Chưa đọc được số liệu năng suất: {e}", code="WORKLOAD_UNAVAILABLE"))
+
+
+@app.get("/api/v2/dashboard/export")
+async def api_dashboard_export(
+    days:      int       = Query(7, ge=1, le=90),
+    principal: Principal = Depends(require(policy.REPORT_READ)),
+):
+    """Xuất số liệu bảng điều khiển ra bảng tính (YC-DB-08)."""
+    from scripts.core import dashboard, export_excel
+
+    try:
+        workload = dashboard.staff_workload(days=days)
+        sla = dashboard.sla_breaches(limit=1000)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Chưa có dữ liệu để xuất: {e}", code="DASHBOARD_UNAVAILABLE"))
+
+    sheets = {
+        "Năng suất": export_excel.build_rows(workload["can_bo"], [
+            ("can_bo", "Cán bộ"), ("so_tai_lieu", "Số tài liệu"), ("so_trang", "Số trang"),
+            ("so_truong_da_sua", "Số trường đã sửa"), ("lan_cuoi", "Lần duyệt gần nhất"),
+        ]),
+        "Quá hạn SLA": export_excel.build_rows(sla["danh_sach"], [
+            ("filename", "Tài liệu"), ("status", "Trạng thái"),
+            ("gio_ton_dong", "Số giờ tồn đọng"), ("review_note", "Ghi chú"),
+        ]),
+    }
+
+    content, extension, media_type = export_excel.export(sheets)
+    filename = f"bang-dieu-khien-{datetime.now().strftime('%Y%m%d')}.{extension}"
+
+    user_log.log_activity(action=user_log.ACTION_EXPORT, resource_type="report",
+                          resource_id="dashboard", detail={"days": days, "format": extension})
+
+    return StreamingResponse(
+        io.BytesIO(content), media_type=media_type,
+        headers={"Content-Disposition": content_disposition(filename)},
+    )
+
+
+# ---------------------------------------------------------------------
+# ROUTES - PHÂN TÍCH KẾT QUẢ AI (YC-AN, sprint V2)
+# ---------------------------------------------------------------------
+
+@app.get("/api/v2/analytics/ai/accuracy")
+async def api_ai_accuracy(
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    provider:  Optional[str] = Query(None),
+    principal: Principal     = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Độ chính xác theo từng trường, **đo trên việc thật** (YC-AN-05).
+
+    ⚠️ Phản hồi LUÔN kèm `sample_size` và `phuong_phap`. Trường dưới ngưỡng mẫu tối thiểu trả
+    `do_chinh_xac=null` + ghi chú "chưa đủ dữ liệu" thay vì một tỉ lệ vô nghĩa — xem `analytics.py`.
+    """
+    try:
+        rows = analytics.field_accuracy(date_from=date_from, date_to=date_to, provider=provider)
+    except Exception as e:  # noqa: BLE001 - bảng chưa di trú thì nói rõ, không trả 500 trống
+        logger.warning("Không tính được độ chính xác: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có dữ liệu phân tích. Đã chạy migration 005 chưa?", code="ANALYTICS_UNAVAILABLE"))
+
+    return success(
+        {"fields": rows,
+         "phuong_phap": analytics.METHOD_NOTE,
+         "co_mau_toi_thieu": analytics.ACCURACY_MIN_SAMPLE},
+        "Độ chính xác trích xuất theo trường",
+    )
+
+
+@app.get("/api/v2/analytics/ai/providers")
+async def api_ai_providers(
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    principal: Principal     = Depends(require(policy.REPORT_READ)),
+):
+    """
+    So sánh độ chính xác giữa các công cụ mô hình (YC-AN-06).
+
+    Bảng số liệu cho hồ sơ dự thi **không cần chạy lại harness**: lấy từ việc thật nên phản ánh đúng
+    loại tài liệu Trung tâm đang xử lý.
+    """
+    try:
+        rows = analytics.provider_accuracy(date_from=date_from, date_to=date_to)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không so sánh được công cụ: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có dữ liệu phân tích. Đã chạy migration 005 chưa?", code="ANALYTICS_UNAVAILABLE"))
+
+    return success({"providers": rows, "phuong_phap": analytics.METHOD_NOTE},
+                   "So sánh công cụ mô hình")
+
+
+@app.get("/api/v2/analytics/ai/cost")
+async def api_ai_cost(
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    principal: Principal     = Depends(require(policy.REPORT_READ)),
+):
+    """Chi phí gọi model theo tháng và theo công cụ, đơn vị **VNĐ số nguyên** (YC-AN-04)."""
+    try:
+        return success(analytics.cost_summary(date_from=date_from, date_to=date_to),
+                       "Chi phí gọi model")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không tính được chi phí: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có dữ liệu chi phí. Đã chạy migration 005 chưa?", code="ANALYTICS_UNAVAILABLE"))
+
+
+@app.get("/api/v2/analytics/ai/ocr-quality")
+async def api_ocr_quality(
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    limit:     int           = Query(100, ge=1, le=1000),
+    principal: Principal     = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Chất lượng OCR + danh sách tài liệu **nên quét lại** (YC-AN-03).
+
+    `pages_without_text > 0` nghĩa là có trang không tạo được lớp text — ảnh quá mờ hoặc lệch. Biết
+    sớm thì đề nghị quét lại, thay vì để tài liệu vào DSpace ở dạng không tra cứu được.
+    """
+    try:
+        return success(analytics.ocr_quality(date_from=date_from, date_to=date_to, limit=limit),
+                       "Chất lượng OCR")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được chất lượng OCR: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có dữ liệu OCR. Đã chạy migration 005 chưa?", code="ANALYTICS_UNAVAILABLE"))
+
+
+@app.get("/api/v2/analytics/ai/export")
+async def api_ai_export(
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    principal: Principal     = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Xuất báo cáo phân tích AI ra bảng tính (YC-AN-10).
+
+    XLSX nếu có `openpyxl`, không thì CSV UTF-8 **có BOM** để Excel trên Windows hiển thị đúng
+    tiếng Việt. Cột "Độ chính xác" ghi rõ "chưa đủ dữ liệu" thay vì để trống — tệp xuất ra cũng phải
+    mang theo giới hạn của số liệu, vì nó sẽ rời khỏi hệ thống và không còn ghi chú phương pháp.
+    """
+    from scripts.core import export_excel
+
+    try:
+        fields = analytics.field_accuracy(date_from=date_from, date_to=date_to)
+        cost = analytics.cost_summary(date_from=date_from, date_to=date_to)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Chưa có dữ liệu để xuất: {e}", code="ANALYTICS_UNAVAILABLE"))
+
+    for row in fields:
+        row["hien_thi"] = (f"{row['do_chinh_xac']}%" if row["do_chinh_xac"] is not None
+                           else analytics.INSUFFICIENT)
+
+    sheets = {
+        "Độ chính xác": export_excel.build_rows(fields, [
+            ("field_key", "Trường"), ("so_dung", "Số đúng"),
+            ("sample_size", "Cỡ mẫu"), ("hien_thi", "Độ chính xác"),
+        ]),
+        "Chi phí": export_excel.build_rows(cost["theo_cong_cu"], [
+            ("provider", "Công cụ"), ("deployment", "Chế độ"),
+            ("so_luot_goi", "Lượt gọi"), ("tong_token", "Token"),
+            ("chi_phi_hien_thi", "Chi phí"),
+        ]),
+    }
+
+    content, extension, media_type = export_excel.export(sheets)
+    filename = f"phan-tich-ai-{datetime.now().strftime('%Y%m%d')}.{extension}"
+
+    user_log.log_activity(action=user_log.ACTION_EXPORT, resource_type="report",
+                          resource_id="analytics/ai", detail={"format": extension})
+
+    return StreamingResponse(
+        io.BytesIO(content), media_type=media_type,
+        headers={"Content-Disposition": content_disposition(filename)},
+    )
+
+
+@app.get("/api/v2/analytics/ai/drift")
+async def api_quality_drift(
+    days:          int       = Query(7, ge=1, le=90),
+    baseline_days: int       = Query(30, ge=1, le=365),
+    principal:     Principal = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Phát hiện suy giảm chất lượng (YC-AN-08): so kỳ gần đây với kỳ trước đó.
+
+    Chỉ kết luận khi CẢ HAI kỳ đủ mẫu — thiếu mẫu thì nói rõ, không báo động giả.
+    """
+    try:
+        return success(analytics.quality_drift(days=days, baseline_days=baseline_days),
+                       "Theo dõi suy giảm chất lượng")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không tính được suy giảm chất lượng: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Không tính được: {e}", code="ANALYTICS_UNAVAILABLE"))
+
+
+# ---------------------------------------------------------------------
+# ROUTES - HÀNG ĐỢI (ADR-011)
+# ---------------------------------------------------------------------
+
+@app.get("/api/v2/queue")
+async def api_queue_depth():
+    """Độ sâu mọi hàng đợi: chờ theo mức ưu tiên, đang thử lại, đã chết, đang xử lý."""
+    try:
+        depth = jobqueue.depth(redis_client, REDIS_QUEUE)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Không đọc được hàng đợi: {e}", code="QUEUE_UNAVAILABLE"))
+    return success({**depth.as_dict(), "mode": os.getenv("QUEUE_MODE", "reliable")},
+                   "Tình trạng hàng đợi")
+
+
+@app.get("/api/v2/queue/history")
+async def api_queue_history(
+    hours:          int       = Query(24, ge=1, le=720),
+    bucket_minutes: int       = Query(15, ge=1, le=1440),
+    principal:      Principal = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Lịch sử độ sâu hàng đợi (YC-BU-18, YC-DB-06) — trả lời "giờ nào trong ngày dồn nhất".
+
+    Lấy giá trị LỚN NHẤT trong mỗi khoảng, không phải trung bình: câu hỏi là "lúc cao điểm dồn bao
+    nhiêu", mà trung bình sẽ làm phẳng mất đỉnh.
+    """
+    try:
+        rows = db.queue_history(hours=hours, bucket_minutes=bucket_minutes)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được lịch sử hàng đợi: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa có dữ liệu lịch sử hàng đợi. Đã chạy migration 007 chưa?",
+            code="QUEUE_HISTORY_UNAVAILABLE"))
+
+    return success({"diem": rows, "so_gio": hours},
+                   f"Độ sâu hàng đợi {hours} giờ gần nhất")
+
+
+@app.get("/api/v2/queue/dead")
+async def api_queue_dead(limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0)):
+    """
+    Hàng đợi chết: job đã hết lượt thử hoặc lỗi tài liệu, kèm LÝ DO đọc được (KT-BU-21).
+
+    Trước ADR-011 những job này biến mất không dấu vết — tài liệu treo mãi ở "Chờ xử lý".
+    """
+    try:
+        rows = jobqueue.list_dead(redis_client, REDIS_QUEUE, limit=limit, offset=offset)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Không đọc được hàng đợi chết: {e}", code="QUEUE_UNAVAILABLE"))
+    return success(rows, f"{len(rows)} job trong hàng đợi chết")
+
+
+@app.post("/api/v2/queue/dead/{job_id}/retry")
+async def api_queue_retry_dead(job_id: str,
+                               principal: Principal = Depends(require(policy.QUEUE_MANAGE))):
+    """
+    Chạy lại một job từ hàng đợi chết. GIỮ NGUYÊN `job_id` để không tạo bản ghi tài liệu trùng.
+    """
+    try:
+        ok = jobqueue.retry_dead(redis_client, REDIS_QUEUE, job_id)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Không chạy lại được: {e}", code="QUEUE_UNAVAILABLE"))
+
+    if not ok:
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy job này trong hàng đợi chết", code="NOT_FOUND"))
+
+    db.update_document_status(job_id, "queued", progress=10,
+                              error_message="Được chạy lại từ hàng đợi chết")
+    audit.log_action(action="queue_retry", document_id=job_id, actor=principal.actor)
+    return success({"job_id": job_id}, "Đã đưa tài liệu trở lại hàng đợi")
+
+
+@app.post("/api/v2/queue/dead/retry-all")
+async def api_queue_retry_all_dead(limit: int = Query(500, ge=1, le=5000),
+                                   principal: Principal = Depends(require(policy.QUEUE_MANAGE))):
+    """Chạy lại toàn bộ hàng đợi chết — dùng sau khi đã sửa nguyên nhân chung (vd Redis/DB đã lên lại)."""
+    try:
+        count = jobqueue.retry_all_dead(redis_client, REDIS_QUEUE, limit=limit)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=503, content=err_envelope(
+            f"Không chạy lại được: {e}", code="QUEUE_UNAVAILABLE"))
+
+    audit.log_action(action="queue_retry_all", actor=principal.actor, detail={"count": count})
+    return success({"count": count}, f"Đã đưa {count} tài liệu trở lại hàng đợi")
 
 
 @app.get("/api/v2/reports/processing-time")

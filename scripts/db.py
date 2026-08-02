@@ -118,11 +118,18 @@ def update_document_status(
     progress: Optional[int] = None,
     pdf_path: Optional[str] = None,
     error_message: Optional[str] = None,
+    clear_error: bool = False,
 ) -> None:
     """
     Cập nhật trạng thái OCR job.
     - progress=None → tự lấy progress_value từ bảng job_statuses
     - Tự set finished_at khi status là terminal (is_terminal=TRUE)
+    - `clear_error=True` → XÓA `error_message` (đặt NULL).
+
+    Vì sao cần `clear_error`: `error_message` dùng `COALESCE` nên truyền `None` là GIỮ giá trị cũ —
+    hợp lý khi cập nhật từng phần, nhưng từ khi có cơ chế thử lại (ADR-011) thì một tài liệu có thể
+    thất bại rồi thành công ở lần sau. Không có cờ này thì tài liệu `completed` vẫn mang thông báo lỗi
+    của lần thử trước — một trạng thái tự mâu thuẫn mà người dùng không hiểu được.
     """
     sql = """
         UPDATE documents
@@ -133,7 +140,10 @@ def update_document_status(
                                 (SELECT progress_value FROM job_statuses WHERE code = %(status)s)
                             ),
             pdf_path      = COALESCE(%(pdf_path)s, pdf_path),
-            error_message = COALESCE(%(error_message)s, error_message),
+            error_message = CASE
+                                WHEN %(clear_error)s THEN NULL
+                                ELSE COALESCE(%(error_message)s, error_message)
+                            END,
             finished_at   = CASE
                                 WHEN (SELECT is_terminal FROM job_statuses WHERE code = %(status)s)
                                 THEN NOW()
@@ -149,6 +159,7 @@ def update_document_status(
                 "progress":      progress,
                 "pdf_path":      pdf_path,
                 "error_message": error_message,
+                "clear_error":   clear_error,
             })
 
     logger.debug(f"Updated document status: {job_id} → {status}")
@@ -781,28 +792,299 @@ def log_model_call(
     fallback_from: Optional[str] = None,
     error: Optional[str] = None,
     status: str = "success",
-) -> None:
+    analytics: Optional[Dict] = None,
+) -> Optional[int]:
     """
-    Ghi một lần gọi model (YC-MP-06). KHÔNG ném lỗi ra ngoài: nhật ký hỏng không được làm gãy
-    việc số hóa của cán bộ — cùng nguyên tắc với audit.log_action.
+    Ghi một lần gọi model (YC-MP-06). Trả về `id` của bản ghi, hoặc `None` nếu ghi thất bại.
+
+    KHÔNG ném lỗi ra ngoài: nhật ký hỏng không được làm gãy việc số hóa của cán bộ — cùng nguyên tắc
+    với `audit.log_action`.
+
+    `analytics` (sprint V2, tùy chọn) mang thêm token/chi phí/độ tin cậy. Truyền dưới dạng dict thay
+    vì mười tham số mới để không phá chữ ký hàm với mọi nơi gọi hiện có; khóa lạ bị bỏ qua, nên mã cũ
+    và DB chưa chạy migration 005 vẫn hoạt động bình thường.
+
+    Trả về `id` để `model_call_fields` gắn được vào đúng lượt gọi (YC-AN-02).
+    """
+    # Danh sách trắng cột phân tích — KHÔNG nhận tên cột tùy ý từ nơi gọi (chúng đi thẳng vào SQL)
+    _ANALYTICS_COLUMNS = (
+        "prompt_tokens", "completion_tokens", "total_tokens", "cost_micro_usd", "cost_vnd",
+        "prompt_version", "prompt_hash", "context_chars", "context_pages", "retry_reason",
+        "confidence_avg", "confidence_min", "grounded_ratio", "request_id",
+    )
+
+    columns = ["document_id", "provider", "deployment", "model", "model_version", "schema_code",
+               "used_ai", "attempts", "latency_ms", "rss_mb", "gpu_mem_mb", "n_fields",
+               "fallback_from", "error", "status"]
+    values = [document_id, provider, deployment, model, model_version, schema_code,
+              used_ai, attempts, latency_ms, rss_mb, gpu_mem_mb, n_fields,
+              fallback_from, error, status]
+
+    for column in _ANALYTICS_COLUMNS:
+        if analytics and analytics.get(column) is not None:
+            columns.append(column)
+            values.append(analytics[column])
+
+    sql = (f"INSERT INTO model_calls ({', '.join(columns)}) "
+           f"VALUES ({', '.join(['%s'] * len(columns))}) RETURNING id")
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, values)
+                return int(cur.fetchone()[0])
+    except Exception as e:  # noqa: BLE001 - nhật ký không được chặn nghiệp vụ chính
+        logger.error(f"Ghi model_calls thất bại (provider={provider}, doc={document_id}): {e}")
+        return None
+
+
+def log_model_call_fields(model_call_id: Optional[int], document_id: Optional[str],
+                          fields: List[Dict], preview_chars: int = 200) -> int:
+    """
+    Ghi kết quả TỪNG TRƯỜNG của một lượt gọi model (YC-AN-02). Trả về số dòng đã ghi.
+
+    Đây là dữ liệu để đo độ chính xác trên việc thật: so giá trị AI trả về với giá trị cán bộ duyệt
+    sau đó (xem `scripts/core/analytics.py`).
+
+    `value_preview` cắt ngắn có chủ đích — đủ để đối chiếu, mà không biến bảng nhật ký thành bản sao
+    thứ hai của nội dung tài liệu (vừa phình DB, vừa nhân đôi bề mặt rủi ro dữ liệu nhạy cảm).
+    """
+    if not fields:
+        return 0
+
+    sql = """
+        INSERT INTO model_call_fields
+            (model_call_id, document_id, field_key, value_preview, confidence, grounded, attempt)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    rows = []
+    for field in fields:
+        value = field.get("value")
+        rows.append((
+            model_call_id, document_id, field.get("key"),
+            (str(value)[:preview_chars] if value is not None else None),
+            field.get("confidence"), field.get("grounded"), field.get("attempt", 1),
+        ))
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, rows)
+        return len(rows)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Ghi model_call_fields thất bại (doc={document_id}): {e}")
+        return 0
+
+
+def confirm_document(job_id: str, actor: str) -> bool:
+    """
+    Cán bộ xác nhận một tài liệu (YC-RV-04). Trả `True` nếu vừa xác nhận, `False` nếu đã xác nhận rồi.
+
+    `confirmed_at IS NULL` trong điều kiện WHERE là chốt chống xác nhận hai lần: hai cán bộ cùng bấm
+    thì người sau nhận `False` và giao diện nói rõ "đã được duyệt bởi ...", thay vì ghi đè tên người
+    trước một cách im lặng.
+
+    Xác nhận CŨNG gỡ cờ `needs_review`: cán bộ đã xem và đồng ý thì tài liệu không còn nằm trong
+    danh sách chờ nữa — nếu không nó sẽ ở đó mãi và danh sách chờ mất ý nghĩa.
     """
     sql = """
-        INSERT INTO model_calls
-            (document_id, provider, deployment, model, model_version, schema_code,
-             used_ai, attempts, latency_ms, rss_mb, gpu_mem_mb, n_fields,
-             fallback_from, error, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        UPDATE documents
+        SET confirmed_at = NOW(), confirmed_by = %s, needs_review = FALSE
+        WHERE id = %s AND confirmed_at IS NULL AND status = 'completed'
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (actor, job_id))
+            return bool(cur.rowcount)
+
+
+def confirmation_status(job_id: str) -> Optional[Dict]:
+    """
+    Trạng thái xác nhận của một tài liệu, hoặc `None` nếu KHÔNG XÁC ĐỊNH ĐƯỢC.
+
+    Truy vấn riêng thay vì thêm cột vào `get_document()`: cột `confirmed_at` chỉ tồn tại sau
+    migration 008, và thêm nó vào `get_document` sẽ làm **toàn bộ trang chi tiết tài liệu hỏng** nếu
+    mã mới được triển khai trước khi chạy migration — đúng tình huống bình thường lúc deploy.
+
+    Trả `None` (không biết) chứ không phải `{}` (chưa duyệt): nơi gọi phải phân biệt hai điều này.
+    Chốt chặn đẩy DSpace xử lý "không biết" bằng cách CHẶN kèm thông báo yêu cầu chạy migration —
+    một chốt an toàn mà im lặng cho qua khi không đọc được dữ liệu là một chốt nói dối.
+    """
+    try:
+        import psycopg2.extras
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT confirmed_at, confirmed_by FROM documents WHERE id = %s", (job_id,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không đọc được trạng thái xác nhận của %s: %s", job_id, e)
+        return None
+
+
+def assign_document(job_id: str, user_id: Optional[int]) -> bool:
+    """Giao tài liệu cho một cán bộ duyệt (YC-RV-07). `user_id=None` = bỏ phân công."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE documents SET assigned_to = %s WHERE id = %s", (user_id, job_id))
+            return bool(cur.rowcount)
+
+
+def list_pending_review(assigned_to: Optional[int] = None, only_unassigned: bool = False,
+                        limit: int = 100, offset: int = 0) -> List[Dict]:
+    """
+    Danh sách tài liệu chờ duyệt (YC-RV-01).
+
+    Sắp theo `updated_at` TĂNG DẦN — tài liệu chờ lâu nhất lên đầu. Sắp theo mới nhất trước sẽ làm
+    những tài liệu tồn đọng lâu bị đẩy xuống cuối và không bao giờ được xử lý.
+    """
+    conditions = ["d.status = 'completed'", "d.confirmed_at IS NULL"]
+    params: list = []
+
+    if assigned_to is not None:
+        conditions.append("(d.assigned_to = %s OR d.assigned_to IS NULL)")
+        params.append(assigned_to)
+    elif only_unassigned:
+        conditions.append("d.assigned_to IS NULL")
+
+    sql = f"""
+        SELECT d.id, d.filename, d.status, d.needs_review, d.review_note,
+               d.created_at, d.updated_at, d.assigned_to, d.batch_id,
+               d.extraction_provider, d.extraction_mode,
+               ROUND(EXTRACT(EPOCH FROM (NOW() - d.updated_at)) / 3600) AS gio_cho,
+               (SELECT COUNT(*) FROM metadata_fields m
+                 WHERE m.document_id = d.id AND m.confidence IS NOT NULL AND m.confidence < 0.5)
+                   AS so_truong_diem_thap
+        FROM documents d
+        WHERE {' AND '.join(conditions)}
+        ORDER BY d.needs_review DESC, d.updated_at ASC
+        LIMIT %s OFFSET %s
+    """
+    params.extend([limit, offset])
+
+    import psycopg2.extras
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+
+def log_queue_sample(depth: Dict, workers_alive: Optional[int] = None) -> None:
+    """
+    Ghi một mẫu độ sâu hàng đợi (YC-BU-18). Không ném lỗi — số liệu không được chặn việc xử lý.
+
+    `workers_alive=None` được lưu là NULL chứ không phải 0: "không đọc được Redis" và "không có
+    worker nào" dẫn tới hai hành động hoàn toàn khác nhau (cùng nguyên tắc với ADR-009 mục 6).
+    """
+    sql = """
+        INSERT INTO queue_samples (high, normal, low, delayed, dead, processing, workers_alive)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (
-                    document_id, provider, deployment, model, model_version, schema_code,
-                    used_ai, attempts, latency_ms, rss_mb, gpu_mem_mb, n_fields,
-                    fallback_from, error, status,
+                    depth.get("high", 0), depth.get("normal", 0), depth.get("low", 0),
+                    depth.get("delayed", 0), depth.get("dead", 0), depth.get("processing", 0),
+                    workers_alive,
                 ))
-    except Exception as e:  # noqa: BLE001 - nhật ký không được chặn nghiệp vụ chính
-        logger.error(f"Ghi model_calls thất bại (provider={provider}, doc={document_id}): {e}")
+    except Exception as e:  # noqa: BLE001 - chưa chạy migration 007 thì bỏ qua, không làm ồn log
+        logger.debug(f"Không ghi được mẫu hàng đợi: {e}")
+
+
+def queue_history(hours: int = 24, bucket_minutes: int = 15) -> List[Dict]:
+    """
+    Lịch sử độ sâu hàng đợi, gộp theo khoảng thời gian (YC-DB-06).
+
+    Gộp theo `bucket_minutes` thay vì trả từng mẫu: 24 giờ × 60 mẫu = 1440 điểm, vẽ ra thì rối và
+    truyền qua mạng thì lãng phí. Lấy giá trị LỚN NHẤT trong mỗi khoảng chứ không phải trung bình —
+    câu hỏi là "lúc cao điểm dồn bao nhiêu", mà trung bình sẽ làm phẳng mất đỉnh.
+    """
+    sql = """
+        SELECT to_char(
+                   to_timestamp(floor(extract(epoch FROM created_at) / (%(bucket)s * 60))
+                                * (%(bucket)s * 60)),
+                   'YYYY-MM-DD HH24:MI') AS moc_thoi_gian,
+               MAX(high + normal + low) AS cho_xu_ly,
+               MAX(high)                AS uu_tien_cao,
+               MAX(delayed)             AS cho_thu_lai,
+               MAX(dead)                AS da_chet,
+               MAX(processing)          AS dang_xu_ly,
+               MIN(workers_alive)       AS worker_it_nhat
+        FROM queue_samples
+        WHERE created_at > NOW() - (%(hours)s || ' hours')::interval
+        GROUP BY moc_thoi_gian
+        ORDER BY moc_thoi_gian
+    """
+    import psycopg2.extras
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, {"hours": hours, "bucket": bucket_minutes})
+            return [dict(r) for r in cur.fetchall()]
+
+
+def set_document_batch_info(job_id: str, batch_id: Optional[str] = None,
+                            file_hash: Optional[str] = None, file_size: Optional[int] = None,
+                            page_count: Optional[int] = None, uploaded_by: Optional[int] = None,
+                            priority: Optional[str] = None) -> None:
+    """
+    Gắn thông tin lô/tệp cho một tài liệu (sprint V5). Không ném lỗi ra ngoài.
+
+    Tách khỏi `create_document` thay vì thêm tham số: `create_document` được gọi từ đường nạp CŨ
+    (`/api/v1/process`) vốn không có khái niệm lô, và đổi chữ ký của nó là chạm vào đường đang chạy
+    thật mà không được gì.
+
+    Chỉ cập nhật trường được truyền vào — `COALESCE` giữ nguyên giá trị cũ cho phần bỏ trống.
+    """
+    sql = """
+        UPDATE documents
+        SET batch_id    = COALESCE(%(batch_id)s, batch_id),
+            file_hash   = COALESCE(%(file_hash)s, file_hash),
+            file_size   = COALESCE(%(file_size)s, file_size),
+            page_count  = COALESCE(%(page_count)s, page_count),
+            uploaded_by = COALESCE(%(uploaded_by)s, uploaded_by),
+            priority    = COALESCE(%(priority)s, priority)
+        WHERE id = %(job_id)s
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {
+                    "job_id": job_id, "batch_id": batch_id, "file_hash": file_hash,
+                    "file_size": file_size, "page_count": page_count,
+                    "uploaded_by": uploaded_by, "priority": priority,
+                })
+    except Exception as e:  # noqa: BLE001 - chưa chạy migration 006 thì vẫn phải nạp được tài liệu
+        logger.warning(f"Không gắn được thông tin lô cho {job_id}: {e}")
+
+
+def log_ocr_run(document_id: str, **fields) -> None:
+    """
+    Ghi chỉ số một lượt OCR (YC-AN-03). Không ném lỗi ra ngoài.
+
+    Nhận `**fields` theo danh sách trắng: pipeline OCR sẽ còn được bổ sung chỉ số mới theo thời gian,
+    và không nên phải sửa chữ ký hàm mỗi lần.
+    """
+    allowed = ("engine", "language", "pages", "pages_without_text", "dpi_pre", "dpi_post",
+               "size_in_bytes", "size_out_bytes", "text_chars", "duration_ms", "warnings", "status")
+
+    columns = ["document_id"]
+    values = [document_id]
+    for column in allowed:
+        if fields.get(column) is not None:
+            columns.append(column)
+            values.append(fields[column])
+
+    sql = (f"INSERT INTO ocr_runs ({', '.join(columns)}) "
+           f"VALUES ({', '.join(['%s'] * len(columns))})")
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, values)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Ghi ocr_runs thất bại (doc={document_id}): {e}")
 
 
 def list_model_calls(

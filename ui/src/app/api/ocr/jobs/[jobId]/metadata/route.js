@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { apiBase } from '@/lib/api';
+import { apiBase, forwardHeaders } from '@/lib/api';
 
 // Proxy same-origin tới FastAPI. Client PHẢI gọi qua đây thay vì gọi trực tiếp bằng URL tuyệt đối:
 // trình duyệt không nhất thiết tới được địa chỉ nội bộ của API, và mọi thay đổi tên miền sẽ bắt
@@ -12,7 +12,7 @@ export async function PUT(req, ctx) {
   try {
     const res = await fetch(`${apiBase()}/api/v2/jobs/${jobId}/metadata`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: await forwardHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
       cache: 'no-store',
     });
@@ -32,7 +32,8 @@ export async function PUT(req, ctx) {
 export async function GET(req, ctx) {
   const { jobId } = await ctx.params;
   try {
-    const res = await fetch(`${apiBase()}/api/v2/jobs/${jobId}/metadata`, { cache: 'no-store' });
+    const res = await fetch(`${apiBase()}/api/v2/jobs/${jobId}/metadata`,
+      { cache: 'no-store', headers: await forwardHeaders() });
     const text = await res.text();
     return new NextResponse(text, {
       status: res.status,
