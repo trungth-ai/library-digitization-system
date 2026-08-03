@@ -3,6 +3,16 @@ import { apiBase, forwardHeaders } from '@/lib/api';
 
 // Proxy same-origin cho nhóm lô nạp tài liệu: /api/v2/batches* (sprint V5).
 //
+// ⚠️ HAI CẶP NGOẶC `[[...path]]` LÀ CÓ CHỦ ĐÍCH — ĐỪNG rút về `[...path]`.
+//
+// Next.js: `[...path]` là catch-all BẮT BUỘC, cần ít nhất một đoạn đường dẫn nên nó KHÔNG khớp
+// `/api/lo` trần. `[[...path]]` là catch-all TÙY CHỌN, khớp cả đường dẫn cha.
+//
+// Trang `/lo` gọi `fetch("/api/lo")` để lấy danh sách lô (backend: `GET /api/v2/batches`). Với
+// `[...path]`, lời gọi đó không khớp route nào → Next trả về trang 404 dạng HTML → `res.json()` chết
+// với "Unexpected token '<', "<!DOCTYPE"...". Triệu chứng trông như backend sập, thực chất là request
+// chưa bao giờ ra khỏi Next.
+//
 // Tách riêng khỏi proxy quản trị vì đường này phải chuyển tiếp được **thân multipart** của tệp tải
 // lên: một lô có thể là 500 tệp, không được đọc hết vào RAM rồi mới gửi đi. `duplex: 'half'` cho
 // phép chuyển tiếp thân request dạng luồng — thiếu nó thì Node đọc trọn tệp vào bộ nhớ trước.

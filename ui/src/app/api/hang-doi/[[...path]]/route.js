@@ -2,6 +2,11 @@ import { NextResponse } from 'next/server';
 import { apiBase, forwardHeaders } from '@/lib/api';
 
 // Proxy same-origin cho nhóm hàng đợi: /api/v2/queue* (ADR-011, sprint V6).
+//
+// ⚠️ HAI CẶP NGOẶC `[[...path]]` LÀ CÓ CHỦ ĐÍCH — ĐỪNG rút về `[...path]`.
+// `[...path]` cần ít nhất một đoạn đường dẫn nên KHÔNG khớp `/api/hang-doi` trần, mà trang
+// `/hang-doi` gọi đúng đường đó để lấy độ sâu hàng đợi (backend: `GET /api/v2/queue`).
+// Xem chú thích đầy đủ trong `api/lo/[[...path]]/route.js`.
 
 export const dynamic = 'force-dynamic';
 
