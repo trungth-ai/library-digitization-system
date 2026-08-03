@@ -127,27 +127,43 @@ Bản nâng cấp này thêm cột/bảng mới (`documents.updated_at`, `needs_
 `postgres_data` đã có → `init.sql` không chạy lại → code mới sẽ lỗi *"column does not exist"* nếu bỏ
 qua bước này:
 
+> ⚠️ **`$POSTGRES_USER` KHÔNG có trong shell của bạn** — nó nằm trong `.env`, thứ mà
+> `docker compose` đọc chứ shell thì không. Viết `psql -U "$POSTGRES_USER"` trực tiếp sẽ cho
+> `FATAL: role "root" does not exist`, vì `docker compose exec` chạy dưới root và `psql` lùi về
+> tên user hệ điều hành. Mọi lệnh dưới đây khai triển biến **bên trong container** bằng
+> `sh -c '...'` — đúng do kiến trúc, không cần cấu hình gì ở host.
+
+**Sao lưu TRƯỚC khi chạy bất kỳ migration nào:**
+
 ```bash
-docker compose exec -T postgres psql -U "$POSTGRES_USER" -d library_digitization \
-    < database/migrations/001_provider_layer_and_soft_delete.sql
+docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' > ~/docuflow-truoc-migration-$(date +%Y%m%d-%H%M).dump
 ```
 
-Bản nâng cấp theo dõi vận hành (ADR-009) cần thêm migration 002:
+Chạy tất cả migration theo thứ tự, dừng ngay khi có lỗi:
 
 ```bash
-docker compose exec -T postgres psql -U "$POSTGRES_USER" -d library_digitization \
-    < database/migrations/002_monitoring.sql
+for f in database/migrations/0*.sql; do echo "→ $f"; docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1' < "$f" || break; done
 ```
 
-Cả hai migration đều idempotent (chạy lại nhiều lần không sao) và không xóa dữ liệu — đã kiểm
-chứng trên PostgreSQL 17 thật: áp 2 lần liên tiếp không lỗi, tài liệu + metadata cũ nguyên vẹn,
-`updated_at` được điền theo `created_at`.
+Mọi migration đều idempotent (chạy lại nhiều lần không sao) và không xóa dữ liệu. Migration 001+002
+đã kiểm chứng trên PostgreSQL 17 thật: áp 2 lần liên tiếp không lỗi, tài liệu + metadata cũ nguyên
+vẹn. Migration 003–008 được CI áp hai lần trên PostgreSQL 15 và đối chiếu schema với `init.sql`.
 
-Kiểm tra sau khi chạy:
+**Nếu chưa chạy 003–008** thì hệ thống *vẫn chạy* — nhưng log PostgreSQL sẽ đầy
+`relation "queue_samples" does not exist` và `relation "batches" does not exist`, còn các trang
+Lô tài liệu / Phân tích AI / Bảng điều khiển sẽ trống. Mã nguồn nuốt các lỗi đó **có chủ đích**
+(một bảng chưa di trú không được làm gãy việc số hóa của cán bộ), nhưng PostgreSQL vẫn ghi chúng ở
+phía máy chủ. Chúng tự hết sau khi chạy migration.
+
+Kiểm tra sau khi chạy — dùng **heredoc** để psql đọc SQL từ stdin, khỏi phải lồng dấu nháy:
+
 ```bash
-docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization -c \
-  "SELECT count(*) FROM information_schema.columns WHERE table_name='documents' AND column_name IN ('updated_at','needs_review');"
-# Kỳ vọng: 2
+docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At' <<'SQL'
+SELECT count(*) FROM information_schema.tables
+WHERE table_schema = 'public'
+  AND table_name IN ('batches','queue_samples','model_call_fields','ocr_runs','user_activity');
+SQL
+# Kỳ vọng: 5
 ```
 
 ## 4. ⚠️ Lưu ý build-time cho UI (NEXT_PUBLIC_*)

@@ -5,6 +5,7 @@ FastAPI + Redis Queue + PostgreSQL + SSE
 """
 
 import os
+import time
 import uuid
 import json
 import shutil
@@ -129,11 +130,68 @@ if not _cors_origins:
 # STARTUP / SHUTDOWN
 # ---------------------------------------------------------------------
 
+# Tổng thời gian chờ PostgreSQL lúc khởi động (giây). 0 = chờ vô hạn.
+DB_STARTUP_WAIT_SEC = int(os.getenv("DB_STARTUP_WAIT_SEC", "120"))
+
+
+def _should_keep_waiting(attempt: int, elapsed: float) -> bool:
+    """
+    Còn nên tiếp tục đợi PostgreSQL, hay bỏ cuộc và khởi động ở chế độ suy giảm?
+
+    ⚠️ ĐÂY LÀ ĐIỂM QUYẾT ĐỊNH VẬN HÀNH, chưa chốt — xem phần TODO bên dưới.
+
+    Bối cảnh: `depends_on: service_healthy` trong docker-compose đã lo trường hợp `docker compose up`.
+    Hàm này lo những trường hợp CÒN LẠI mà `depends_on` không phủ:
+      • PostgreSQL restart về sau (nó có `restart: unless-stopped`, api KHÔNG được restart cùng)
+      • `docker compose restart api` một mình
+      • máy chủ khởi động lại và Docker dựng container theo thứ tự khác
+
+    TODO(trungth): chốt chính sách. Hai lựa chọn, hệ quả khác nhau ở chỗ CÁN BỘ THẤY GÌ:
+      (a) `return True` — đợi mãi. Container sống, log nói rõ đang đợi gì. Nhưng `/health` chưa
+          phục vụ được nên Caddy trả 502 và cán bộ thấy trang lỗi trắng của trình duyệt.
+      (b) `return elapsed < DB_STARTUP_WAIT_SEC` — bỏ cuộc sau 2 phút và khởi động ở chế độ suy
+          giảm: `/health` trả lời được và nói rõ "đang chờ cơ sở dữ liệu" bằng tiếng Việt, nhưng
+          mọi endpoint chạm DB phải chịu được `_pool = None`.
+    """
+    return True      # tạm thời: đợi mãi, giống hành vi của worker
+
+
+def _init_db_with_retry() -> None:
+    """
+    Mở connection pool, THỬ LẠI cho tới khi được — cùng mẫu với `worker._init_db_with_retry`.
+
+    VÌ SAO CẦN Ở CẢ API: `db.init_pool()` trần trong hàm startup làm uvicorn thoát khi PostgreSQL
+    chưa sẵn sàng, `restart: unless-stopped` cho nó chết lại vòng vòng. Đúng lỗi này đã được chẩn
+    đoán và sửa cho `worker` (xem `docker-compose.yml`, khối `depends_on` của worker) nhưng bỏ sót ở
+    `api` — nên triệu chứng là hàng trăm dòng traceback y hệt nhau trong log, không nói được gì thêm
+    sau dòng đầu.
+    """
+    delay, attempt, started = 1, 0, time.time()
+    while True:
+        attempt += 1
+        try:
+            # API chạy 2 uvicorn workers → pool cần đủ cho cả hai
+            db.init_pool(min_conn=2, max_conn=10)
+            logger.info("DB pool initialized (lần thử %d)", attempt)
+            return
+        except Exception as e:  # noqa: BLE001
+            elapsed = time.time() - started
+            if not _should_keep_waiting(attempt, elapsed):
+                logger.error(
+                    "Không nối được PostgreSQL sau %.0fs — khởi động ở chế độ SUY GIẢM. "
+                    "Các chức năng cần cơ sở dữ liệu sẽ trả lỗi cho tới khi nối lại được.", elapsed)
+                return
+            logger.error(
+                "Chưa nối được PostgreSQL (lần %d, đã đợi %.0fs): %s — thử lại sau %ds. "
+                "Kiểm tra service postgres đã chạy và POSTGRES_* có đúng chưa.",
+                attempt, elapsed, e, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+
 @app.on_event("startup")
 async def startup():
-    # API chạy 2 uvicorn workers → pool cần đủ cho cả hai
-    db.init_pool(min_conn=2, max_conn=10)
-    logger.info("DB pool initialized")
+    _init_db_with_retry()
 
     # Nấc xác thực hiện tại — ghi rõ ra log vì đây là thông tin vận hành quan trọng nhất khi gỡ lỗi
     # "vì sao gọi API không cần đăng nhập" hoặc "vì sao bị 401" (ADR-012).
