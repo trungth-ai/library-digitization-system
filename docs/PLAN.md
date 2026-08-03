@@ -73,16 +73,18 @@ Phần lớn KHÔNG phải việc code.
 
 ### Kiểm tra sau khi deploy (thứ tự này)
 ```bash
-# 1. Migration (BẮT BUỘC nếu volume postgres_data đã tồn tại)
-docker compose exec -T postgres psql -U "$POSTGRES_USER" -d library_digitization \
-    < database/migrations/001_provider_layer_and_soft_delete.sql
+# 1. Migration (BẮT BUỘC nếu volume postgres_data đã tồn tại).
+#    ⚠️ $POSTGRES_USER nằm trong .env, KHÔNG trong shell → khai triển BÊN TRONG container,
+#    nếu không sẽ nhận: FATAL: role "root" does not exist
+for f in database/migrations/0*.sql; do echo "→ $f"; docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1' < "$f" || break; done
 # 2. Công cụ đã sẵn sàng chưa
 docker compose exec api python -m scripts.eval.run_eval --health
 # 3. Log worker phải có dòng "Lớp provider BẬT — công cụ ..."
 docker compose logs worker | grep "Lớp provider"
 # 4. Xử lý 1 tài liệu thử → mở /cong-cu xem có lượt gọi model, và:
-docker compose exec postgres psql -U "$POSTGRES_USER" -d library_digitization \
-    -c "SELECT provider, deployment, latency_ms, rss_mb, n_fields FROM model_calls ORDER BY id DESC LIMIT 5;"
+docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' <<'SQL'
+SELECT provider, deployment, latency_ms, rss_mb, n_fields FROM model_calls ORDER BY id DESC LIMIT 5;
+SQL
 ```
 
 ---

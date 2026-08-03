@@ -21,9 +21,24 @@ BACKUP_PATH="${1:-}"
 [ -n "$BACKUP_PATH" ] || { echo "Dùng: $0 <đường-dẫn-bản-sao-lưu>"; exit 1; }
 [ -d "$BACKUP_PATH" ] || { echo "LỖI: không thấy thư mục $BACKUP_PATH"; exit 1; }
 
-POSTGRES_USER="${POSTGRES_USER:-postgres}"
 DRILL_DB="${DRILL_DB:-library_digitization_drill}"
 COMPOSE="${COMPOSE:-docker compose}"
+
+# ⚠️ KHÔNG đọc POSTGRES_USER từ shell của người chạy — nó nằm trong `.env`, thứ mà `docker compose`
+# đọc chứ shell thì KHÔNG. Bản đầu dùng `${POSTGRES_USER:-postgres}`, và trên máy chủ thật (user là
+# `libraryuser`) nó lặng lẽ lùi về `postgres` rồi chết với "role postgres does not exist" — một kịch
+# bản an toàn thất bại vì lý do trông như lỗi cấu hình PostgreSQL chứ không phải lỗi của chính nó.
+#
+# Khai triển biến BÊN TRONG container; giá trị host-side (`$DRILL_DB`) truyền vào bằng `-e`.
+# Đúng do kiến trúc: giá trị lấy từ chính container đã được khởi tạo bằng nó, không thể lệch.
+psql_admin() {   # nối vào CSDL chính, để tạo/xóa CSDL tạm
+    $COMPOSE exec -T -e DRILL_DB="$DRILL_DB" postgres \
+        sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" '"$*"
+}
+psql_drill() {   # nối vào CSDL tạm
+    $COMPOSE exec -T -e DRILL_DB="$DRILL_DB" postgres \
+        sh -c 'psql -U "$POSTGRES_USER" -d "$DRILL_DB" '"$*"
+}
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
@@ -37,12 +52,13 @@ log ""
 # ── 1. Dựng CSDL tạm ────────────────────────────────────────────────
 # Tên khác hẳn CSDL thật, và luôn DROP trước để lần diễn tập trước không làm sai kết quả lần này.
 log "Tạo cơ sở dữ liệu tạm..."
-$COMPOSE exec -T postgres psql -U "$POSTGRES_USER" -c "DROP DATABASE IF EXISTS $DRILL_DB;" >/dev/null
-$COMPOSE exec -T postgres psql -U "$POSTGRES_USER" -c "CREATE DATABASE $DRILL_DB;" >/dev/null
+psql_admin -c '"DROP DATABASE IF EXISTS $DRILL_DB;"' >/dev/null
+psql_admin -c '"CREATE DATABASE $DRILL_DB;"' >/dev/null
 
 # ── 2. Khôi phục ────────────────────────────────────────────────────
 log "Khôi phục bản dump..."
-if ! $COMPOSE exec -T postgres pg_restore -U "$POSTGRES_USER" -d "$DRILL_DB" --no-owner \
+if ! $COMPOSE exec -T -e DRILL_DB="$DRILL_DB" postgres \
+        sh -c 'pg_restore -U "$POSTGRES_USER" -d "$DRILL_DB" --no-owner' \
         < "$BACKUP_PATH/database.dump"; then
     log "❌ KHÔI PHỤC THẤT BẠI — bản sao lưu này KHÔNG dùng được"
     exit 1
@@ -61,8 +77,8 @@ while IFS='=' read -r bang mong_doi; do
         *) continue ;;
     esac
 
-    thuc_te="$($COMPOSE exec -T postgres psql -U "$POSTGRES_USER" -d "$DRILL_DB" -At \
-                -c "SELECT COUNT(*) FROM $bang;" 2>/dev/null | tr -d '[:space:]')"
+    thuc_te="$(psql_drill -At -c "\"SELECT COUNT(*) FROM $bang;\"" 2>/dev/null \
+                | tr -d '[:space:]')"
 
     if [ "$thuc_te" = "$mong_doi" ]; then
         log "  ✅ $bang: $thuc_te"
@@ -90,7 +106,7 @@ fi
 # ── 5. Dọn ──────────────────────────────────────────────────────────
 log ""
 log "Xóa cơ sở dữ liệu tạm..."
-$COMPOSE exec -T postgres psql -U "$POSTGRES_USER" -c "DROP DATABASE IF EXISTS $DRILL_DB;" >/dev/null
+psql_admin -c '"DROP DATABASE IF EXISTS $DRILL_DB;"' >/dev/null
 
 # ── Kết luận ────────────────────────────────────────────────────────
 log ""

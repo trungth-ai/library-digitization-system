@@ -21,9 +21,20 @@ set -euo pipefail
 BACKUP_DIR="${BACKUP_DIR:-/data/backups/docuflow}"
 BACKUP_KEEP="${BACKUP_KEEP:-14}"
 DIGITIZE_DATA_DIR="${DIGITIZE_DATA_DIR:-/data/digitization/jobs}"
-POSTGRES_USER="${POSTGRES_USER:-postgres}"
-POSTGRES_DB="${POSTGRES_DB:-library_digitization}"
 COMPOSE="${COMPOSE:-docker compose}"
+
+# ⚠️ KHÔNG đọc POSTGRES_USER/POSTGRES_DB từ shell của người chạy.
+#
+# Chúng nằm trong `.env` — thứ mà `docker compose` đọc, còn shell thì KHÔNG. Bản đầu của kịch bản này
+# dùng `${POSTGRES_USER:-postgres}`, và trên máy chủ thật (user là `libraryuser`) nó lặng lẽ lùi về
+# `postgres` rồi chết với "role postgres does not exist" — một bản sao lưu thất bại vì lý do trông
+# như lỗi cấu hình PostgreSQL chứ không phải lỗi của kịch bản.
+#
+# Thay vào đó: khai triển biến BÊN TRONG container qua `sh -c`. Đúng do kiến trúc — giá trị lấy từ
+# chính container đã được khởi tạo bằng nó, không thể lệch.
+psql_in_container() {
+    $COMPOSE exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" '"$*"
+}
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 TARGET="$BACKUP_DIR/$STAMP"
@@ -44,12 +55,19 @@ fi
 
 log "Bắt đầu sao lưu vào $TARGET"
 
+# ── 0. Kiểm nối được PostgreSQL TRƯỚC khi làm gì ────────────────────
+# Thất bại ở đây phải nói rõ là "không nối được", chứ không để lộ ra dưới dạng một tệp dump 0 byte —
+# đúng cái đã xảy ra khi kịch bản này còn đọc POSTGRES_USER từ shell.
+if ! psql_in_container -At -c "SELECT 1" >/dev/null 2>&1; then
+    fail "Không nối được PostgreSQL trong container. Kiểm tra: docker compose ps postgres"
+fi
+
 # ── 1. Cơ sở dữ liệu ────────────────────────────────────────────────
 # `--format=custom` (nén sẵn, khôi phục chọn lọc được) thay vì SQL thuần: bản dump 5 GB dạng SQL rất
 # chậm khi khôi phục và không cho phép khôi phục riêng một bảng khi cần đối chiếu.
 log "Sao lưu PostgreSQL..."
-if ! $COMPOSE exec -T postgres pg_dump \
-        -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom \
+if ! $COMPOSE exec -T postgres sh -c \
+        'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' \
         > "$TARGET/database.dump"; then
     fail "pg_dump thất bại — KHÔNG có bản sao lưu cơ sở dữ liệu"
 fi
@@ -82,17 +100,20 @@ fi
 # Ghi số bản ghi từng bảng: đây là căn cứ đối chiếu khi diễn tập khôi phục (YC-VH-08). Không có nó
 # thì "khôi phục thành công" chỉ là "lệnh chạy xong mà không báo lỗi".
 log "Ghi bản kê số bản ghi..."
-$COMPOSE exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -c "
+psql_in_container -At -c "\"
     SELECT 'documents=' || COUNT(*) FROM documents
     UNION ALL SELECT 'metadata_fields=' || COUNT(*) FROM metadata_fields
     UNION ALL SELECT 'audit_log=' || COUNT(*) FROM audit_log
     UNION ALL SELECT 'model_calls=' || COUNT(*) FROM model_calls;
-" > "$TARGET/manifest.txt" 2>/dev/null || log "CẢNH BÁO: không ghi được bản kê"
+\"" > "$TARGET/manifest.txt" 2>/dev/null || log "CẢNH BÁO: không ghi được bản kê"
+
+# Bản kê rỗng làm diễn tập khôi phục thành nghi thức trống rỗng: không có gì để đối chiếu thì
+# `restore-drill.sh` sẽ báo ĐẠT dù bản dump có vấn đề.
+[ -s "$TARGET/manifest.txt" ] || log "CẢNH BÁO: bản kê RỖNG — diễn tập khôi phục sẽ không đối chiếu được gì"
 
 {
     echo "created_at=$(date -Iseconds)"
     echo "database_bytes=$db_size"
-    echo "postgres_db=$POSTGRES_DB"
 } >> "$TARGET/manifest.txt"
 
 # ── 5. Dọn bản cũ ───────────────────────────────────────────────────
