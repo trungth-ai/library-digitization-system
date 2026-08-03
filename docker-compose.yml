@@ -58,6 +58,19 @@ services:
       # KHÔNG mở PostgreSQL ra ngoài: chỉ loopback, và đổi cổng để không đâm vào PostgreSQL
       # có thể đã chạy sẵn trên máy chủ. Trong mạng Docker các service vẫn dùng postgres:5432.
       - "${BIND_ADDR:-127.0.0.1}:${POSTGRES_HOST_PORT:-5433}:5432"
+    # Healthcheck để `api`/`worker` đợi được ĐẾN KHI SẴN SÀNG, không chỉ đợi container bắt đầu.
+    # `depends_on` trần chỉ đợi container start — PostgreSQL mất vài giây mới nhận kết nối, và lần
+    # khởi tạo đầu tiên còn chạy `init.sql` trước đó.
+    #
+    # `pg_isready` chỉ báo sẵn sàng SAU KHI entrypoint chạy xong toàn bộ `docker-entrypoint-initdb.d`,
+    # nên nó cũng bao luôn thời gian chạy `init.sql` (14 phần, có thể lâu ở lần đầu).
+    # `start_period` 60s để lần khởi tạo đầu không bị đánh dấu unhealthy oan.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-libraryuser} -d ${POSTGRES_DB:-library_digitization}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
 
   # Redis for Queue Management
   redis:
@@ -149,8 +162,13 @@ services:
       # Worker cần CẢ HAI: Redis để lấy việc, PostgreSQL để ghi trạng thái. Trước đây chỉ khai `redis`
       # nên worker khởi động trước PostgreSQL, mở pool thất bại rồi chết vòng vòng — tài liệu treo ở
       # "Chờ xử lý" mà không có dấu hiệu gì. Nay có thêm `postgres` + worker tự thử lại (xem worker.py).
-      - redis
-      - postgres
+      #
+      # `service_healthy` thay cho danh sách trần: worker tự thử lại nên nó sống sót được, nhưng đợi
+      # sẵn sàng thì log khởi động sạch hơn và không tốn mấy vòng thử vô ích.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
     # TÀI NGUYÊN: đặt qua .env để KHỚP VỚI MÁY CHỦ THẬT, không cứng trong file.
     # Giá trị cũ (2 worker × 10 CPU giới hạn / 8 CPU dự trữ = 20/16 CPU) làm Docker TỪ CHỐI khởi động
     # trên máy 4 CPU: "Range of CPUs is from 0.01 to 4.00".
@@ -338,7 +356,17 @@ services:
     networks:
       - library-net
     depends_on:
-      - redis
+      # ⚠️ API cần CẢ HAI — giống `worker`. Trước đây chỉ khai `redis`, nên khi khởi động cả stack,
+      # container `postgres` còn CHƯA TỒN TẠI trên mạng lúc api chạy → DNS nội bộ của Docker báo
+      # "could not translate host name postgres: Temporary failure in name resolution", uvicorn thoát,
+      # Docker restart, rồi đua lại vòng vòng. Đúng lỗi đã sửa cho worker mà bỏ sót ở đây.
+      #
+      # `service_healthy` (không phải `service_started`) vì `depends_on` trần chỉ đợi container BẮT
+      # ĐẦU, không đợi PostgreSQL nhận được kết nối.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
