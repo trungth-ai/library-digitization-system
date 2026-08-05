@@ -30,7 +30,13 @@ class SchemaField:
     data_type: str = "text"        # text | date | number | list
     language: Optional[str] = None # vd "vi_VN", "en_US"
     description: str = ""
+    source: str = "ai"             # ai (model trích) | system (sinh từ file/PDF) | manual (người biên mục điền)
 
+
+# Nguồn dữ liệu trường (xác định trường nào ĐƯA vào prompt AI — YC-CF chống ảo giác)
+SOURCE_AI = "ai"          # model trích từ nội dung
+SOURCE_SYSTEM = "system"  # hệ thống sinh: số trang (PDF), dung lượng (file), mimetype, dc.type
+SOURCE_MANUAL = "manual"  # người biên mục nhập: mã HPU (dc.identifier.other) — AI KHÔNG được đoán
 
 # Độ nhạy cảm (YC-DR-01) — dùng cho định tuyến ở GĐ1
 SENSITIVITY_PUBLIC = "public"       # Công khai

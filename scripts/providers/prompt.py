@@ -13,13 +13,18 @@ import re
 import json
 from typing import Callable
 
-from scripts.providers.base import ExtractionSchema, ExtractionResult, FieldValue
+from scripts.providers.base import ExtractionSchema, ExtractionResult, FieldValue, SOURCE_AI
+
+
+def _ai_fields(schema: ExtractionSchema):
+    """Chỉ trường do AI trích — loại trường hệ thống/người-điền (mã HPU, số trang...) khỏi prompt."""
+    return [f for f in schema.fields if f.source == SOURCE_AI]
 
 
 def build_schema_prompt(text: str, schema: ExtractionSchema) -> str:
     """Dựng prompt liệt kê các trường của lược đồ, yêu cầu trả JSON đúng khóa."""
     field_lines = []
-    for f in schema.fields:
+    for f in _ai_fields(schema):
         hint = ""
         if f.data_type == "list":
             hint = " [mảng]"
@@ -30,7 +35,7 @@ def build_schema_prompt(text: str, schema: ExtractionSchema) -> str:
         req = " (bắt buộc)" if f.required else ""
         field_lines.append(f'- "{f.key}": {f.label or f.key}{hint}{req}')
     fields_desc = "\n".join(field_lines)
-    example = "{\n" + ",\n".join(f'  "{f.key}": null' for f in schema.fields) + "\n}"
+    example = "{\n" + ",\n".join(f'  "{f.key}": null' for f in _ai_fields(schema)) + "\n}"
 
     return f"""Trích xuất thông tin từ tài liệu loại "{schema.document_type}" theo ĐÚNG các trường dưới đây.
 CHỈ dùng thông tin CÓ trong văn bản. Trường nào không tìm thấy thì để null — TUYỆT ĐỐI KHÔNG bịa giá trị.
@@ -51,7 +56,7 @@ def parse_schema_response(raw_text: str, schema: ExtractionSchema) -> Extraction
     data = json.loads(cleaned) if cleaned else {}
 
     fields = []
-    for f in schema.fields:
+    for f in _ai_fields(schema):
         value = data.get(f.key)
         if value is None:
             continue
