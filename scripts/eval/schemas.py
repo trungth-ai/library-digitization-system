@@ -148,8 +148,8 @@ def cong_van_schema() -> ExtractionSchema:
         SchemaField("so_trang", "Số trang", source=SOURCE_SYSTEM, description="Đếm từ PDF"),
         SchemaField("dung_luong", "Dung lượng tệp", source=SOURCE_SYSTEM, description="Từ kích thước file"),
     ]
-    return ExtractionSchema(code="cong_van", document_type="cong_van", fields=fields,
-                            context_strategy="full", sensitivity=SENSITIVITY_INTERNAL)
+    return ExtractionSchema(code="cong_van", name="Công văn hành chính", document_type="cong_van",
+                            fields=fields, context_strategy="full", sensitivity=SENSITIVITY_INTERNAL)
 
 
 # ---------------------------------------------------------------------
@@ -157,8 +157,9 @@ def cong_van_schema() -> ExtractionSchema:
 # ---------------------------------------------------------------------
 
 _REGISTRY = {
-    # 7 loại theo bộ mẫu biên mục
-    "sach":      lambda: _schema_sach("sach", "Sách", "book", "Book"),
+    # 7 loại theo bộ mẫu biên mục — document_type RIÊNG cho từng loại (không trùng 'book' của
+    # lược đồ dublin_core cũ → resolve_schema('book') vẫn ra Claude cũ, không hồi quy KT-KH).
+    "sach":      lambda: _schema_sach("sach", "Sách", "sach", "Book"),
     "de_cuong":  lambda: _schema_sach("de_cuong", "Đề cương môn học", "de_cuong", "Presentation"),
     "khoa_luan": lambda: _schema_luan("khoa_luan", "Khóa luận / Đồ án", "khoa_luan", "Thesis"),
     "luan_van":  lambda: _schema_luan("luan_van", "Luận văn thạc sỹ", "luan_van", "Thesis"),

@@ -29,6 +29,7 @@ def rows_to_schema(schema_row: Dict, field_rows: List[Dict]) -> ExtractionSchema
             data_type=r.get("data_type") or "text",
             language=r.get("language"),
             description=r.get("description") or "",
+            source=r.get("source") or "ai",
         )
         for r in sorted(field_rows, key=lambda x: x.get("sort_order", 0))
     ]
@@ -54,7 +55,7 @@ def schema_to_dict(schema: ExtractionSchema) -> Dict:
             {
                 "key": f.key, "label": f.label, "required": f.required,
                 "data_type": f.data_type, "language": f.language, "description": f.description,
-                "sort_order": i + 1,
+                "source": f.source, "sort_order": i + 1,
             }
             for i, f in enumerate(schema.fields)
         ],
@@ -67,7 +68,7 @@ def dict_to_schema(data: Dict) -> ExtractionSchema:
         SchemaField(
             key=f["key"], label=f.get("label", ""), required=bool(f.get("required", False)),
             data_type=f.get("data_type", "text"), language=f.get("language"),
-            description=f.get("description", ""),
+            description=f.get("description", ""), source=f.get("source", "ai"),
         )
         for f in sorted(data.get("fields", []), key=lambda x: x.get("sort_order", 0))
     ]
@@ -161,9 +162,10 @@ def save_schema(schema: ExtractionSchema) -> None:
             for i, f in enumerate(schema.fields):
                 cur.execute(
                     """INSERT INTO schema_fields
-                       (schema_code, key, label, required, data_type, language, description, sort_order)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (schema.code, f.key, f.label, f.required, f.data_type, f.language, f.description, i + 1),
+                       (schema_code, key, label, required, data_type, language, description, sort_order, source)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (schema.code, f.key, f.label, f.required, f.data_type, f.language,
+                     f.description, i + 1, f.source),
                 )
     logger.info("Đã lưu lược đồ '%s' (%d trường)", schema.code, len(schema.fields))
 

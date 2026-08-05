@@ -7,13 +7,17 @@
 
 | # | Loại | `document_type` | `code` lược đồ | Chuẩn | `dc.type` |
 |---|---|---|---|---|---|
-| 1 | Sách | `book` | `sach` | Dublin Core | Book |
+| 1 | Sách | `sach` | `sach` | Dublin Core | Book |
 | 2 | Đề cương môn học | `de_cuong` | `de_cuong` | Dublin Core | Presentation |
 | 3 | Khóa luận / Đồ án | `khoa_luan` | `khoa_luan` | Dublin Core | Thesis |
 | 4 | Luận văn (Thạc sỹ) | `luan_van` | `luan_van` | Dublin Core | Thesis |
 | 5 | Kỷ yếu hội thảo | `hoi_thao` | `hoi_thao` | Dublin Core | Presentation |
 | 6 | Báo / Tạp chí NCKH | `bao_nckh` | `bao_nckh` | Dublin Core | Article |
 | 7 | Công văn hành chính | `cong_van` | `cong_van` | Trường hành chính riêng | — |
+
+> Mỗi loại có `document_type` RIÊNG (= mã lược đồ), không trùng `book` của lược đồ `dublin_core` cũ —
+> nhờ đó `resolve_schema('book')` vẫn đi đường Claude cũ (không hồi quy KT-KH), còn 7 loại mới dùng
+> generic schema-driven prompt.
 
 Ba **nhóm cấu trúc trường** (Dublin Core):
 - **Nhóm SÁCH** (sách, đề cương): có `contributor.editor`, `title.alternative`, `identifier.isbn`; *không* advisor/degree.
