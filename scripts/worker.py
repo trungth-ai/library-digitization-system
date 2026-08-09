@@ -756,6 +756,20 @@ class DigitizationWorker:
                 # Tách riêng phần gọi model để biết OCR chậm hay model chậm
                 if run.get("latency_ms") is not None:
                     stage_timings["model_call"] = run["latency_ms"]
+
+                # Loại tài liệu máy đoán (YC-SC-09) — đẩy ra Redis để màn hình duyệt hiện ngay,
+                # không phải chờ tải lại danh sách từ DB.
+                detected = run.get("detected")
+                if detected:
+                    self.redis.hset(f"job:{job_id}", mapping={
+                        "detected_type": detected.get("document_type") or "",
+                        "detected_label": detected.get("label") or "",
+                        "detected_confidence": str(detected.get("confidence") or 0),
+                        "detected_reason": detected.get("reason") or "",
+                    })
+                    logger.info("Job %s: máy đoán loại '%s' (%.2f) — %s", job_id,
+                                detected.get("label"), detected.get("confidence") or 0,
+                                detected.get("reason"))
                 logger.info(
                     "Job %s trích bằng %s (%s) model=%s, %d trường, %s ms",
                     job_id, run.get("provider"), run.get("mode"), run.get("model"),

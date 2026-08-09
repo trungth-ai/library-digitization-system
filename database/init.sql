@@ -78,6 +78,14 @@ CREATE TABLE IF NOT EXISTS documents (
     needs_review           BOOLEAN     NOT NULL DEFAULT FALSE,  -- YC-CF-03: cần cán bộ xử lý tay
     review_note            TEXT,          -- lý do cần xem lại (lỗi hợp lệ, điểm tin cậy thấp)
 
+    -- Loại tài liệu MÁY đoán (YC-SC-09). Tách khỏi `document_type` (loại cán bộ chốt) để so được
+    -- "máy đoán" với "người chốt" → đo được độ chính xác. Không FK: mã lạ do model trả về vẫn phải
+    -- ghi được, đoán sai không được biến thành job thất bại.
+    detected_type          VARCHAR(50),
+    detected_confidence    NUMERIC(4, 3),
+    detected_source        VARCHAR(20),   -- filename | text | model | none
+    detected_reason        TEXT,          -- dấu hiệu đã khớp, viết bằng tiếng Việt cho cán bộ đọc
+
     -- Thời gian xử lý (theo dõi vận hành + YC-HN). `finished_at - created_at` KHÔNG dùng được vì
     -- gồm cả thời gian nằm chờ trong hàng đợi; hai cột dưới đây đo đúng phần worker thực sự làm.
     duration_ms            INTEGER,       -- tổng thời gian worker xử lý tài liệu này
@@ -103,6 +111,9 @@ CREATE INDEX IF NOT EXISTS idx_documents_not_deleted    ON documents(created_at 
     WHERE status <> 'deleted';
 CREATE INDEX IF NOT EXISTS idx_documents_needs_review   ON documents(needs_review)
     WHERE needs_review;
+-- Đo độ chính xác của việc đoán loại: "tài liệu nào máy đoán khác loại cán bộ chốt"
+CREATE INDEX IF NOT EXISTS idx_documents_detected_mismatch ON documents(created_at DESC)
+    WHERE detected_type IS NOT NULL AND detected_type <> document_type;
 
 -- =====================================================================
 -- 4b. TRIGGER: tự cập nhật updated_at (chuẩn HPU — không phụ thuộc app nhớ set)

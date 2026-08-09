@@ -71,6 +71,47 @@ def resolve_schema(document_type: str) -> ExtractionSchema:
     return schema
 
 
+def probe_text(pdf_path: str, max_pages: int = 3) -> str:
+    """
+    Đọc vài trang đầu để ĐOÁN LOẠI tài liệu (YC-SC-09), trước khi biết dùng lược đồ nào.
+
+    Đây là bước đọc CỤC BỘ, không gửi đi đâu — nên chạy được kể cả với tài liệu chưa rõ độ nhạy cảm.
+    Ba trang là đủ: bìa, trang thông tin, trang mục lục — nơi mọi dấu hiệu loại tài liệu nằm ở đó.
+    """
+    from scripts.digitize import PDFTextExtractor   # lazy: pypdf chỉ cần khi chạy thật
+
+    try:
+        return PDFTextExtractor().extract(pdf_path, max_pages=max_pages)
+    except Exception as e:  # noqa: BLE001 — không đọc được thì đoán bằng tên tệp, không làm hỏng job
+        logger.warning("Không đọc được văn bản để đoán loại tài liệu: %s", e)
+        return ""
+
+
+def local_provider_or_none(config=None):
+    """
+    Công cụ mô hình TẠI CHỖ nếu có sẵn, ngược lại None.
+
+    Dùng riêng cho việc đoán loại tài liệu: lúc đoán loại ta CHƯA biết độ nhạy cảm của tài liệu, mà
+    YC-DR-02 nói rõ "không rõ độ nhạy cảm → xử lý tại chỗ". Vì vậy tuyệt đối không được gửi văn bản
+    chưa phân loại tới công cụ đám mây chỉ để hỏi "đây là loại gì" — kể cả khi sau đó hóa ra tài
+    liệu là Công khai. Không có công cụ tại chỗ thì đoán bằng từ khóa, không gọi model.
+    """
+    try:
+        from scripts.providers.factory import get_provider
+        from scripts.providers.router import MODE_LOCAL
+
+        provider = get_provider(kind=MODE_LOCAL, config=config)
+        if provider.deployment != MODE_LOCAL:
+            logger.info("Không dùng model để đoán loại: công cụ tại chỗ đang trỏ tới dịch vụ đám mây")
+            return None
+        if not provider.health().ready:
+            return None
+        return provider
+    except Exception as e:  # noqa: BLE001 — chưa cấu hình model tại chỗ là chuyện bình thường
+        logger.debug("Không có công cụ tại chỗ để đoán loại tài liệu: %s", e)
+        return None
+
+
 def select_context(pdf_path: str, schema: ExtractionSchema) -> str:
     """
     Chọn ngữ cảnh đưa vào model theo `schema.context_strategy` (YC-SC-04).
@@ -113,6 +154,43 @@ class ProviderMetadataExtractor:
         # Giữ ở mức đối tượng thay vì truyền qua tham số vì `_persist` đã là bước cuối của luồng.
         self._last_result = None
         self._last_context: str = ""
+        # Loại tài liệu máy đoán được ở lần trích gần nhất (None nếu cán bộ đã chọn tay).
+        # Worker đọc qua `last_run["detected"]` để ghi vào DB.
+        self._suggestion = None
+
+    # -- Đoán loại tài liệu (YC-SC-09) ------------------------------------
+    def _resolve_document_type(self, pdf_path: str) -> str:
+        """
+        Quyết định dùng lược đồ của loại tài liệu nào.
+
+        Cán bộ chọn tay → dùng đúng lựa chọn đó, KHÔNG đoán lại (con người giữ quyền quyết định).
+        Cán bộ chọn "tự đoán" → đọc vài trang đầu rồi đối sánh dấu hiệu; chỉ hỏi model khi từ khóa
+        không đủ tự tin VÀ có công cụ TẠI CHỖ (không gửi tài liệu chưa phân loại ra đám mây).
+
+        Đoán hỏng thì lùi về loại mặc định cũ — tài liệu vẫn được số hóa, không mất.
+        """
+        from scripts.core import doc_classifier
+
+        requested = getattr(self.config, "document_type", "book")
+        self._suggestion = None
+        if not doc_classifier.is_auto(requested):
+            return requested
+
+        try:
+            text = probe_text(pdf_path)
+            filename = os.path.basename(pdf_path or "")
+            suggestion = doc_classifier.classify(
+                text, filename=filename, provider=local_provider_or_none(self.config),
+            )
+        except Exception as e:  # noqa: BLE001 — đoán loại là việc phụ, không được làm mất tài liệu
+            logger.error("Đoán loại tài liệu thất bại, dùng loại mặc định: %s", e)
+            return doc_classifier.FALLBACK_TYPE
+
+        self._suggestion = suggestion
+        logger.info("Đoán loại tài liệu: %s (tin cậy %.2f, nguồn %s) — %s",
+                    suggestion.document_type, suggestion.confidence, suggestion.source,
+                    suggestion.reason_vi())
+        return suggestion.document_type
 
     # -- Giao diện giống AIMetadataExtractor -------------------------------
     def extract(self, pdf_path: str) -> Dict:
@@ -120,7 +198,8 @@ class ProviderMetadataExtractor:
         from scripts.core import quality
         from scripts.providers import fallback, router
 
-        schema = resolve_schema(getattr(self.config, "document_type", "book"))
+        document_type = self._resolve_document_type(pdf_path)
+        schema = resolve_schema(document_type)
 
         # Ràng buộc cứng YC-DR-03: vi phạm thì PHẢI dừng, không được "cứ xử lý tạm".
         # SensitivityViolation cố ý bay ra ngoài để worker cho job thất bại có mô tả.
@@ -173,6 +252,8 @@ class ProviderMetadataExtractor:
             "latency_ms": self._sample.latency_ms if self._sample else None,
             "rss_mb": self._sample.rss_mb if self._sample else None,
             "gpu_mem_mb": self._sample.gpu_mem_mb if self._sample else None,
+            "document_type": document_type,
+            "detected": self._suggestion.to_dict() if self._suggestion else None,
         }
 
         self._persist(schema)
@@ -191,6 +272,8 @@ class ProviderMetadataExtractor:
             "low_confidence_fields": [], "needs_review": True, "review_note": reason,
             "fallback_from": None, "n_fields": 0, "error": reason,
             "latency_ms": None, "rss_mb": None, "gpu_mem_mb": None,
+            "document_type": schema.document_type,
+            "detected": self._suggestion.to_dict() if self._suggestion else None,
         }
         self._persist(schema)
         return {"metadata": [], "extraction": dict(self.last_run)}
@@ -329,6 +412,17 @@ class ProviderMetadataExtractor:
                 db.log_model_call_fields(
                     model_call_id=model_call_id, document_id=self.document_id,
                     fields=self._field_rows(), preview_chars=FIELD_PREVIEW_CHARS,
+                )
+
+            # Loại tài liệu máy đoán (YC-SC-09). Chỉ ghi khi THỰC SỰ có đoán — cán bộ chọn tay thì
+            # `_suggestion` là None và cột `detected_*` giữ nguyên rỗng, đúng nghĩa "máy không đoán".
+            if self.document_id and self._suggestion is not None:
+                s = self._suggestion
+                db.set_detected_type(
+                    self.document_id, detected_type=s.document_type, confidence=s.confidence,
+                    source=s.source, reason=s.reason_vi(),
+                    # Cán bộ đã chọn "tự đoán" nên loại đoán được TRỞ THÀNH loại đang dùng
+                    apply_to_document=True,
                 )
 
             if self.document_id:

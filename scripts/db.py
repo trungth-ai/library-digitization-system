@@ -192,6 +192,11 @@ def get_document(job_id: str) -> Optional[Dict]:
             d.extraction_model,
             d.needs_review,
             d.review_note,
+            -- Loại tài liệu MÁY đoán (YC-SC-09) — để màn hình duyệt hiện gợi ý kèm lý do
+            d.detected_type,
+            d.detected_confidence,
+            d.detected_source,
+            d.detected_reason,
             -- DSpace fields
             d.dspace_status,
             ds.label            AS dspace_status_label,
@@ -776,6 +781,60 @@ def set_extraction_info(
     logger.debug(f"Extraction info saved: {job_id} → {provider}/{mode}/{model}")
 
 
+def update_document_type(job_id: str, document_type: str) -> None:
+    """Cán bộ chốt lại loại tài liệu. `detected_type` KHÔNG đụng tới — đó là ý kiến của máy."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE documents SET document_type = %s WHERE id = %s",
+                (document_type, job_id),
+            )
+    logger.info("Đổi loại tài liệu %s → %s", job_id, document_type)
+
+
+def set_detected_type(
+    job_id: str,
+    detected_type: str,
+    confidence: Optional[float] = None,
+    source: Optional[str] = None,
+    reason: Optional[str] = None,
+    apply_to_document: bool = False,
+) -> None:
+    """
+    Ghi loại tài liệu MÁY đoán được (YC-SC-09).
+
+    `apply_to_document=True` chỉ khi cán bộ đã chọn "để hệ thống tự đoán" — lúc đó loại đoán được
+    trở thành loại đang dùng. Nếu cán bộ đã chọn tay thì KHÔNG ghi đè: ý kiến của máy vẫn được lưu
+    để đối chiếu, nhưng lựa chọn của con người thắng (nguyên tắc SRS).
+
+    Việc ghi đè dùng câu điều kiện phòng khi loại đoán được không có trong `document_types` (model
+    trả mã lạ) — khóa ngoại sẽ từ chối, và một tài liệu đã OCR xong không đáng bị hỏng vì đoán sai.
+    """
+    sql = """
+        UPDATE documents
+        SET detected_type       = %(detected_type)s,
+            detected_confidence = %(confidence)s,
+            detected_source     = %(source)s,
+            detected_reason     = %(reason)s,
+            document_type       = CASE
+                WHEN %(apply)s AND EXISTS (
+                    SELECT 1 FROM document_types WHERE code = %(detected_type)s AND is_active
+                ) THEN %(detected_type)s
+                ELSE document_type
+            END
+        WHERE id = %(job_id)s
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {
+                "job_id": job_id, "detected_type": detected_type, "confidence": confidence,
+                "source": source, "reason": reason, "apply": bool(apply_to_document),
+            })
+
+    logger.info("Loại tài liệu đoán được cho %s: %s (%.2f, %s)",
+                job_id, detected_type, confidence or 0.0, source)
+
+
 def log_model_call(
     provider: str,
     deployment: str,
@@ -952,11 +1011,15 @@ def list_pending_review(assigned_to: Optional[int] = None, only_unassigned: bool
         SELECT d.id, d.filename, d.status, d.needs_review, d.review_note,
                d.created_at, d.updated_at, d.assigned_to, d.batch_id,
                d.extraction_provider, d.extraction_mode,
+               d.document_type, dt.label AS document_type_label,
+               -- Máy đoán loại gì và vì sao: cán bộ duyệt cần thấy để đồng ý hay sửa lại
+               d.detected_type, d.detected_confidence, d.detected_source, d.detected_reason,
                ROUND(EXTRACT(EPOCH FROM (NOW() - d.updated_at)) / 3600) AS gio_cho,
                (SELECT COUNT(*) FROM metadata_fields m
                  WHERE m.document_id = d.id AND m.confidence IS NOT NULL AND m.confidence < 0.5)
                    AS so_truong_diem_thap
         FROM documents d
+        JOIN document_types dt ON dt.code = d.document_type
         WHERE {' AND '.join(conditions)}
         ORDER BY d.needs_review DESC, d.updated_at ASC
         LIMIT %s OFFSET %s

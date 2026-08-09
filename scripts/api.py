@@ -5,6 +5,7 @@ FastAPI + Redis Queue + PostgreSQL + SSE
 """
 
 import os
+import re
 import time
 import uuid
 import json
@@ -1396,6 +1397,48 @@ async def set_dspace_collection(job_id: str, body: DSpaceCollectionUpdate,
     )
 
     return {"message": "Collection updated", "job_id": job_id}
+
+
+class DocumentTypeUpdate(BaseModel):
+    document_type: str
+
+
+@app.put("/api/v2/jobs/{job_id}/document-type")
+async def set_document_type(job_id: str, body: DocumentTypeUpdate,
+                            principal: Principal = Depends(require(policy.DOCUMENT_EDIT))):
+    """
+    Cán bộ sửa lại loại tài liệu máy đã đoán (YC-SC-09).
+
+    Ghi audit MỖI LẦN sửa, vì đây chính là số liệu nói bộ đoán loại sai ở đâu: `detected_type` giữ
+    nguyên ý kiến của máy, còn `document_type` là kết luận của người. So hai cột đó trên toàn bộ
+    tài liệu ra được tỉ lệ đoán đúng — không có audit thì chỉ còn cảm tính.
+
+    KHÔNG trích xuất lại tự động: đổi loại nghĩa là đổi lược đồ, và chạy lại model trên hàng trăm
+    tài liệu vì một cú bấm nhầm là chuyện phải do người quyết định (dùng đường thử lại của hàng đợi).
+    """
+    doc = db.get_document(job_id)
+    if not doc:
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy tài liệu", code="NOT_FOUND"))
+
+    hop_le = {t["code"] for t in db.get_document_types()}
+    if body.document_type not in hop_le:
+        return JSONResponse(status_code=400, content=err_envelope(
+            f"Loại tài liệu '{body.document_type}' không hợp lệ", code="INVALID_TYPE"))
+
+    truoc = doc.get("document_type")
+    if truoc == body.document_type:
+        return success({"job_id": job_id, "document_type": truoc}, "Loại tài liệu không đổi")
+
+    db.update_document_type(job_id, body.document_type)
+    audit.log_action(
+        action=audit.ACTION_EDIT_FIELD, document_id=job_id, actor=principal.actor,
+        detail={"field": "document_type", "truoc": truoc, "sau": body.document_type,
+                "may_doan": doc.get("detected_type")},
+    )
+
+    return success({"job_id": job_id, "document_type": body.document_type},
+                   "Đã cập nhật loại tài liệu")
 
 
 @app.put("/api/v2/jobs/{job_id}/dspace-status")

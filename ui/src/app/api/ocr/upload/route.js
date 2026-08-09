@@ -9,6 +9,10 @@ export async function POST(req) {
     const file = formData.get('file');
     const collection = formData.get('collection') || 'default';
     const language = formData.get('language') || 'vie';
+    // Loại tài liệu (YC-SC-09). Route này TRƯỚC ĐÂY bỏ rơi trường này, nên mọi tệp tải qua trang
+    // chính đều vào backend với loại mặc định 'book' dù cán bộ chọn gì — dựng lại nguyên vẹn.
+    // Mặc định 'book' (KHÔNG phải 'auto') để giữ đúng hành vi cũ cho client chưa gửi trường này.
+    const docType = formData.get('doc_type') || 'book';
 
     if (!file) {
       return NextResponse.json({ error: 'No file provided' }, { status: 400 });
@@ -22,6 +26,7 @@ export async function POST(req) {
     uploadFormData.append('file', file);
     uploadFormData.append('collection', collection);
     uploadFormData.append('language', language);
+    uploadFormData.append('doc_type', docType);
 
     const res = await fetch(`${ocrApiUrl}/api/v1/process`, {
       method: 'POST',
