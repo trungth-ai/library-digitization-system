@@ -1,8 +1,30 @@
 # DocuFlow HP — Trạng thái nâng cấp & Bàn giao
 
-> Cập nhật: 29/07/2026. Repo: `github.com/trungth-ai/library-digitization-system`.
+> Cập nhật: 09/08/2026. Repo: `github.com/trungth-ai/library-digitization-system`.
 > Số commit mới nhất: xem `git log --oneline`. Tài liệu này để kỹ sư tiếp quản (YC-VH-01) nắm nhanh:
 > đã làm gì, cách kiểm chứng, còn gì — và **bắt đầu lần nâng cấp tiếp theo từ mục 4**.
+
+## 0. Đợt 09/08/2026 — biên mục thông minh, nạp từ Drive, thống kê người dùng
+
+| Hạng mục | Yêu cầu | Module | Kiểm chứng |
+|---|---|---|---|
+| **7 lược đồ biên mục** theo bộ mẫu HPU + cột `source` (ai/system/manual) — mã HPU và trường hệ thống KHÔNG lọt vào prompt AI | YC-SC | `scripts/eval/schemas.py`, `providers/prompt.py`, migration 009 | 18 pytest · CI xanh (PR #4 đã merge) |
+| **Đoán loại tài liệu ba tầng** (tên tệp → nội dung sau OCR → hỏi model tại chỗ), có giải thích được | YC-SC-09→14 | `scripts/core/doc_classifier.py`, `core/extraction.py`, migration 010 | 41 pytest |
+| **Dropdown loại tài liệu** ở màn hình tải lên / lô / duyệt, kèm gợi ý + nút "dùng gợi ý này" | YC-SC-11 | `ui/src/components/DocumentTypeSelect.jsx`, `OCRUploader.jsx`, `/lo`, `/duyet` | UI build exit 0 |
+| **Nạp tự động từ Google Drive** — quét định kỳ, chống trùng ba lớp, chỉ đọc trên Drive | YC-BU-21 | `scripts/core/{gdrive,drive_ingest}.py`, `worker.py`, migration 011, `/nguon-drive` | 27 pytest (lớp giả, không cần mạng) |
+| **Thống kê theo người dùng & quản trị** + cảnh báo an ninh + độ chính xác đoán loại | YC-TT | `scripts/core/user_stats.py`, `/thong-ke` | 15 pytest |
+
+**631 pytest PASS** (trước đợt này: 589) · `compileall` sạch · `npm run build` exit 0 · schema
+`init.sql` khớp migrations (đối chiếu tĩnh).
+
+⚠️ **Chưa kiểm chứng được trên máy dev, phải chạy trước khi triển khai:**
+- **Migration 010 + 011 áp hai lần trên PostgreSQL thật** — máy dev không chạy được Docker.
+  CI job `migrations` làm việc này; xem kết quả trên GitHub Actions trước khi deploy.
+- **Nạp Drive đầu-cuối với tài khoản Google thật** (KT-BU-39/40) — cần khóa tài khoản dịch vụ.
+- **Kiểm nhật ký không lọt token Drive** (KT-BM-22) — cần chạy thật rồi đọc log.
+
+**Bật nạp Drive:** `DRIVE_INGEST_ENABLED=1` + cấu hình `GDRIVE_*` (xem `.env.example`).
+Mặc định TẮT — tính năng gọi ra Internet và tự tạo việc trong hàng đợi, phải bật có ý thức.
 
 ## 1. Đã hoàn thành (kiểm chứng ở dev)
 
