@@ -1721,9 +1721,239 @@ async def get_stats():
     return stats
 
 
+# ---------------------------------------------------------------------
+# ROUTES - NGUỒN GOOGLE DRIVE (YC-BU-21)
+#
+# Cấu hình nguồn là việc QUẢN TRỊ (`SYSTEM_CONFIG`): nó quyết định hệ thống tự động gọi ra Internet
+# và tự tạo việc trong hàng đợi. Quét tay thì chỉ cần quyền tải tài liệu — đó là thao tác nghiệp vụ
+# hằng ngày của cán bộ thư viện.
+# ---------------------------------------------------------------------
+
+class DriveSourceRequest(BaseModel):
+    name: str
+    folder_id: str
+    document_type: str = "auto"
+    collection_id: str = ""
+    collection_name: str = ""
+    language: str = "vie"
+    priority: str = "low"
+    scan_interval_sec: int = 300
+
+
+class DriveSourceUpdate(BaseModel):
+    name: Optional[str] = None
+    document_type: Optional[str] = None
+    collection_id: Optional[str] = None
+    collection_name: Optional[str] = None
+    language: Optional[str] = None
+    priority: Optional[str] = None
+    status: Optional[str] = None                 # active | paused | deleted (xóa mềm)
+    scan_interval_sec: Optional[int] = None
+
+
+def _extract_folder_id(raw: str) -> str:
+    """
+    Chấp nhận cả URL Drive lẫn mã thư mục trần.
+
+    Cán bộ sẽ dán URL từ thanh địa chỉ — bắt họ tự cắt lấy đoạn mã giữa hai dấu gạch chéo là chỗ
+    sai sót không cần thiết, và khi sai thì lỗi hiện ra là "403 không có quyền", nghe như lỗi cấu
+    hình chia sẻ chứ không phải lỗi dán nhầm.
+    """
+    value = (raw or "").strip()
+    match = re.search(r"/folders/([A-Za-z0-9_-]+)", value)
+    if match:
+        return match.group(1)
+    match = re.search(r"[?&]id=([A-Za-z0-9_-]+)", value)
+    if match:
+        return match.group(1)
+    return value.rstrip("/").split("/")[-1]
+
+
+@app.get("/api/v2/drive/sources")
+async def api_list_drive_sources(principal: Principal = Depends(require(policy.DOCUMENT_READ))):
+    """Danh sách thư mục Drive đang được quét, kèm kết quả lượt quét gần nhất."""
+    try:
+        return success(db.list_drive_sources(), "Danh sách nguồn Google Drive")
+    except Exception as e:  # noqa: BLE001 — chưa chạy migration 011 thì nói rõ, không đổ 500 trống
+        logger.warning("Không đọc được nguồn Drive: %s", e)
+        return JSONResponse(status_code=503, content=err_envelope(
+            "Chưa dùng được tính năng nạp từ Google Drive. "
+            "Hãy chạy migration 011_drive_ingest.sql trước.", code="DRIVE_NOT_READY"))
+
+
+@app.post("/api/v2/drive/sources")
+async def api_create_drive_source(
+    body: DriveSourceRequest,
+    principal: Principal = Depends(require(policy.SYSTEM_CONFIG)),
+):
+    """
+    Thêm/cập nhật một thư mục Drive để quét định kỳ.
+
+    KIỂM TRA NGAY LÚC LƯU: gọi Drive lấy tên thư mục. Lưu được một cấu hình sai rồi để cán bộ chờ
+    5 phút mới thấy "403" trong nhật ký là cách chẩn đoán tệ nhất — sai thì phải biết ngay tại chỗ.
+    """
+    from scripts.core import gdrive
+
+    folder_id = _extract_folder_id(body.folder_id)
+    if not folder_id:
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Chưa nhập mã thư mục Drive (hoặc URL thư mục)", code="MISSING_FOLDER"))
+
+    client = gdrive.client_from_env()
+    if not client.configured:
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Máy chủ chưa cấu hình xác thực Google Drive. Đặt GDRIVE_SERVICE_ACCOUNT_FILE, hoặc "
+            "bộ ba GDRIVE_OAUTH_CLIENT_ID / _CLIENT_SECRET / _REFRESH_TOKEN rồi khởi động lại.",
+            code="DRIVE_NOT_CONFIGURED"))
+
+    try:
+        folder_name = await run_in_threadpool(client.folder_name, folder_id)
+    except gdrive.DriveError as e:
+        return JSONResponse(status_code=400, content=err_envelope(str(e), code="DRIVE_ERROR"))
+
+    source_id = db.create_drive_source(
+        name=body.name.strip() or folder_name or folder_id, folder_id=folder_id,
+        folder_name=folder_name, document_type=body.document_type,
+        collection_id=body.collection_id, collection_name=body.collection_name,
+        language=body.language,
+        priority=body.priority if body.priority in jobqueue.PRIORITIES else "low",
+        scan_interval_sec=max(60, body.scan_interval_sec),
+        created_by=principal.user_id,
+    )
+
+    audit.log_action(action="drive_source_create", actor=principal.actor,
+                     detail={"source_id": source_id, "folder_id": folder_id,
+                             "folder_name": folder_name})
+
+    return success({"id": source_id, "folder_id": folder_id, "folder_name": folder_name},
+                   f"Đã kết nối thư mục «{folder_name or folder_id}»")
+
+
+@app.put("/api/v2/drive/sources/{source_id}")
+async def api_update_drive_source(
+    source_id: int, body: DriveSourceUpdate,
+    principal: Principal = Depends(require(policy.SYSTEM_CONFIG)),
+):
+    """Sửa cấu hình nguồn. `status='deleted'` là XÓA MỀM — sổ tệp đã nạp vẫn giữ nguyên."""
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not fields:
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Không có trường nào để cập nhật", code="NOTHING_TO_UPDATE"))
+
+    if "status" in fields and fields["status"] not in ("active", "paused", "deleted"):
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Trạng thái chỉ nhận: active, paused, deleted", code="INVALID_STATUS"))
+    if "scan_interval_sec" in fields:
+        fields["scan_interval_sec"] = max(60, int(fields["scan_interval_sec"]))
+
+    if not db.update_drive_source(source_id, **fields):
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy nguồn Drive này", code="NOT_FOUND"))
+
+    audit.log_action(action="drive_source_update", actor=principal.actor,
+                     detail={"source_id": source_id, **fields})
+    return success({"id": source_id, **fields}, "Đã cập nhật nguồn Google Drive")
+
+
+@app.post("/api/v2/drive/sources/{source_id}/scan")
+async def api_scan_drive_source(
+    source_id: int,
+    principal: Principal = Depends(require(policy.DOCUMENT_UPLOAD)),
+):
+    """
+    Quét NGAY một nguồn, không đợi chu kỳ.
+
+    Có nút này thì cán bộ vừa đặt tài liệu vào thư mục là kéo được vào hệ thống luôn, thay vì ngồi
+    đợi tới 5 phút và không chắc hệ thống có đang chạy hay không.
+
+    Chạy trong threadpool: quét gồm tải tệp qua mạng — chặn event loop sẽ làm treo cả API.
+    """
+    from scripts.core import drive_ingest
+
+    source = db.get_drive_source(source_id)
+    if not source or source["status"] == "deleted":
+        return JSONResponse(status_code=404, content=err_envelope(
+            "Không tìm thấy nguồn Drive này", code="NOT_FOUND"))
+
+    result = await run_in_threadpool(
+        drive_ingest.scan_source, source,
+        base_dir=BASE_DIR, enqueue=enqueue_job, redis_client=redis_client,
+    )
+    db.update_drive_scan_result(
+        source_id, status="ok" if result.ok else "error",
+        message=result.error or "", found=result.found, ingested=result.ingested,
+    )
+    audit.log_action(action="drive_scan", actor=principal.actor, detail=result.to_dict())
+
+    if not result.ok:
+        return JSONResponse(status_code=502, content=err_envelope(
+            result.error, code="DRIVE_SCAN_FAILED"))
+
+    return success(
+        result.to_dict(),
+        f"Đã nạp {result.ingested} tài liệu mới"
+        + (f", bỏ qua {result.skipped}" if result.skipped else "")
+        + (f", lỗi {result.failed}" if result.failed else ""),
+    )
+
+
+@app.get("/api/v2/drive/sources/{source_id}/files")
+async def api_list_drive_files(
+    source_id: int,
+    status: Optional[str] = Query(None, description="ingested | skipped | failed"),
+    limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0),
+    principal: Principal = Depends(require(policy.DOCUMENT_READ)),
+):
+    """Lịch sử tệp của một nguồn — quan trọng nhất là lọc `status=failed` để biết cần xử lý gì."""
+    return success(db.list_drive_files(source_id, status=status, limit=limit, offset=offset),
+                   "Lịch sử tệp từ Google Drive")
+
+
+@app.get("/api/v2/drive/health")
+async def api_drive_health(principal: Principal = Depends(require(policy.DOCUMENT_READ))):
+    """Cấu hình Drive có dùng được không — trả lời TRƯỚC khi cán bộ mất công thêm thư mục."""
+    from scripts.core import gdrive
+
+    client = gdrive.client_from_env()
+    ready, detail = await run_in_threadpool(client.health)
+    return success({"san_sang": ready, "chi_tiet": detail,
+                    "da_cau_hinh": client.configured}, detail)
+
+
 @app.get("/api/v2/lookup/document-types")
 async def get_document_types():
     return db.get_document_types()
+
+
+class ClassifyFilenamesRequest(BaseModel):
+    filenames: List[str]
+
+
+@app.post("/api/v2/classify/filenames")
+async def api_classify_filenames(
+    body: ClassifyFilenamesRequest,
+    principal: Principal = Depends(require(policy.DOCUMENT_UPLOAD)),
+):
+    """
+    Gợi ý loại tài liệu từ TÊN TỆP, ngay khi cán bộ vừa chọn tệp — trước khi tải lên (YC-SC-09).
+
+    Nhận cả DANH SÁCH tên tệp trong một lượt: lô 500 tệp mà gọi 500 request thì giao diện đứng hình,
+    trong khi phép đoán này chỉ là đối sánh chuỗi, gộp lại gần như không tốn gì thêm.
+
+    Đây mới là gợi ý SƠ BỘ. Gợi ý chính xác hơn (đọc nội dung sau khi OCR) nằm ở
+    `documents.detected_*`, hiện trên màn hình duyệt.
+    """
+    from scripts.core import doc_classifier
+
+    if len(body.filenames) > 2000:
+        return JSONResponse(status_code=400, content=err_envelope(
+            "Mỗi lượt gợi ý tối đa 2000 tên tệp", code="TOO_MANY"))
+
+    ket_qua = [
+        {"filename": ten, **doc_classifier.suggest_from_filename(ten).to_dict()}
+        for ten in body.filenames
+    ]
+    return success(ket_qua, f"Đã gợi ý loại cho {len(ket_qua)} tệp")
 
 
 @app.get("/api/v2/lookup/job-statuses")

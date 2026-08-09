@@ -865,5 +865,65 @@ CREATE INDEX IF NOT EXISTS idx_documents_unconfirmed ON documents(updated_at ASC
     WHERE confirmed_at IS NULL AND status = 'completed';
 
 -- =====================================================================
+-- 15. NẠP TỰ ĐỘNG TỪ GOOGLE DRIVE (YC-BU-21)
+--     Giữ ĐỒNG BỘ với database/migrations/011_drive_ingest.sql.
+--
+--     `drive_sources` là CẤU HÌNH (thư mục nào, tham số gì); `drive_files` là SỔ GHI tệp nào đã nạp
+--     — chính sổ này làm cho việc quét lặp lại an toàn, không tạo job trùng.
+--
+--     Máy khách Drive CHỈ ĐỌC: hệ thống không bao giờ sửa/xóa tệp gốc của Nhà trường.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS drive_sources (
+    id                  SERIAL PRIMARY KEY,
+    name                VARCHAR(200) NOT NULL,
+    folder_id           VARCHAR(200) NOT NULL UNIQUE,
+    folder_name         VARCHAR(300) DEFAULT '',
+    document_type       VARCHAR(50)  NOT NULL DEFAULT 'auto',  -- 'auto' = đoán theo nội dung (YC-SC-09)
+    collection_id       TEXT         NOT NULL DEFAULT '',
+    collection_name     TEXT         NOT NULL DEFAULT '',
+    language            VARCHAR(20)  NOT NULL DEFAULT 'vie',
+    priority            VARCHAR(10)  NOT NULL DEFAULT 'low',   -- mẻ nền, không chen tài liệu lẻ
+    status              VARCHAR(20)  NOT NULL DEFAULT 'active', -- active | paused | deleted (xóa mềm)
+    scan_interval_sec   INTEGER      NOT NULL DEFAULT 300,
+    last_scan_at        TIMESTAMPTZ,
+    last_scan_status    VARCHAR(20),
+    last_scan_message   TEXT,
+    last_scan_found     INTEGER      NOT NULL DEFAULT 0,
+    last_scan_ingested  INTEGER      NOT NULL DEFAULT 0,
+    created_by          INTEGER,
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_drive_sources_active ON drive_sources(last_scan_at NULLS FIRST)
+    WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS drive_files (
+    id             SERIAL PRIMARY KEY,
+    source_id      INTEGER      NOT NULL REFERENCES drive_sources(id),
+    -- DUY NHẤT TOÀN BẢNG: cùng một tệp chia sẻ vào hai thư mục vẫn là MỘT tài liệu
+    drive_file_id  VARCHAR(200) NOT NULL UNIQUE,
+    filename       TEXT         NOT NULL,
+    size_bytes     BIGINT       NOT NULL DEFAULT 0,
+    drive_md5      VARCHAR(64)  DEFAULT '',
+    modified_time  TIMESTAMPTZ,
+    job_id         TEXT         REFERENCES documents(id),
+    status         VARCHAR(20)  NOT NULL DEFAULT 'ingested',   -- ingested | skipped | failed
+    note           TEXT,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_drive_files_source ON drive_files(source_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_drive_files_failed ON drive_files(source_id, updated_at DESC)
+    WHERE status = 'failed';
+
+DROP TRIGGER IF EXISTS trg_drive_sources_touch ON drive_sources;
+CREATE TRIGGER trg_drive_sources_touch BEFORE UPDATE ON drive_sources
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+DROP TRIGGER IF EXISTS trg_drive_files_touch ON drive_files;
+CREATE TRIGGER trg_drive_files_touch BEFORE UPDATE ON drive_files
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+-- =====================================================================
 -- END OF SCHEMA
 -- =====================================================================

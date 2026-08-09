@@ -1347,3 +1347,193 @@ def processing_time_summary(since_hours: int = 24) -> Dict:
 
     # NUMERIC → Decimal; đổi sang int để JSON hóa được. None nghĩa là CHƯA CÓ SỐ, không phải 0.
     return {k: (int(v) if v is not None else None) for k, v in row.items()}
+
+
+# =============================================================
+# NGUỒN GOOGLE DRIVE (YC-BU-21)
+# =============================================================
+
+def list_drive_sources(include_deleted: bool = False) -> List[Dict]:
+    """Danh sách nguồn Drive. Nguồn xóa mềm bị ẩn mặc định (chuẩn HPU: không xóa cứng)."""
+    where = "" if include_deleted else "WHERE status <> 'deleted'"
+    sql = f"""
+        SELECT s.*,
+               (SELECT COUNT(*) FROM drive_files f
+                 WHERE f.source_id = s.id AND f.status = 'ingested')  AS so_da_nap,
+               (SELECT COUNT(*) FROM drive_files f
+                 WHERE f.source_id = s.id AND f.status = 'failed')    AS so_loi
+        FROM drive_sources s
+        {where}
+        ORDER BY s.created_at DESC
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql)
+            return [dict(r) for r in cur.fetchall()]
+
+
+def get_drive_source(source_id: int) -> Optional[Dict]:
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM drive_sources WHERE id = %s", (source_id,))
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def create_drive_source(name: str, folder_id: str, folder_name: str = "",
+                        document_type: str = "auto", collection_id: str = "",
+                        collection_name: str = "", language: str = "vie",
+                        priority: str = "low", scan_interval_sec: int = 300,
+                        created_by: Optional[int] = None) -> int:
+    """
+    Thêm một thư mục Drive để quét định kỳ.
+
+    `folder_id` là DUY NHẤT: hai nguồn cùng trỏ một thư mục sẽ tranh nhau nạp cùng bộ tệp. Nếu thư
+    mục đó từng bị xóa mềm thì BẬT LẠI bản ghi cũ thay vì tạo bản mới — sổ `drive_files` của nó vẫn
+    còn, nên bật lại sẽ không nạp trùng những tệp đã xử lý.
+    """
+    sql = """
+        INSERT INTO drive_sources
+            (name, folder_id, folder_name, document_type, collection_id, collection_name,
+             language, priority, scan_interval_sec, created_by, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active')
+        ON CONFLICT (folder_id) DO UPDATE SET
+            name = EXCLUDED.name, folder_name = EXCLUDED.folder_name,
+            document_type = EXCLUDED.document_type,
+            collection_id = EXCLUDED.collection_id, collection_name = EXCLUDED.collection_name,
+            language = EXCLUDED.language, priority = EXCLUDED.priority,
+            scan_interval_sec = EXCLUDED.scan_interval_sec, status = 'active'
+        RETURNING id
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (name, folder_id, folder_name, document_type, collection_id,
+                              collection_name, language, priority, scan_interval_sec, created_by))
+            source_id = cur.fetchone()[0]
+
+    logger.info("Nguồn Drive '%s' (thư mục %s) → #%s", name, folder_id, source_id)
+    return source_id
+
+
+def update_drive_source(source_id: int, **fields) -> bool:
+    """
+    Sửa cấu hình nguồn. Chỉ nhận đúng các cột được phép — KHÔNG ghép tên cột lấy từ dữ liệu người
+    dùng vào câu SQL, dù nơi gọi hiện tại đã kiểm (phòng vệ nhiều lớp).
+    """
+    cho_phep = {"name", "folder_name", "document_type", "collection_id", "collection_name",
+                "language", "priority", "status", "scan_interval_sec"}
+    sets, params = [], []
+    for key, value in fields.items():
+        if key in cho_phep:
+            sets.append(f"{key} = %s")
+            params.append(value)
+    if not sets:
+        return False
+
+    params.append(source_id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE drive_sources SET {', '.join(sets)} WHERE id = %s", params)
+            return cur.rowcount > 0
+
+
+def list_due_drive_sources() -> List[Dict]:
+    """
+    Nguồn đang bật và đã tới hạn quét.
+
+    `last_scan_at IS NULL` (nguồn vừa thêm) cũng tính là tới hạn — cán bộ thêm thư mục xong phải
+    thấy nó chạy ngay, chứ không phải chờ hết một chu kỳ mới biết mình cấu hình đúng hay sai.
+    """
+    sql = """
+        SELECT * FROM drive_sources
+        WHERE status = 'active'
+          AND (last_scan_at IS NULL
+               OR last_scan_at < NOW() - (scan_interval_sec || ' seconds')::interval)
+        ORDER BY last_scan_at NULLS FIRST
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql)
+            return [dict(r) for r in cur.fetchall()]
+
+
+def update_drive_scan_result(source_id: int, status: str, message: str = "",
+                             found: int = 0, ingested: int = 0) -> None:
+    """Ghi kết quả lượt quét gần nhất — để màn hình nguồn nói được tính năng nền có đang chạy không."""
+    sql = """
+        UPDATE drive_sources
+        SET last_scan_at = NOW(), last_scan_status = %s, last_scan_message = %s,
+            last_scan_found = %s, last_scan_ingested = %s
+        WHERE id = %s
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (status, (message or "")[:2000], found, ingested, source_id))
+
+
+def drive_processed_file_ids(source_id: int) -> set:
+    """
+    Mã các tệp Drive đã xử lý (dù thành công hay đã cố ý bỏ qua).
+
+    Trả về `set` để việc kiểm tra trong vòng lặp quét là O(1). Tệp `failed` KHÔNG nằm trong đây:
+    lỗi tải thường là tạm thời, lượt quét sau nên thử lại.
+    """
+    sql = """
+        SELECT drive_file_id FROM drive_files
+        WHERE source_id = %s AND status IN ('ingested', 'skipped')
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (source_id,))
+            return {r[0] for r in cur.fetchall()}
+
+
+def record_drive_file(source_id: int, drive_file_id: str, filename: str,
+                      size_bytes: int = 0, drive_md5: str = "",
+                      modified_time: Optional[str] = None, job_id: Optional[str] = None,
+                      status: str = "ingested", note: str = "") -> None:
+    """
+    Ghi sổ một tệp Drive đã xử lý. Chạy lại với cùng `drive_file_id` thì CẬP NHẬT, không lỗi —
+    một tệp `failed` ở lượt trước phải chuyển được sang `ingested` khi thử lại thành công.
+    """
+    sql = """
+        INSERT INTO drive_files
+            (source_id, drive_file_id, filename, size_bytes, drive_md5, modified_time,
+             job_id, status, note)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (drive_file_id) DO UPDATE SET
+            job_id = EXCLUDED.job_id, status = EXCLUDED.status, note = EXCLUDED.note,
+            size_bytes = EXCLUDED.size_bytes, drive_md5 = EXCLUDED.drive_md5
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (source_id, drive_file_id, filename, size_bytes, drive_md5,
+                                  modified_time, job_id, status, (note or "")[:2000]))
+    except Exception as e:  # noqa: BLE001
+        # Sổ ghi hỏng không được làm mất tài liệu đã tải về và đã vào hàng đợi. Hệ quả xấu nhất là
+        # lượt quét sau nạp lại tệp này — và lớp chống trùng bằng SHA-256 sẽ chặn nó.
+        logger.error("Không ghi được sổ tệp Drive '%s': %s", filename, e)
+
+
+def list_drive_files(source_id: int, status: Optional[str] = None,
+                     limit: int = 100, offset: int = 0) -> List[Dict]:
+    """Lịch sử tệp của một nguồn. Lọc `status='failed'` để xem đúng phần cần xử lý."""
+    conditions, params = ["f.source_id = %s"], [source_id]
+    if status:
+        conditions.append("f.status = %s")
+        params.append(status)
+    params.extend([limit, offset])
+
+    sql = f"""
+        SELECT f.*, d.status AS job_status, d.needs_review, d.document_type
+        FROM drive_files f
+        LEFT JOIN documents d ON d.id = f.job_id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY f.created_at DESC
+        LIMIT %s OFFSET %s
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
