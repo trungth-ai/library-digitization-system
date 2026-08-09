@@ -2010,6 +2010,93 @@ async def api_report_actions(date_from: Optional[str] = Query(None), date_to: Op
     return success(reports.report_action_summary(date_from, date_to), "Tổng quan thao tác")
 
 
+# ---------------------------------------------------------------------
+# ROUTES - THỐNG KÊ THEO NGƯỜI DÙNG & QUẢN TRỊ (YC-TT)
+#
+# Ba mức, ba quyền khác nhau:
+#   /me       — của CHÍNH mình, ai cũng xem được (không cần quyền báo cáo)
+#   /users    — của mọi người, cần quyền đọc báo cáo
+#   /admin    — kèm số liệu an ninh (đăng nhập hỏng, IP dò mật khẩu), cần quyền quản trị người dùng
+# ---------------------------------------------------------------------
+
+@app.get("/api/v2/stats/me")
+async def api_my_stats(
+    days: int = Query(30, ge=1, le=365),
+    principal: Principal = Depends(require_authenticated),
+):
+    """
+    Thống kê của CHÍNH người đang đăng nhập.
+
+    Không đòi quyền `REPORT_READ`: xem việc mình đã làm là quyền đương nhiên của mỗi người, và bắt
+    xin quyền để xem chính mình là rào cản vô nghĩa.
+    """
+    from scripts.core import user_stats
+
+    return success(user_stats.for_user(principal.actor, days=days),
+                   f"Hoạt động của bạn trong {days} ngày qua")
+
+
+@app.get("/api/v2/stats/users")
+async def api_user_stats(
+    days: int = Query(30, ge=1, le=365),
+    principal: Principal = Depends(require(policy.REPORT_READ)),
+):
+    """Bảng số liệu theo từng cán bộ. Luôn kèm `ghi_chu` về cách đọc (QĐ-06)."""
+    from scripts.core import user_stats
+
+    return success(user_stats.per_user(days=days), f"Thống kê theo người dùng ({days} ngày)")
+
+
+@app.get("/api/v2/stats/users/{username}")
+async def api_one_user_stats(
+    username: str,
+    days: int = Query(30, ge=1, le=365),
+    principal: Principal = Depends(require(policy.REPORT_READ)),
+):
+    """Hồ sơ hoạt động của một cán bộ cụ thể."""
+    from scripts.core import user_stats
+
+    return success(user_stats.for_user(username, days=days),
+                   f"Hoạt động của «{username}» trong {days} ngày qua")
+
+
+@app.get("/api/v2/stats/admin")
+async def api_admin_stats(
+    days: int = Query(30, ge=1, le=365),
+    principal: Principal = Depends(require(policy.USER_MANAGE)),
+):
+    """
+    Bức tranh toàn hệ thống cho quản trị viên, kèm cảnh báo đã tính sẵn.
+
+    Cần `USER_MANAGE` chứ không phải `REPORT_READ`: phần này chứa số liệu AN NINH (đăng nhập thất
+    bại, địa chỉ IP dò mật khẩu, số lần bị từ chối quyền) — đó là dữ liệu quản trị, không phải báo cáo
+    nghiệp vụ.
+    """
+    from scripts.core import user_stats
+
+    data = user_stats.admin_overview(days=days)
+    user_log.log_activity(action=user_log.ACTION_VIEW, username=principal.actor,
+                          resource_type="admin_stats", detail={"days": days})
+    return success(data, f"Tổng quan hệ thống {days} ngày qua")
+
+
+@app.get("/api/v2/stats/classification")
+async def api_classification_accuracy(
+    days: int = Query(30, ge=1, le=365),
+    principal: Principal = Depends(require(policy.REPORT_READ)),
+):
+    """
+    Độ chính xác của việc ĐOÁN LOẠI tài liệu, đo trên việc thật (YC-SC-09).
+
+    Đây là con số duy nhất được phép dùng khi nói bộ đoán loại chính xác đến đâu — nguyên tắc SRS
+    "đo được mới tuyên bố".
+    """
+    from scripts.core import user_stats
+
+    return success(user_stats.classification_accuracy(days=days),
+                   "Độ chính xác đoán loại tài liệu")
+
+
 @app.get("/api/v2/jobs/{job_id}/audit")
 async def api_document_audit(job_id: str,
                              principal: Principal = Depends(require(policy.AUDIT_READ))):
