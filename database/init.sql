@@ -262,14 +262,17 @@ CREATE TABLE IF NOT EXISTS schema_fields (
     language    VARCHAR(20),
     description TEXT,
     sort_order  INTEGER      NOT NULL DEFAULT 0,
+    source      VARCHAR(10)  NOT NULL DEFAULT 'ai',  -- ai | system | manual (YC-CF: chỉ 'ai' đưa vào prompt)
     CONSTRAINT uq_schema_field UNIQUE (schema_code, key)
 );
 CREATE INDEX IF NOT EXISTS idx_schema_fields_code ON schema_fields(schema_code);
 
--- Seed 2 lược đồ khởi tạo: Dublin Core (YC-SC-02) + Công văn hành chính (YC-SC-03)
+-- Seed lược đồ khởi tạo:
+--   • dublin_core (document_type=book) — GIỮ đường Claude cũ (KT-KH), không xóa.
+--   • 7 lược đồ biên mục theo bộ mẫu HPU (sach/de_cuong/khoa_luan/luan_van/hoi_thao/bao_nckh/cong_van)
+--     seed ở khối "CATALOG SCHEMAS" ngay bên dưới — sinh từ scripts/eval/schemas.py (docs/CATALOG_SCHEMAS.md).
 INSERT INTO extraction_schemas (code, name, document_type, context_strategy, sensitivity) VALUES
-    ('dublin_core', 'Dublin Core (sách/khóa luận)', 'book',     'first8_last2', 'public'),
-    ('cong_van',    'Công văn hành chính',          'cong_van', 'full',         'internal')
+    ('dublin_core', 'Dublin Core (sách/khóa luận)', 'book', 'first8_last2', 'public')
 ON CONFLICT (code) DO NOTHING;
 
 INSERT INTO schema_fields (schema_code, key, label, required, data_type, language, sort_order) VALUES
@@ -283,16 +286,129 @@ INSERT INTO schema_fields (schema_code, key, label, required, data_type, languag
     ('dublin_core', 'dc.description.abstract', 'Tóm tắt',              FALSE, 'text',   'vi_VN', 8),
     ('dublin_core', 'dc.type',                 'Loại',                 TRUE,  'text',   'en_US', 9),
     ('dublin_core', 'dc.language.iso',         'Ngôn ngữ',             FALSE, 'text',   NULL,    10),
-    ('dublin_core', 'dc.identifier.isbn',      'ISBN',                 FALSE, 'text',   NULL,    11),
-    ('cong_van',    'so_hieu',                 'Số hiệu',              TRUE,  'text',   NULL,    1),
-    ('cong_van',    'ngay_ban_hanh',           'Ngày ban hành',        FALSE, 'date',   NULL,    2),
-    ('cong_van',    'co_quan_ban_hanh',        'Cơ quan ban hành',     TRUE,  'text',   NULL,    3),
-    ('cong_van',    'loai_van_ban',            'Loại văn bản',         FALSE, 'text',   NULL,    4),
-    ('cong_van',    'trich_yeu',               'Trích yếu',            TRUE,  'text',   NULL,    5),
-    ('cong_van',    'do_khan',                 'Độ khẩn',              FALSE, 'text',   NULL,    6),
-    ('cong_van',    'do_mat',                  'Độ mật',               FALSE, 'text',   NULL,    7),
-    ('cong_van',    'noi_nhan',                'Nơi nhận',             FALSE, 'list',   NULL,    8),
-    ('cong_van',    'nguoi_ky',                'Người ký',             FALSE, 'text',   NULL,    9)
+    ('dublin_core', 'dc.identifier.isbn',      'ISBN',                 FALSE, 'text',   NULL,    11)
+ON CONFLICT (schema_code, key) DO NOTHING;
+
+-- ===== CATALOG SCHEMAS (7 loại theo bộ mẫu biên mục HPU) =====
+INSERT INTO extraction_schemas (code, name, document_type, context_strategy, sensitivity) VALUES
+    ('sach', 'Sách', 'sach', 'first8_last2', 'public'),
+    ('de_cuong', 'Đề cương môn học', 'de_cuong', 'first8_last2', 'public'),
+    ('khoa_luan', 'Khóa luận / Đồ án', 'khoa_luan', 'first8_last2', 'public'),
+    ('luan_van', 'Luận văn thạc sỹ', 'luan_van', 'first8_last2', 'public'),
+    ('hoi_thao', 'Kỷ yếu hội thảo', 'hoi_thao', 'first8_last2', 'public'),
+    ('bao_nckh', 'Báo / Tạp chí NCKH', 'bao_nckh', 'first8_last2', 'public'),
+    ('cong_van', 'Công văn hành chính', 'cong_van', 'full', 'internal')
+ON CONFLICT (code) DO NOTHING;
+
+INSERT INTO schema_fields (schema_code, key, label, required, data_type, language, sort_order, source) VALUES
+    ('sach', 'dc.identifier.other', 'Mã tài liệu (HPU)', TRUE, 'text', NULL, 1, 'manual'),
+    ('sach', 'dc.title', 'Nhan đề', TRUE, 'text', 'vi_VN', 2, 'ai'),
+    ('sach', 'dc.title.alternative', 'Nhan đề khác', FALSE, 'text', 'vi_VN', 3, 'ai'),
+    ('sach', 'dc.contributor.author', 'Tác giả', TRUE, 'list', 'vi_VN', 4, 'ai'),
+    ('sach', 'dc.contributor.editor', 'Biên tập / Chủ biên', FALSE, 'list', 'vi_VN', 5, 'ai'),
+    ('sach', 'dc.publisher', 'Nhà xuất bản', FALSE, 'text', 'vi_VN', 6, 'ai'),
+    ('sach', 'dc.date.issued', 'Năm xuất bản', FALSE, 'number', NULL, 7, 'ai'),
+    ('sach', 'dc.subject', 'Từ khóa', TRUE, 'list', 'vi_VN', 8, 'ai'),
+    ('sach', 'dc.description.abstract', 'Tóm tắt', FALSE, 'text', 'vi_VN', 9, 'ai'),
+    ('sach', 'dc.identifier.isbn', 'ISBN', FALSE, 'text', NULL, 10, 'ai'),
+    ('sach', 'dc.language.iso', 'Ngôn ngữ', FALSE, 'text', NULL, 11, 'ai'),
+    ('sach', 'dc.department', 'Bộ sưu tập / Khoa', FALSE, 'text', 'en_US', 12, 'ai'),
+    ('sach', 'dc.type', 'Loại tài liệu', TRUE, 'text', 'en_US', 13, 'system'),
+    ('sach', 'dc.format.extent', 'Số trang', FALSE, 'text', NULL, 14, 'system'),
+    ('sach', 'dc.size', 'Dung lượng', FALSE, 'text', 'en_US', 15, 'system'),
+    ('sach', 'dc.format.mimetype', 'Định dạng', FALSE, 'text', NULL, 16, 'system'),
+    ('de_cuong', 'dc.identifier.other', 'Mã tài liệu (HPU)', TRUE, 'text', NULL, 1, 'manual'),
+    ('de_cuong', 'dc.title', 'Nhan đề', TRUE, 'text', 'vi_VN', 2, 'ai'),
+    ('de_cuong', 'dc.title.alternative', 'Nhan đề khác', FALSE, 'text', 'vi_VN', 3, 'ai'),
+    ('de_cuong', 'dc.contributor.author', 'Tác giả', TRUE, 'list', 'vi_VN', 4, 'ai'),
+    ('de_cuong', 'dc.contributor.editor', 'Biên tập / Chủ biên', FALSE, 'list', 'vi_VN', 5, 'ai'),
+    ('de_cuong', 'dc.publisher', 'Nhà xuất bản', FALSE, 'text', 'vi_VN', 6, 'ai'),
+    ('de_cuong', 'dc.date.issued', 'Năm xuất bản', FALSE, 'number', NULL, 7, 'ai'),
+    ('de_cuong', 'dc.subject', 'Từ khóa', TRUE, 'list', 'vi_VN', 8, 'ai'),
+    ('de_cuong', 'dc.description.abstract', 'Tóm tắt', FALSE, 'text', 'vi_VN', 9, 'ai'),
+    ('de_cuong', 'dc.identifier.isbn', 'ISBN', FALSE, 'text', NULL, 10, 'ai'),
+    ('de_cuong', 'dc.language.iso', 'Ngôn ngữ', FALSE, 'text', NULL, 11, 'ai'),
+    ('de_cuong', 'dc.department', 'Bộ sưu tập / Khoa', FALSE, 'text', 'en_US', 12, 'ai'),
+    ('de_cuong', 'dc.type', 'Loại tài liệu', TRUE, 'text', 'en_US', 13, 'system'),
+    ('de_cuong', 'dc.format.extent', 'Số trang', FALSE, 'text', NULL, 14, 'system'),
+    ('de_cuong', 'dc.size', 'Dung lượng', FALSE, 'text', 'en_US', 15, 'system'),
+    ('de_cuong', 'dc.format.mimetype', 'Định dạng', FALSE, 'text', NULL, 16, 'system'),
+    ('khoa_luan', 'dc.identifier.other', 'Mã tài liệu (HPU)', TRUE, 'text', NULL, 1, 'manual'),
+    ('khoa_luan', 'dc.title', 'Nhan đề', TRUE, 'text', 'vi_VN', 2, 'ai'),
+    ('khoa_luan', 'dc.contributor.author', 'Tác giả', TRUE, 'list', 'vi_VN', 3, 'ai'),
+    ('khoa_luan', 'dc.contributor.advisor', 'Người hướng dẫn', TRUE, 'list', 'vi_VN', 4, 'ai'),
+    ('khoa_luan', 'dc.publisher', 'Đơn vị đào tạo', FALSE, 'text', 'vi_VN', 5, 'ai'),
+    ('khoa_luan', 'dc.date.issued', 'Năm bảo vệ', FALSE, 'number', NULL, 6, 'ai'),
+    ('khoa_luan', 'dc.subject', 'Từ khóa', TRUE, 'list', 'vi_VN', 7, 'ai'),
+    ('khoa_luan', 'dc.description.abstract', 'Tóm tắt', FALSE, 'text', 'vi_VN', 8, 'ai'),
+    ('khoa_luan', 'dc.description.degree', 'Học vị / Loại', FALSE, 'text', 'en_US', 9, 'ai'),
+    ('khoa_luan', 'dc.language.iso', 'Ngôn ngữ', FALSE, 'text', NULL, 10, 'ai'),
+    ('khoa_luan', 'dc.department', 'Khoa / Bộ môn', FALSE, 'text', 'en_US', 11, 'ai'),
+    ('khoa_luan', 'dc.type', 'Loại tài liệu', TRUE, 'text', 'en_US', 12, 'system'),
+    ('khoa_luan', 'dc.format.extent', 'Số trang', FALSE, 'text', NULL, 13, 'system'),
+    ('khoa_luan', 'dc.size', 'Dung lượng', FALSE, 'text', 'en_US', 14, 'system'),
+    ('khoa_luan', 'dc.format.mimetype', 'Định dạng', FALSE, 'text', NULL, 15, 'system'),
+    ('luan_van', 'dc.identifier.other', 'Mã tài liệu (HPU)', TRUE, 'text', NULL, 1, 'manual'),
+    ('luan_van', 'dc.title', 'Nhan đề', TRUE, 'text', 'vi_VN', 2, 'ai'),
+    ('luan_van', 'dc.contributor.author', 'Tác giả', TRUE, 'list', 'vi_VN', 3, 'ai'),
+    ('luan_van', 'dc.contributor.advisor', 'Người hướng dẫn', TRUE, 'list', 'vi_VN', 4, 'ai'),
+    ('luan_van', 'dc.publisher', 'Đơn vị đào tạo', FALSE, 'text', 'vi_VN', 5, 'ai'),
+    ('luan_van', 'dc.date.issued', 'Năm bảo vệ', FALSE, 'number', NULL, 6, 'ai'),
+    ('luan_van', 'dc.subject', 'Từ khóa', TRUE, 'list', 'vi_VN', 7, 'ai'),
+    ('luan_van', 'dc.description.abstract', 'Tóm tắt', FALSE, 'text', 'vi_VN', 8, 'ai'),
+    ('luan_van', 'dc.description.degree', 'Học vị / Loại', FALSE, 'text', 'en_US', 9, 'ai'),
+    ('luan_van', 'dc.language.iso', 'Ngôn ngữ', FALSE, 'text', NULL, 10, 'ai'),
+    ('luan_van', 'dc.department', 'Khoa / Bộ môn', FALSE, 'text', 'en_US', 11, 'ai'),
+    ('luan_van', 'dc.type', 'Loại tài liệu', TRUE, 'text', 'en_US', 12, 'system'),
+    ('luan_van', 'dc.format.extent', 'Số trang', FALSE, 'text', NULL, 13, 'system'),
+    ('luan_van', 'dc.size', 'Dung lượng', FALSE, 'text', 'en_US', 14, 'system'),
+    ('luan_van', 'dc.format.mimetype', 'Định dạng', FALSE, 'text', NULL, 15, 'system'),
+    ('hoi_thao', 'dc.identifier.other', 'Mã tài liệu (HPU)', TRUE, 'text', NULL, 1, 'manual'),
+    ('hoi_thao', 'dc.title', 'Nhan đề', TRUE, 'text', 'vi_VN', 2, 'ai'),
+    ('hoi_thao', 'dc.contributor.author', 'Tác giả', TRUE, 'list', 'vi_VN', 3, 'ai'),
+    ('hoi_thao', 'dc.contributor.advisor', 'Người hướng dẫn', FALSE, 'list', 'vi_VN', 4, 'ai'),
+    ('hoi_thao', 'dc.publisher', 'Nơi công bố / Tạp chí', FALSE, 'text', 'vi_VN', 5, 'ai'),
+    ('hoi_thao', 'dc.date.issued', 'Năm công bố', FALSE, 'number', NULL, 6, 'ai'),
+    ('hoi_thao', 'dc.subject', 'Từ khóa', TRUE, 'list', 'vi_VN', 7, 'ai'),
+    ('hoi_thao', 'dc.description.abstract', 'Tóm tắt', FALSE, 'text', 'vi_VN', 8, 'ai'),
+    ('hoi_thao', 'dc.description.degree', 'Loại bài', FALSE, 'text', 'en_US', 9, 'ai'),
+    ('hoi_thao', 'dc.language.iso', 'Ngôn ngữ', FALSE, 'text', NULL, 10, 'ai'),
+    ('hoi_thao', 'dc.department', 'Lĩnh vực / Khoa', FALSE, 'text', 'en_US', 11, 'ai'),
+    ('hoi_thao', 'dc.type', 'Loại tài liệu', TRUE, 'text', 'en_US', 12, 'system'),
+    ('hoi_thao', 'dc.format.extent', 'Số trang', FALSE, 'text', NULL, 13, 'system'),
+    ('hoi_thao', 'dc.size', 'Dung lượng', FALSE, 'text', 'en_US', 14, 'system'),
+    ('hoi_thao', 'dc.format.mimetype', 'Định dạng', FALSE, 'text', NULL, 15, 'system'),
+    ('bao_nckh', 'dc.identifier.other', 'Mã tài liệu (HPU)', TRUE, 'text', NULL, 1, 'manual'),
+    ('bao_nckh', 'dc.title', 'Nhan đề', TRUE, 'text', 'vi_VN', 2, 'ai'),
+    ('bao_nckh', 'dc.contributor.author', 'Tác giả', TRUE, 'list', 'vi_VN', 3, 'ai'),
+    ('bao_nckh', 'dc.contributor.advisor', 'Người hướng dẫn', FALSE, 'list', 'vi_VN', 4, 'ai'),
+    ('bao_nckh', 'dc.publisher', 'Nơi công bố / Tạp chí', FALSE, 'text', 'vi_VN', 5, 'ai'),
+    ('bao_nckh', 'dc.date.issued', 'Năm công bố', FALSE, 'number', NULL, 6, 'ai'),
+    ('bao_nckh', 'dc.subject', 'Từ khóa', TRUE, 'list', 'vi_VN', 7, 'ai'),
+    ('bao_nckh', 'dc.description.abstract', 'Tóm tắt', FALSE, 'text', 'vi_VN', 8, 'ai'),
+    ('bao_nckh', 'dc.description.degree', 'Loại bài', FALSE, 'text', 'en_US', 9, 'ai'),
+    ('bao_nckh', 'dc.language.iso', 'Ngôn ngữ', FALSE, 'text', NULL, 10, 'ai'),
+    ('bao_nckh', 'dc.department', 'Lĩnh vực / Khoa', FALSE, 'text', 'en_US', 11, 'ai'),
+    ('bao_nckh', 'dc.type', 'Loại tài liệu', TRUE, 'text', 'en_US', 12, 'system'),
+    ('bao_nckh', 'dc.format.extent', 'Số trang', FALSE, 'text', NULL, 13, 'system'),
+    ('bao_nckh', 'dc.size', 'Dung lượng', FALSE, 'text', 'en_US', 14, 'system'),
+    ('bao_nckh', 'dc.format.mimetype', 'Định dạng', FALSE, 'text', NULL, 15, 'system'),
+    ('cong_van', 'so_hieu', 'Số, ký hiệu văn bản', TRUE, 'text', NULL, 1, 'ai'),
+    ('cong_van', 'loai_van_ban', 'Loại văn bản', FALSE, 'text', NULL, 2, 'ai'),
+    ('cong_van', 'ngay_ban_hanh', 'Ngày ban hành', FALSE, 'date', NULL, 3, 'ai'),
+    ('cong_van', 'don_vi_ban_hanh', 'Đơn vị/bộ phận ban hành', FALSE, 'text', NULL, 4, 'ai'),
+    ('cong_van', 'co_quan_ban_hanh', 'Cơ quan ban hành', TRUE, 'text', NULL, 5, 'ai'),
+    ('cong_van', 'noi_ban_hanh', 'Nơi ban hành', FALSE, 'text', NULL, 6, 'ai'),
+    ('cong_van', 'nguoi_ky', 'Người ký', FALSE, 'text', NULL, 7, 'ai'),
+    ('cong_van', 'chuc_vu_nguoi_ky', 'Chức vụ người ký', FALSE, 'text', NULL, 8, 'ai'),
+    ('cong_van', 'nhan_de', 'Nhan đề văn bản', FALSE, 'text', NULL, 9, 'ai'),
+    ('cong_van', 'trich_yeu', 'Trích yếu nội dung', TRUE, 'text', NULL, 10, 'ai'),
+    ('cong_van', 'tu_khoa', 'Từ khóa', FALSE, 'list', NULL, 11, 'ai'),
+    ('cong_van', 'noi_nhan', 'Nơi nhận', FALSE, 'list', NULL, 12, 'ai'),
+    ('cong_van', 'do_khan', 'Độ khẩn', FALSE, 'text', NULL, 13, 'ai'),
+    ('cong_van', 'do_mat', 'Độ mật', FALSE, 'text', NULL, 14, 'ai'),
+    ('cong_van', 'so_trang', 'Số trang', FALSE, 'text', NULL, 15, 'system'),
+    ('cong_van', 'dung_luong', 'Dung lượng tệp', FALSE, 'text', NULL, 16, 'system')
 ON CONFLICT (schema_code, key) DO NOTHING;
 
 -- =====================================================================
@@ -376,7 +492,14 @@ INSERT INTO document_types (code, label, description, is_active, sort_order) VAL
     ('textbook',  'Giáo trình',           'Giáo trình giảng dạy',                    TRUE, 3),
     ('journal',   'Tạp chí',              'Tạp chí, kỷ yếu khoa học',                TRUE, 4),
     ('reference', 'Tài liệu tham khảo',   'Tài liệu tham khảo khác',                 TRUE, 5),
-    ('cong_van',  'Công văn',             'Công văn, văn bản hành chính',            TRUE, 6)
+    ('cong_van',  'Công văn',             'Công văn, văn bản hành chính',            TRUE, 6),
+    -- 6 loại biên mục theo bộ mẫu HPU (mỗi loại 1 lược đồ trong extraction_schemas)
+    ('sach',      'Sách',                 'Sách (biên mục Dublin Core)',             TRUE, 7),
+    ('de_cuong',  'Đề cương môn học',     'Đề cương chi tiết học phần',              TRUE, 8),
+    ('khoa_luan', 'Khóa luận / Đồ án',    'Khóa luận, đồ án tốt nghiệp',             TRUE, 9),
+    ('luan_van',  'Luận văn thạc sỹ',     'Luận văn cao học',                        TRUE, 10),
+    ('hoi_thao',  'Kỷ yếu hội thảo',      'Bài tham luận hội thảo khoa học',         TRUE, 11),
+    ('bao_nckh',  'Báo / Tạp chí NCKH',   'Bài báo khoa học, tạp chí',               TRUE, 12)
 ON CONFLICT (code) DO NOTHING;
 
 -- 8.2 Trạng thái OCR (khớp worker.py: queued→ocr→extracting→exporting→completed/failed)
