@@ -8,8 +8,9 @@
 // Nguyên tắc hiển thị quan trọng nhất: **liệt kê từng tệp bị bỏ qua kèm lý do**. Nạp 500 tệp mà chỉ
 // báo "30 tệp lỗi" là thông tin vô dụng — cán bộ không biết tệp nào, cũng không biết phải sửa gì.
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { PageShell, ErrorBox, StatCard } from "@/components/hpu/HpuLayout";
+import DocumentTypeSelect, { AUTO } from "@/components/DocumentTypeSelect";
 import { formatNumber } from "@/lib/format";
 
 const STATUS_LABEL = {
@@ -210,8 +211,49 @@ function BatchUploader({ onDone, onError }) {
   const [files, setFiles] = useState([]);
   const [name, setName] = useState("");
   const [uploading, setUploading] = useState(false);
+  // Cả lô dùng chung một loại tài liệu. 'auto' = mỗi tệp được đoán riêng theo nội dung sau khi OCR —
+  // đúng với cách cán bộ nạp thật: một thư mục thường trộn nhiều loại.
+  const [docType, setDocType] = useState(AUTO);
 
   const tongMB = files.reduce((s, f) => s + f.size, 0) / 1024 / 1024;
+
+  // Thống kê gợi ý theo tên tệp cho cả lô: cán bộ nhìn một dòng là biết lô này gồm những loại gì,
+  // thay vì phải mở từng tệp. Chỉ hiện khi để «Tự động» — chọn tay rồi thì gợi ý không còn ý nghĩa.
+  const [phanBo, setPhanBo] = useState([]);
+  const khoaTen = useMemo(() => files.map((f) => f.name).join("|"), [files]);
+
+  useEffect(() => {
+    if (!files.length || docType !== AUTO) {
+      setPhanBo([]);
+      return;
+    }
+    let huy = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/loai-tai-lieu", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ filenames: files.map((f) => f.name) }),
+        });
+        if (!res.ok) return;
+        const payload = await res.json();
+        const dem = new Map();
+        for (const item of payload.data || []) {
+          // Gợi ý quá yếu thì xếp vào "chưa rõ" — hứa hẹn quá mức còn tệ hơn im lặng
+          const nhan = item.confidence >= 0.35 ? item.label : "Chưa rõ (đoán theo nội dung sau OCR)";
+          dem.set(nhan, (dem.get(nhan) || 0) + 1);
+        }
+        if (!huy) setPhanBo([...dem.entries()].sort((a, b) => b[1] - a[1]));
+      } catch {
+        /* không có gợi ý cũng không sao — worker vẫn đoán lại theo nội dung */
+      }
+    })();
+    return () => {
+      huy = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [khoaTen, docType]);
 
   async function submit(e) {
     e.preventDefault();
@@ -223,6 +265,7 @@ function BatchUploader({ onDone, onError }) {
       const form = new FormData();
       files.forEach((f) => form.append("files", f));
       form.append("name", name);
+      form.append("doc_type", docType);
 
       const laZip = files.length === 1 && files[0].name.toLowerCase().endsWith(".zip");
       const duong = laZip ? "/api/lo/zip" : "/api/lo";
@@ -274,12 +317,42 @@ function BatchUploader({ onDone, onError }) {
             className="w-full text-sm"
           />
         </div>
+        <div className="md:col-span-2">
+          <DocumentTypeSelect
+            value={docType}
+            onChange={setDocType}
+            disabled={uploading}
+            label="Loại tài liệu của cả lô"
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            Để «Tự động» khi lô trộn nhiều loại — mỗi tệp sẽ được đoán riêng theo nội dung sau OCR.
+          </p>
+        </div>
       </div>
 
       {files.length > 0 && (
         <p className="text-sm text-gray-700 mt-2">
           Đã chọn <strong>{formatNumber(files.length)}</strong> tệp ({tongMB.toFixed(1)} MB)
         </p>
+      )}
+
+      {phanBo.length > 0 && (
+        <div className="mt-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+          <p className="text-xs font-medium text-gray-700">Đoán sơ bộ theo tên tệp</p>
+          <div className="mt-1 flex flex-wrap gap-1.5">
+            {phanBo.map(([nhan, soLuong]) => (
+              <span
+                key={nhan}
+                className="rounded border border-gray-300 bg-white px-2 py-0.5 text-xs text-gray-700"
+              >
+                {nhan}: <strong>{formatNumber(soLuong)}</strong>
+              </span>
+            ))}
+          </div>
+          <p className="text-xs text-gray-500 mt-1">
+            Đây mới là đoán theo tên tệp. Sau khi OCR, hệ thống đọc nội dung và đoán lại chính xác hơn.
+          </p>
+        </div>
       )}
 
       <button

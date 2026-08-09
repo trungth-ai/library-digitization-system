@@ -152,10 +152,28 @@ services:
       - CONTEXT_FULL_MAX_CHARS=${CONTEXT_FULL_MAX_CHARS:-20000}
       - METRICS_GPU=${METRICS_GPU:-0}
       - ALLOW_PUBLIC_LOCAL_ENDPOINT=${ALLOW_PUBLIC_LOCAL_ENDPOINT:-}
+      # -- Nạp tự động từ Google Drive (YC-BU-21) --
+      # MẶC ĐỊNH TẮT: tính năng này gọi ra Internet và tự tạo việc trong hàng đợi, nên phải là một
+      # quyết định có ý thức chứ không phải thứ tự bật lên sau một lần `docker compose pull`.
+      # Vòng quét chạy TRONG worker — không có container riêng để triển khai và giám sát.
+      - DRIVE_INGEST_ENABLED=${DRIVE_INGEST_ENABLED:-0}
+      - DRIVE_SCAN_INTERVAL_SEC=${DRIVE_SCAN_INTERVAL_SEC:-300}
+      - DRIVE_MAX_PER_SCAN=${DRIVE_MAX_PER_SCAN:-200}
+      - GDRIVE_MAX_FILE_MB=${GDRIVE_MAX_FILE_MB:-500}
+      # Cách 1 (khuyến nghị): tài khoản dịch vụ. Gắn tệp khóa vào container qua volume bên dưới.
+      - GDRIVE_SERVICE_ACCOUNT_FILE=${GDRIVE_SERVICE_ACCOUNT_FILE:-}
+      - GDRIVE_IMPERSONATE_SUBJECT=${GDRIVE_IMPERSONATE_SUBJECT:-}
+      # Cách 2: OAuth refresh token (không cần gói cryptography)
+      - GDRIVE_OAUTH_CLIENT_ID=${GDRIVE_OAUTH_CLIENT_ID:-}
+      - GDRIVE_OAUTH_CLIENT_SECRET=${GDRIVE_OAUTH_CLIENT_SECRET:-}
+      - GDRIVE_OAUTH_REFRESH_TOKEN=${GDRIVE_OAUTH_REFRESH_TOKEN:-}
     volumes:
       - ./scripts:/app/scripts
       - ./configs:/app/configs
       - ${DIGITIZE_DATA_DIR}:/data/digitization
+      # Khóa tài khoản dịch vụ Google, gắn CHỈ ĐỌC. Mặc định trỏ tới /dev/null để `docker compose up`
+      # chạy được khi chưa dùng Drive — đặt GDRIVE_SECRET_FILE trong .env khi bật tính năng.
+      - ${GDRIVE_SECRET_FILE:-/dev/null}:${GDRIVE_SERVICE_ACCOUNT_FILE:-/tmp/gdrive-unused.json}:ro
     networks:
       - library-net
     depends_on:
@@ -348,11 +366,23 @@ services:
       - LOCAL_FALLBACK_PROVIDERS=${LOCAL_FALLBACK_PROVIDERS:-}
       - CLOUD_FALLBACK_PROVIDERS=${CLOUD_FALLBACK_PROVIDERS:-}
       - ALLOW_PUBLIC_LOCAL_ENDPOINT=${ALLOW_PUBLIC_LOCAL_ENDPOINT:-}
+      # -- Google Drive (YC-BU-21) --
+      # ⚠️ PHẢI GIỮ ĐỒNG BỘ với service `worker`: API dùng cùng cấu hình này để kiểm tra kết nối lúc
+      # cán bộ thêm thư mục và để chạy nút «Quét ngay». Lệch nhau thì thêm thư mục thấy thành công
+      # nhưng vòng quét nền của worker lại lỗi 403 — sai lệch khó chẩn đoán nhất.
+      - GDRIVE_SERVICE_ACCOUNT_FILE=${GDRIVE_SERVICE_ACCOUNT_FILE:-}
+      - GDRIVE_IMPERSONATE_SUBJECT=${GDRIVE_IMPERSONATE_SUBJECT:-}
+      - GDRIVE_OAUTH_CLIENT_ID=${GDRIVE_OAUTH_CLIENT_ID:-}
+      - GDRIVE_OAUTH_CLIENT_SECRET=${GDRIVE_OAUTH_CLIENT_SECRET:-}
+      - GDRIVE_OAUTH_REFRESH_TOKEN=${GDRIVE_OAUTH_REFRESH_TOKEN:-}
+      - GDRIVE_MAX_FILE_MB=${GDRIVE_MAX_FILE_MB:-500}
+      - DRIVE_MAX_PER_SCAN=${DRIVE_MAX_PER_SCAN:-200}
     volumes:
       - ./api:/app/api
       - ./scripts:/app/scripts
       - ./configs:/app/configs
       - ${DIGITIZE_DATA_DIR}:/data/digitization
+      - ${GDRIVE_SECRET_FILE:-/dev/null}:${GDRIVE_SERVICE_ACCOUNT_FILE:-/tmp/gdrive-unused.json}:ro
     networks:
       - library-net
     depends_on:

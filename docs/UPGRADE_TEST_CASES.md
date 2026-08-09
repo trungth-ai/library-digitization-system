@@ -508,3 +508,75 @@ Sprint chỉ được coi là xong khi **tất cả** kiểm thử của nó đ�
 
 **Biên bản nghiệm thu phải ghi:** ai thực hiện · ngày · số tài liệu/thao tác thực tế · vướng mắc gặp
 phải · kết luận đạt/không đạt · chữ ký. Không có biên bản thì kiểm thử chấp nhận coi như chưa chạy.
+
+---
+
+## 19. Bổ sung 09/08/2026 — YC-SC-09→14, YC-BU-21, YC-TT
+
+> Ba nhóm yêu cầu thêm sau đề xuất gốc (xem `docs/UPGRADE_REQUIREMENTS.md` mục 7.1, 9.4b, 9.4c).
+>
+> **Trạng thái:** cột dưới ghi kết quả THẬT tính tới 09/08/2026, không ghi kỳ vọng.
+> `✅ pytest` = đã chạy đạt trên máy dev bằng lớp giả · `⏳` = cần môi trường thật, chưa chạy.
+
+### 19.1 Đoán loại tài liệu (YC-SC-09→14)
+
+| Mã | Nội dung | Điều kiện đạt | Trạng thái |
+|---|---|---|---|
+| KT-SC-09 | Đoán từ tên tệp 8 mẫu đặt tên thật (`KL_`, `DATN`, `CV_`, `Ky yeu`…) | Đúng loại cho cả 8 | ✅ pytest |
+| KT-SC-10 | Tên tệp vô nghĩa (`scan_0001.pdf`) | KHÔNG đoán bừa: độ tin cậy = 0, nguồn = `none` | ✅ pytest |
+| KT-SC-11 | Đoán từ nội dung 4 loại (công văn, luận văn, khóa luận, đề cương) | Đúng loại, độ tin cậy > 0 | ✅ pytest |
+| KT-SC-12 | Bản quét MẤT DẤU (`luan van thac si`) | Vẫn nhận đúng "Luận văn" | ✅ pytest |
+| KT-SC-13 | Tên tệp và nội dung MÂU THUẪN | **Nội dung thắng** tên tệp | ✅ pytest |
+| KT-SC-14 | Bằng chứng mỏng (một từ khóa yếu lẻ loi) | Độ tin cậy dưới ngưỡng, không tự nhận là chắc | ✅ pytest |
+| KT-SC-15 | Lặp một từ khóa 50 lần trong tài liệu dài | Điểm số KHÔNG đổi — độ dài không được làm lệch kết quả | ✅ pytest |
+| KT-SC-16 | Prompt hỏi model dùng lược đồ MỘT TRƯỜNG, liệt kê đủ 7 mã hợp lệ | Không thêm phương thức nào vào `ModelProvider` (phép thử YC-MP-08) | ✅ pytest |
+| KT-SC-17 | Model chết / trả mã lạ khi đoán loại | Trả `None`, job vẫn số hóa bình thường, không ném lỗi lên trên | ✅ pytest |
+| KT-SC-18 | Cấu hình chỉ có công cụ ĐÁM MÂY | Tầng 3 bị bỏ qua — không gửi tài liệu chưa phân loại ra ngoài (YC-DR-02) | ⏳ cần cấu hình thật |
+| KT-SC-19 | Cán bộ chọn tay loại tài liệu ở màn hình tải lên | Worker dùng ĐÚNG lược đồ đó, `detected_*` để rỗng | ⏳ cần PostgreSQL + trình duyệt |
+| KT-SC-20 | Cán bộ đổi loại ở màn hình duyệt | `document_type` đổi, `detected_type` GIỮ NGUYÊN, có bản ghi audit | ⏳ cần PostgreSQL |
+
+### 19.2 Nạp từ Google Drive (YC-BU-21)
+
+| Mã | Nội dung | Điều kiện đạt | Trạng thái |
+|---|---|---|---|
+| KT-BU-27 | Quét thư mục có 2 tệp mới | Tạo 2 job, tạo 1 lô `source='drive'` | ✅ pytest |
+| KT-BU-28 | Tham số nguồn (bộ sưu tập, ngôn ngữ, loại) đi theo vào job | Đủ trong payload; `document_type='auto'` mặc định | ✅ pytest |
+| KT-BU-29 | **Quét lần hai trên cùng thư mục** | Vẫn THẤY đủ tệp nhưng nạp mới = 0, không job trùng | ✅ pytest |
+| KT-BU-30 | Tệp đã biết | KHÔNG tải về (chặn trước khi tốn băng thông) | ✅ pytest |
+| KT-BU-31 | Cùng nội dung, hai tên tệp khác nhau | Bỏ qua theo SHA-256, nêu rõ trùng với tài liệu nào | ✅ pytest |
+| KT-BU-32 | Tệp tải lỗi | Ghi sổ `failed`, **được thử lại** ở lượt quét sau | ✅ pytest |
+| KT-BU-33 | Tệp bỏ qua có chủ đích (trùng) | KHÔNG thử lại ở lượt sau | ✅ pytest |
+| KT-BU-34 | Drive khai `mimeType=application/pdf` nhưng nội dung không phải PDF | Bỏ qua, ghi lý do | ✅ pytest |
+| KT-BU-35 | Tệp tải hỏng giữa chừng | KHÔNG để lại tệp dở dang trên đĩa | ✅ pytest |
+| KT-BU-36 | Đĩa dưới ngưỡng an toàn | Không tải một byte nào, trả lý do tiếng Việt | ✅ pytest |
+| KT-BU-37 | Hai worker cùng quét một nguồn | Worker thứ hai bị khóa Redis chặn; khóa được nhả cả khi quét lỗi | ✅ pytest |
+| KT-BU-38 | Thư mục bị gỡ chia sẻ giữa chừng | Trả lỗi có thông điệp tiếng Việt nói rõ phải sửa gì; worker vẫn xử lý tài liệu khác | ✅ pytest |
+| KT-BU-39 | Đặt 20 tệp thật vào thư mục Drive thật | Trong ≤ 2 chu kỳ quét: 20 tài liệu vào hàng đợi | ⏳ **cần tài khoản Google + mạng** |
+| KT-BU-40 | Tài liệu từ Drive đi tới bước duyệt | DỪNG ở màn hình Duyệt — KHÔNG tự đẩy DSpace (chốt YC-RV-04) | ⏳ cần môi trường thật |
+| KT-BM-22 | Nhật ký khi quét Drive | KHÔNG có khóa/token nào lọt ra log (YC-BM-03) | ⏳ cần chạy thật + đọc log |
+
+### 19.3 Thống kê người dùng & quản trị (YC-TT)
+
+| Mã | Nội dung | Điều kiện đạt | Trạng thái |
+|---|---|---|---|
+| KT-TT-01 | Ghi chú cách đọc (QĐ-06) | Có trong dữ liệu backend trả về, nói rõ "KHÔNG phải bảng xếp hạng" | ✅ pytest |
+| KT-TT-02 | Mọi chỉ số bình thường | KHÔNG sinh cảnh báo nào — im lặng khi ổn là một tính năng | ✅ pytest |
+| KT-TT-03 | Hệ thống mới, 1 lần đăng nhập hỏng trên 2 lần thử | KHÔNG báo động giả (ngưỡng kép) | ✅ pytest |
+| KT-TT-04 | Hệ thống lớn, tỉ lệ đăng nhập hỏng cao | VẪN báo được (ngưỡng kép hoạt động hai chiều) | ✅ pytest |
+| KT-TT-05 | Một IP thử ≥ 3 tài khoản khác nhau | Cảnh báo mức `nguy_hiem`, ghi rõ địa chỉ IP | ✅ pytest |
+| KT-TT-06 | Một người gõ sai mật khẩu của CHÍNH MÌNH 10 lần | KHÔNG báo "dò mật khẩu" | ✅ pytest |
+| KT-TT-07 | Bị từ chối quyền nhiều | Mức `thong_tin`, gợi ý xem lại phân vai (không làm quản trị viên hoảng) | ✅ pytest |
+| KT-TT-08 | Mọi bảng rỗng (hệ thống vừa dựng) | Không `ZeroDivisionError`, không cảnh báo | ✅ pytest |
+| KT-TT-09 | Mọi cảnh báo sinh ra | `muc` luôn thuộc {nguy_hiem, canh_bao, thong_tin} — giao diện tô màu được | ✅ pytest |
+| KT-TT-10 | Chưa có tài liệu nào được duyệt | Độ chính xác đoán loại hiện "chưa đủ dữ liệu", **KHÔNG hiện 0%** | ✅ pytest |
+| KT-TT-11 | Tài khoản `viewer` gọi `/api/v2/stats/me` | 200 — xem việc của chính mình không cần quyền báo cáo | ⏳ cần PostgreSQL |
+| KT-TT-12 | Tài khoản `librarian` gọi `/api/v2/stats/admin` | 403 kèm thông báo tiếng Việt (số liệu an ninh cần `USER_MANAGE`) | ⏳ cần PostgreSQL |
+
+### 19.4 Không hồi quy
+
+| Mã | Nội dung | Điều kiện đạt | Trạng thái |
+|---|---|---|---|
+| KT-KH-10 | Toàn bộ bộ kiểm thử sau ba nhóm thay đổi | 631 pytest đạt, 0 hồi quy (trước đó: 589) | ✅ 09/08/2026 |
+| KT-KH-11 | Dựng giao diện | `npm run build` exit 0, có `/nguon-drive` và `/thong-ke` | ✅ 09/08/2026 |
+| KT-KH-12 | Migration 010 + 011 áp hai lần liên tiếp trên PostgreSQL thật | Không lỗi; schema init.sql khớp schema sau migration | ⏳ **CI job `migrations`** — máy dev không chạy được Docker |
+| KT-KH-13 | Tài liệu chọn tay `document_type='book'` (đường cũ) | Kết quả trích xuất KHÔNG đổi so với trước | ⏳ cần môi trường thật |

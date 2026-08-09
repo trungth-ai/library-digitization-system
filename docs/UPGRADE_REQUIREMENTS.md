@@ -52,6 +52,15 @@
 
 ## 1. Hiện trạng — đã có gì, thiếu gì
 
+> **Cập nhật 09/08/2026.** Các bảng trong mục 1 là ảnh chụp hiện trạng **lúc lập đề xuất nâng cấp**
+> (tháng 7/2026) — giữ nguyên để còn đọc được lý do vì sao làm đợt này. Từ đó tới nay các sprint
+> V1–V9 đã lấp phần lớn ô ❌; xem `docs/STATUS.md` để biết trạng thái hiện tại.
+>
+> Ba nhóm yêu cầu **thêm mới sau đề xuất gốc**, đã hiện thực xong:
+> - **YC-BU-21** — nạp tự động từ thư mục Google Drive (mục 7.1)
+> - **YC-SC-09→14** — đoán loại tài liệu tự động (mục 9.4b)
+> - **YC-TT-01→08** — thống kê theo người dùng & quản trị (mục 9.4c)
+
 Rà tại commit `50dd3bd`. Cột "Có" nghĩa là **đã chạy được**, không phải "đã lên kế hoạch".
 
 ### 1.1 Ghi nhận & nhật ký
@@ -411,6 +420,17 @@ Nấc 3 (AUTH_MODE=on)      Chặn thật. Van lùi: đổi lại `shadow` là c
 | YC-BU-08 | NC | **Upload chia mảnh, tiếp tục được** khi đứt mạng (`init` → `chunk` → `complete`) | Ngắt mạng giữa chừng, nối lại → tiếp tục từ mảnh dở, không tải lại từ đầu |
 | YC-BU-09 | NC | **Kiểm tra tệp đầu vào**: đúng PDF (kiểm chữ ký tệp, không chỉ đuôi), không hỏng, không mã hóa, số trang hợp lệ | Tải file `.pdf` giả (thực chất là ảnh đổi tên) → từ chối, nói rõ lý do |
 | YC-BU-10 | TT | **Quét virus** tùy chọn (ClamAV, profile riêng) trước khi xử lý | Bật profile → tệp nhiễm bị chặn và ghi nhật ký |
+| YC-BU-21 | NC | **Nạp tự động từ thư mục Google Drive** — cán bộ chia sẻ thư mục cho tài khoản dịch vụ, hệ thống quét định kỳ, tải tệp mới về và đưa vào hàng đợi. CHỈ ĐỌC trên Drive (không đổi tên, không chuyển thư mục, không xóa). Chống trùng ba lớp: mã tệp Drive → SHA-256 nội dung → khóa Redis khi quét | Đặt 20 tệp vào thư mục → trong ≤ 2 chu kỳ quét, 20 tài liệu vào hàng đợi; quét lại → không tạo job trùng; gỡ chia sẻ thư mục → nguồn báo lỗi tiếng Việt, worker vẫn chạy bình thường |
+
+> **YC-BU-21 khác YC-BU-06 thế nào.** YC-BU-06 là thư mục **trên máy chủ** (FileBrowser/SMB) — cán bộ
+> phải ở trong mạng Nhà trường. YC-BU-21 là thư mục **trên Drive** — máy scan ở phòng nào cũng đổ
+> thẳng vào được, không cần VPN. Hai đường bổ sung cho nhau, dùng chung phần hạ nguồn (lô, chống
+> trùng, hàng đợi); YC-BU-06 vẫn chưa làm.
+
+**Ranh giới tự động hóa của YC-BU-21 (quan trọng):** hệ thống tự làm tới bước *trích metadata*, rồi
+DỪNG. Việc chọn bộ sưu tập DSpace và xác nhận vẫn ở màn hình Duyệt. Nguồn Drive chỉ đặt sẵn **gợi ý**
+bộ sưu tập. Đây là hiện thực hóa nguyên tắc SRS "con người giữ quyền quyết định — không tự ghi vào
+hệ đích khi chưa có cán bộ xác nhận" (chốt cứng YC-RV-04 vẫn áp dụng nguyên vẹn cho tài liệu từ Drive).
 
 ### 7.2 Yêu cầu — đường xử lý (hàng đợi & worker)
 
@@ -567,6 +587,50 @@ rồi, chỉ chưa dùng được.
 | YC-VH-10 | NC | **CI**: GitHub Actions chạy `pytest` + `npm run build` mỗi push | 224 test hiện chỉ chạy khi ai đó nhớ chạy |
 | YC-VH-11 | NC | **Kiểm thử E2E** (Playwright) cho 5 luồng chính: đăng nhập, tải lên, duyệt, đẩy DSpace, xem báo cáo | Lỗi `Content-Length` đã sửa ở commit `3663eaf` thuộc loại chỉ E2E mới bắt được |
 | YC-VH-12 | NC | **Trang trợ giúp tiếng Việt trong ứng dụng** (YC-VH-04) — hướng dẫn theo vai trò | Cán bộ mới tự làm được không cần kèm |
+
+### 9.4b YC-SC-09 — Đoán loại tài liệu tự động
+
+**Vấn đề.** Từ khi có 7 lược đồ biên mục (`docs/CATALOG_SCHEMAS.md`), chọn sai loại tài liệu nghĩa là
+trích xuất theo sai lược đồ — sai từ gốc, cán bộ phải gõ lại toàn bộ metadata. Nhưng bắt chọn tay
+từng tệp trong lô 500 tệp thì không ai làm nổi; thực tế mọi tệp sẽ đi với loại mặc định `book`.
+
+| Mã | Ưu tiên | Yêu cầu | Tiêu chí nghiệm thu |
+|---|---|---|---|
+| YC-SC-09 | BB | **Đoán loại tài liệu ba tầng**: (1) từ TÊN TỆP ngay khi chọn tệp, (2) từ NỘI DUNG sau khi OCR, (3) hỏi model chỉ khi hai tầng trên chưa đủ tự tin | Tệp `KL_NguyenVanA.pdf` → gợi ý "Khóa luận" ngay trước khi tải lên; tệp tên vô nghĩa nhưng nội dung là công văn → sau OCR nhận đúng "Công văn" |
+| YC-SC-10 | BB | **Gợi ý phải GIẢI THÍCH ĐƯỢC**: trả về đúng những dấu hiệu đã khớp, không chỉ một điểm số | Giao diện hiện "Gợi ý: Luận văn thạc sỹ · 82% — thấy: «luan van thac si», «nguoi huong dan khoa hoc»" |
+| YC-SC-11 | BB | **Người luôn thắng máy**: dropdown loại tài liệu ở màn hình tải lên, màn hình lô và màn hình duyệt; cán bộ chọn tay thì KHÔNG đoán lại | Chọn "Sách" cho một tệp → worker dùng lược đồ Sách kể cả khi nội dung giống công văn |
+| YC-SC-12 | BB | **Lưu tách biệt ý kiến máy và kết luận người** (`detected_type` vs `document_type`) để ĐO được độ chính xác | Trang thống kê hiện "đúng 87% trên 340 tài liệu đã duyệt" + bảng nhầm lẫn thường gặp |
+| YC-SC-13 | BB | **Mặc định an toàn khi đoán loại**: chưa biết độ nhạy cảm thì KHÔNG gửi văn bản ra đám mây chỉ để hỏi "đây là loại gì" — chỉ hỏi model TẠI CHỖ | Cấu hình chỉ có công cụ đám mây → tầng 3 bị bỏ qua, chỉ dùng đối sánh từ khóa |
+| YC-SC-14 | NC | Bản quét MẤT DẤU vẫn nhận ra được (đối sánh trên bản đã bỏ dấu) | OCR ra "luan van thac si" không dấu → vẫn đoán đúng |
+
+**Vì sao đối sánh từ khóa trước, không gọi model ngay:** chạy được khi ngắt mạng; kiểm thử được không
+cần dịch vụ ngoài (CI bắt được hồi quy); không tốn chi phí trên mỗi tài liệu của lô hàng nghìn tệp;
+và giải thích được — một điểm số trần trụi thì không cán bộ nào dám tin.
+
+---
+
+### 9.4c YC-TT — Thống kê theo người dùng & quản trị
+
+**Vấn đề.** `dashboard.staff_workload` (sprint V6) chỉ đếm hai hành động của việc duyệt trong 7 ngày.
+Nó trả lời "hôm nay ai duyệt nhiều", đủ để chia việc — nhưng không trả lời được: *người này đã làm
+những gì*, *toàn Trung tâm tháng này ra sao*, và *có dấu hiệu bất thường nào không*.
+
+| Mã | Ưu tiên | Yêu cầu | Tiêu chí nghiệm thu |
+|---|---|---|---|
+| YC-TT-01 | BB | **Thống kê theo từng cán bộ**: tải lên, duyệt, số trang, số trường đã sửa, đẩy DSpace, đăng nhập — gộp từ cả 4 lớp nhật ký | Mở trang thống kê thấy một dòng cho mỗi cán bộ, đủ 7 cột |
+| YC-TT-02 | BB | **Hồ sơ một người**: phân bố theo ngày, theo loại tài liệu, và 50 thao tác gần nhất | Bấm vào tên cán bộ → mở hồ sơ, thấy được người làm đều mỗi ngày hay dồn cuối tháng |
+| YC-TT-03 | BB | **Mỗi người xem được thống kê CỦA CHÍNH MÌNH** không cần quyền báo cáo | Tài khoản `viewer` gọi `/api/v2/stats/me` → 200 |
+| YC-TT-04 | BB | **Tổng quan quản trị** kèm số liệu AN NINH (đăng nhập hỏng, IP dò mật khẩu, số lần bị từ chối quyền) — cần quyền `USER_MANAGE`, KHÔNG phải `REPORT_READ` | Tài khoản `librarian` gọi `/api/v2/stats/admin` → 403 kèm thông báo tiếng Việt |
+| YC-TT-05 | BB | **Cảnh báo tính sẵn ở backend**, không để giao diện tự đặt ngưỡng | Một IP thử ≥3 tài khoản → cảnh báo mức "nguy hiểm" ghi rõ địa chỉ IP |
+| YC-TT-06 | BB | **Ngưỡng kép (số tuyệt đối VÀ tỉ lệ)** để hệ thống mới ít dữ liệu không báo động giả | Hệ thống có 1 lần đăng nhập hỏng trên 2 lần thử → KHÔNG cảnh báo |
+| YC-TT-07 | BB | **Ghi chú cách đọc (QĐ-06) nằm TRONG dữ liệu backend trả về**, giao diện luôn hiển thị | Ẩn cột nào cũng được, nhưng dòng "không phải bảng xếp hạng thi đua" không bị cắt |
+| YC-TT-08 | NC | **Độ chính xác đoán loại tài liệu** đo trên việc thật + bảng nhầm lẫn thường gặp | Chưa có tài liệu nào được duyệt → hiện "chưa đủ dữ liệu", KHÔNG hiện 0% |
+
+> **QĐ-06 được giữ nguyên hiệu lực.** Số liệu theo người là để **cân đối công việc**, không phải bảng
+> xếp hạng thi đua. Vì vậy cột *số trang* luôn đứng cạnh cột *số tài liệu*: một công văn 2 trang và
+> một khóa luận 200 trang đều là "1 tài liệu".
+
+---
 
 ### 9.4 YC-TK — Tích hợp & tài khoản dịch vụ
 

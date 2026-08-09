@@ -27,6 +27,7 @@ SOURCE_WEB = "web"
 SOURCE_ZIP = "zip"
 SOURCE_WATCH = "watch"
 SOURCE_API = "api"
+SOURCE_DRIVE = "drive"      # nạp tự động từ thư mục Google Drive (YC-BU-21)
 
 STATUS_RUNNING = "running"
 STATUS_PAUSED = "paused"

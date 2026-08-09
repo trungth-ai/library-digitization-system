@@ -74,6 +74,12 @@ QUEUE_SAMPLE_INTERVAL_SEC = int(os.getenv("QUEUE_SAMPLE_INTERVAL_SEC", "60"))
 ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "1").strip() not in ("0", "false", "no")
 ALERT_INTERVAL_SEC = int(os.getenv("ALERT_INTERVAL_SEC", "300"))
 
+# Nạp tự động từ Google Drive (YC-BU-21). MẶC ĐỊNH TẮT: đây là tính năng gọi ra Internet và tự tạo
+# việc trong hàng đợi — phải là quyết định có ý thức của người triển khai, không phải thứ tự bật lên
+# sau một lần `docker compose pull`. Bật bằng `DRIVE_INGEST_ENABLED=1` sau khi đã cấu hình xác thực.
+DRIVE_INGEST_ENABLED = os.getenv("DRIVE_INGEST_ENABLED", "0").strip() not in ("0", "false", "no")
+DRIVE_SCAN_INTERVAL_SEC = int(os.getenv("DRIVE_SCAN_INTERVAL_SEC", "300"))
+
 # ── Kết quả xử lý một job (ADR-011 mục 6) ────────────────────────────
 JOB_OK = "ok"
 JOB_FAILED_DOCUMENT = "document"   # lỗi của TÀI LIỆU → không thử lại, vào hàng đợi chết ngay
@@ -173,6 +179,9 @@ class DigitizationWorker:
         self._last_reclaim = 0.0
         self._last_sample = 0.0
         self._last_alert_check = 0.0
+        # 0 = quét Drive ngay vòng đầu: cán bộ vừa thêm thư mục xong phải thấy nó chạy, chứ không
+        # phải chờ hết một chu kỳ mới biết mình cấu hình đúng hay sai
+        self._last_drive_scan = 0.0
         # Giữ MỘT bộ gửi cảnh báo cho cả vòng đời worker — trạng thái chống spam nằm trong nó
         self._dispatcher = None
         # Chế độ hàng đợi đặt ở MỨC ĐỐI TƯỢNG, không đọc trực tiếp hằng module trong `run()`:
@@ -329,6 +338,14 @@ class DigitizationWorker:
             self._last_alert_check = now
             self._check_alerts()
 
+        # Quét thư mục Google Drive (YC-BU-21). Đặt trong worker chứ KHÔNG thêm container riêng:
+        # worker đã có sẵn vòng lặp nền, kết nối Redis và kết nối DB — một tiến trình nữa chỉ để
+        # gọi một API mỗi 5 phút là thêm thứ phải triển khai, giám sát và khởi động lại.
+        # Nhiều worker cùng quét được ngăn bằng khóa Redis trong `drive_ingest`.
+        if DRIVE_INGEST_ENABLED and now - self._last_drive_scan >= DRIVE_SCAN_INTERVAL_SEC:
+            self._last_drive_scan = now
+            self._scan_drive_sources()
+
         if now - self._last_reclaim < RECLAIM_INTERVAL_SEC:
             return
         self._last_reclaim = now
@@ -343,6 +360,65 @@ class DigitizationWorker:
                 )
         except Exception as e:  # noqa: BLE001
             logger.warning("Không thu hồi được việc mồ côi: %s", e)
+
+    def _enqueue_drive_job(self, job_id: str, filename: str, payload: dict,
+                           priority: str = jobqueue.PRIORITY_NORMAL) -> None:
+        """
+        Đưa một tài liệu tải từ Drive vào hàng đợi.
+
+        Bản sao có chủ đích của `scripts.api.enqueue_job`: hàm đó nằm trong tiến trình API và kéo
+        theo cả FastAPI. Worker chỉ cần đúng ba việc dưới đây, và giữ chúng ở đây thì việc quét Drive
+        không phụ thuộc vào tiến trình API còn sống hay không.
+        """
+        self.redis.hset(f"job:{job_id}", mapping={
+            "status": "queued",
+            "filename": filename,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "progress": "10",
+        })
+        jobqueue.push(self.redis, REDIS_QUEUE, payload, priority=priority)
+        db.create_document(
+            job_id=job_id, filename=filename,
+            collection_id=payload.get("collection_id", ""),
+            # 'auto' KHÔNG phải mã trong `document_types` (khóa ngoại sẽ từ chối). Ghi loại mặc định
+            # ở đây; worker sẽ đoán loại thật sau khi OCR rồi cập nhật lại (YC-SC-09).
+            document_type=(payload.get("document_type") or "book")
+                          if payload.get("document_type") != "auto" else "book",
+        )
+
+    def _scan_drive_sources(self) -> None:
+        """
+        Quét các thư mục Drive đã tới hạn (YC-BU-21).
+
+        Bọc kín try/except: một thư mục bị gỡ chia sẻ hay một token hết hạn KHÔNG được làm worker
+        ngừng xử lý tài liệu. Lỗi được ghi vào `drive_sources.last_scan_message` để cán bộ đọc trên
+        màn hình nguồn, và vào `system_events` để người vận hành thấy trong nhật ký chung.
+        """
+        try:
+            from pathlib import Path
+            from scripts.core import drive_ingest
+
+            ket_qua = drive_ingest.scan_due_sources(
+                base_dir=Path(DIGITIZE_DATA_DIR),
+                enqueue=self._enqueue_drive_job,
+                redis_client=self.redis,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Quét Google Drive thất bại")
+            self._log_event("drive_scan_failed", "error",
+                            "Không quét được thư mục Google Drive", str(e))
+            return
+
+        for result in ket_qua:
+            if not result.ok:
+                self._log_event("drive_scan_failed", "error",
+                                f"Nguồn Drive #{result.source_id} quét lỗi", result.error)
+            elif result.ingested:
+                self._log_event(
+                    "drive_ingested", "info",
+                    f"Nạp {result.ingested} tài liệu mới từ Google Drive "
+                    f"(nguồn #{result.source_id}, bỏ qua {result.skipped}, lỗi {result.failed})",
+                )
 
     def _handle_claimed(self, job: "jobqueue.ClaimedJob") -> None:
         """
@@ -756,6 +832,20 @@ class DigitizationWorker:
                 # Tách riêng phần gọi model để biết OCR chậm hay model chậm
                 if run.get("latency_ms") is not None:
                     stage_timings["model_call"] = run["latency_ms"]
+
+                # Loại tài liệu máy đoán (YC-SC-09) — đẩy ra Redis để màn hình duyệt hiện ngay,
+                # không phải chờ tải lại danh sách từ DB.
+                detected = run.get("detected")
+                if detected:
+                    self.redis.hset(f"job:{job_id}", mapping={
+                        "detected_type": detected.get("document_type") or "",
+                        "detected_label": detected.get("label") or "",
+                        "detected_confidence": str(detected.get("confidence") or 0),
+                        "detected_reason": detected.get("reason") or "",
+                    })
+                    logger.info("Job %s: máy đoán loại '%s' (%.2f) — %s", job_id,
+                                detected.get("label"), detected.get("confidence") or 0,
+                                detected.get("reason"))
                 logger.info(
                     "Job %s trích bằng %s (%s) model=%s, %d trường, %s ms",
                     job_id, run.get("provider"), run.get("mode"), run.get("model"),

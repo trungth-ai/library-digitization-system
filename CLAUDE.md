@@ -21,7 +21,8 @@ tại Trung tâm Thông tin Thư viện HPU từ 2025. Quy trình: upload PDF �
 - **Frontend**: Next.js 16 (App Router), React 19, Tailwind 4.
 - **AI**: lớp provider đa công cụ — mặc định Claude (đám mây); tại chỗ có Ollama/vLLM/llama.cpp/LM Studio/TGI;
   đám mây khác có OpenAI/Azure/Gemini/Groq/OpenRouter... Đổi bằng `MODEL_PROVIDER` — xem ADR-007, ADR-002.
-- **Tích hợp**: DSpace 6.3/7.x REST API.
+- **Tích hợp**: DSpace 6.3/7.x REST API; Google Drive v3 (nạp tự động, CHỈ ĐỌC — `scripts/core/gdrive.py`,
+  viết bằng `urllib`, không dùng SDK Google để giữ air-gapped).
 - **Hạ tầng**: Docker Compose (postgres, redis, api, worker, ui + n8n/grafana/filebrowser tùy chọn).
 
 ## Cấu trúc thư mục (hiện tại → đích)
@@ -90,4 +91,15 @@ docker compose up -d --build
 - `docs/UPGRADE_REQUIREMENTS.md` — **yêu cầu nâng cấp đợt 2** (log hệ thống, phân tích AI chi tiết,
   nạp khối lượng lớn, dashboard, phân quyền, nhật ký người dùng) + 3 vấn đề nghiêm trọng của hệ đang chạy
 - `docs/UPGRADE_SPRINTS.md` — 9 sprint V1–V9: việc, DoD, van lùi, cổng đi tiếp
-- `docs/UPGRADE_TEST_CASES.md` — 145 trường hợp kiểm thử + ma trận truy vết YC ↔ KT ↔ Sprint
+- `docs/UPGRADE_TEST_CASES.md` — trường hợp kiểm thử + ma trận truy vết YC ↔ KT ↔ Sprint
+  (mục 19 = bổ sung 09/08/2026 cho YC-SC-09→14, YC-BU-21, YC-TT)
+- `docs/CATALOG_SCHEMAS.md` — 7 lược đồ biên mục theo bộ mẫu HPU + quy tắc nguồn trường (ai/system/manual)
+
+## Ba nhóm chức năng thêm 08/2026 (đọc trước khi sửa phần liên quan)
+- **Đoán loại tài liệu** (`scripts/core/doc_classifier.py`): ba tầng rẻ→đắt. Tầng 3 (hỏi model) CHỈ
+  chạy với công cụ TẠI CHỖ — lúc đoán loại chưa biết độ nhạy cảm, YC-DR-02 bắt xử lý tại chỗ.
+  Muốn tinh chỉnh độ chính xác thì sửa `_SIGNALS_RAW`, đừng sửa công thức tính điểm.
+- **Nạp từ Drive** (`scripts/core/{gdrive,drive_ingest}.py`): vòng quét nằm TRONG `worker._maintenance`,
+  không có container riêng. Mặc định TẮT (`DRIVE_INGEST_ENABLED=0`).
+- **Thống kê người dùng** (`scripts/core/user_stats.py`): ngưỡng cảnh báo tính ở backend, KHÔNG để
+  giao diện tự đặt. Ghi chú QĐ-06 nằm trong dữ liệu trả về — không được bỏ khi hiển thị.

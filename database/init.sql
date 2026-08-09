@@ -78,6 +78,14 @@ CREATE TABLE IF NOT EXISTS documents (
     needs_review           BOOLEAN     NOT NULL DEFAULT FALSE,  -- YC-CF-03: cần cán bộ xử lý tay
     review_note            TEXT,          -- lý do cần xem lại (lỗi hợp lệ, điểm tin cậy thấp)
 
+    -- Loại tài liệu MÁY đoán (YC-SC-09). Tách khỏi `document_type` (loại cán bộ chốt) để so được
+    -- "máy đoán" với "người chốt" → đo được độ chính xác. Không FK: mã lạ do model trả về vẫn phải
+    -- ghi được, đoán sai không được biến thành job thất bại.
+    detected_type          VARCHAR(50),
+    detected_confidence    NUMERIC(4, 3),
+    detected_source        VARCHAR(20),   -- filename | text | model | none
+    detected_reason        TEXT,          -- dấu hiệu đã khớp, viết bằng tiếng Việt cho cán bộ đọc
+
     -- Thời gian xử lý (theo dõi vận hành + YC-HN). `finished_at - created_at` KHÔNG dùng được vì
     -- gồm cả thời gian nằm chờ trong hàng đợi; hai cột dưới đây đo đúng phần worker thực sự làm.
     duration_ms            INTEGER,       -- tổng thời gian worker xử lý tài liệu này
@@ -103,6 +111,9 @@ CREATE INDEX IF NOT EXISTS idx_documents_not_deleted    ON documents(created_at 
     WHERE status <> 'deleted';
 CREATE INDEX IF NOT EXISTS idx_documents_needs_review   ON documents(needs_review)
     WHERE needs_review;
+-- Đo độ chính xác của việc đoán loại: "tài liệu nào máy đoán khác loại cán bộ chốt"
+CREATE INDEX IF NOT EXISTS idx_documents_detected_mismatch ON documents(created_at DESC)
+    WHERE detected_type IS NOT NULL AND detected_type <> document_type;
 
 -- =====================================================================
 -- 4b. TRIGGER: tự cập nhật updated_at (chuẩn HPU — không phụ thuộc app nhớ set)
@@ -852,6 +863,66 @@ ALTER TABLE documents
 
 CREATE INDEX IF NOT EXISTS idx_documents_unconfirmed ON documents(updated_at ASC)
     WHERE confirmed_at IS NULL AND status = 'completed';
+
+-- =====================================================================
+-- 15. NẠP TỰ ĐỘNG TỪ GOOGLE DRIVE (YC-BU-21)
+--     Giữ ĐỒNG BỘ với database/migrations/011_drive_ingest.sql.
+--
+--     `drive_sources` là CẤU HÌNH (thư mục nào, tham số gì); `drive_files` là SỔ GHI tệp nào đã nạp
+--     — chính sổ này làm cho việc quét lặp lại an toàn, không tạo job trùng.
+--
+--     Máy khách Drive CHỈ ĐỌC: hệ thống không bao giờ sửa/xóa tệp gốc của Nhà trường.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS drive_sources (
+    id                  SERIAL PRIMARY KEY,
+    name                VARCHAR(200) NOT NULL,
+    folder_id           VARCHAR(200) NOT NULL UNIQUE,
+    folder_name         VARCHAR(300) DEFAULT '',
+    document_type       VARCHAR(50)  NOT NULL DEFAULT 'auto',  -- 'auto' = đoán theo nội dung (YC-SC-09)
+    collection_id       TEXT         NOT NULL DEFAULT '',
+    collection_name     TEXT         NOT NULL DEFAULT '',
+    language            VARCHAR(20)  NOT NULL DEFAULT 'vie',
+    priority            VARCHAR(10)  NOT NULL DEFAULT 'low',   -- mẻ nền, không chen tài liệu lẻ
+    status              VARCHAR(20)  NOT NULL DEFAULT 'active', -- active | paused | deleted (xóa mềm)
+    scan_interval_sec   INTEGER      NOT NULL DEFAULT 300,
+    last_scan_at        TIMESTAMPTZ,
+    last_scan_status    VARCHAR(20),
+    last_scan_message   TEXT,
+    last_scan_found     INTEGER      NOT NULL DEFAULT 0,
+    last_scan_ingested  INTEGER      NOT NULL DEFAULT 0,
+    created_by          INTEGER,
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_drive_sources_active ON drive_sources(last_scan_at NULLS FIRST)
+    WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS drive_files (
+    id             SERIAL PRIMARY KEY,
+    source_id      INTEGER      NOT NULL REFERENCES drive_sources(id),
+    -- DUY NHẤT TOÀN BẢNG: cùng một tệp chia sẻ vào hai thư mục vẫn là MỘT tài liệu
+    drive_file_id  VARCHAR(200) NOT NULL UNIQUE,
+    filename       TEXT         NOT NULL,
+    size_bytes     BIGINT       NOT NULL DEFAULT 0,
+    drive_md5      VARCHAR(64)  DEFAULT '',
+    modified_time  TIMESTAMPTZ,
+    job_id         TEXT         REFERENCES documents(id),
+    status         VARCHAR(20)  NOT NULL DEFAULT 'ingested',   -- ingested | skipped | failed
+    note           TEXT,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_drive_files_source ON drive_files(source_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_drive_files_failed ON drive_files(source_id, updated_at DESC)
+    WHERE status = 'failed';
+
+DROP TRIGGER IF EXISTS trg_drive_sources_touch ON drive_sources;
+CREATE TRIGGER trg_drive_sources_touch BEFORE UPDATE ON drive_sources
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+DROP TRIGGER IF EXISTS trg_drive_files_touch ON drive_files;
+CREATE TRIGGER trg_drive_files_touch BEFORE UPDATE ON drive_files
+    FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 
 -- =====================================================================
 -- END OF SCHEMA

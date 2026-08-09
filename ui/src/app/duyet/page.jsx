@@ -164,6 +164,16 @@ export default function DuyetPage() {
           busy={busy}
           onConfirm={() => confirmOne(selected.id)}
           onClose={() => setSelected(null)}
+          onTypeChanged={(loaiMoi) => {
+            // Cập nhật ngay tại chỗ, không tải lại cả danh sách: cán bộ đang giữa mạch duyệt,
+            // một lần danh sách nhấp nháy là một lần mất chỗ đang xem.
+            setSelected((d) => ({ ...d, document_type: loaiMoi }));
+            setPending((ds) =>
+              ds.map((d) => (d.id === selected.id ? { ...d, document_type: loaiMoi } : d))
+            );
+            setNotice("Đã cập nhật loại tài liệu");
+          }}
+          onError={setError}
         />
       ) : (
         <PendingList
@@ -259,7 +269,7 @@ function PendingList({ docs, checked, onToggle, onOpen }) {
   );
 }
 
-function ReviewPane({ doc, metadata, busy, onConfirm, onClose }) {
+function ReviewPane({ doc, metadata, busy, onConfirm, onClose, onTypeChanged, onError }) {
   return (
     <div>
       <div className="flex items-center justify-between mb-3">
@@ -301,6 +311,8 @@ function ReviewPane({ doc, metadata, busy, onConfirm, onClose }) {
         {/* Cột phải: metadata, tô màu trường điểm thấp (YC-CF-04) */}
         <div className="bg-white rounded-xl border border-gray-200 p-4 overflow-y-auto"
              style={{ maxHeight: "70vh" }}>
+          <DocumentTypePanel doc={doc} onChanged={onTypeChanged} onError={onError} />
+
           <h3 className="text-sm font-semibold text-gray-800 mb-2">Metadata trích xuất</h3>
           {metadata.length === 0 ? (
             <p className="text-sm text-gray-500">Chưa tải được metadata.</p>
@@ -317,6 +329,98 @@ function ReviewPane({ doc, metadata, busy, onConfirm, onClose }) {
           </p>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Loại tài liệu của bản ghi đang duyệt (YC-SC-09).
+ *
+ * VÌ SAO Ở NGAY ĐẦU CỘT METADATA: loại tài liệu quyết định LƯỢC ĐỒ, tức là quyết định các trường
+ * bên dưới có đúng bộ hay không. Cán bộ nhìn thấy "Luận văn thạc sỹ" mà tài liệu là khóa luận thì
+ * phải sửa TRƯỚC, chứ sửa từng trường bên dưới là chữa triệu chứng.
+ *
+ * Khi máy đoán khác loại đang dùng, ta nói rõ máy đoán gì và VÌ SAO — đây là chỗ duy nhất cán bộ có
+ * cơ hội bác bỏ máy một cách có căn cứ.
+ */
+function DocumentTypePanel({ doc, onChanged, onError }) {
+  const [types, setTypes] = useState([]);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch("/api/loai-tai-lieu", { credentials: "include" });
+        if (!res.ok) return;
+        const payload = await res.json();
+        setTypes(Array.isArray(payload) ? payload : payload.data || []);
+      } catch {
+        /* không tải được thì vẫn hiện loại hiện tại, chỉ là không đổi được */
+      }
+    })();
+  }, []);
+
+  async function doiLoai(loaiMoi) {
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/ocr/jobs/${doc.id}/document-type`, {
+        method: "PUT",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ document_type: loaiMoi }),
+      });
+      const payload = await res.json();
+      if (!res.ok) {
+        onError?.(payload.message || "Không đổi được loại tài liệu");
+        return;
+      }
+      onChanged?.(loaiMoi);
+    } catch (err) {
+      onError?.(`Không kết nối được backend (${err.message})`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const mayDoanKhac =
+    doc.detected_type &&
+    doc.detected_type !== doc.document_type &&
+    Number(doc.detected_confidence) > 0;
+
+  return (
+    <div className="mb-4 pb-3 border-b border-gray-100">
+      <label className="block text-xs font-semibold text-gray-700 mb-1">Loại tài liệu</label>
+      <select
+        value={doc.document_type || ""}
+        onChange={(e) => doiLoai(e.target.value)}
+        disabled={saving || types.length === 0}
+        className="w-full rounded-lg border border-gray-300 px-3 py-1.5 text-sm disabled:bg-gray-100"
+      >
+        {types.map((t) => (
+          <option key={t.code} value={t.code}>
+            {t.label}
+          </option>
+        ))}
+      </select>
+
+      {doc.detected_reason && (
+        <p className="text-xs text-gray-500 mt-1">
+          {doc.detected_source === "model" ? "Model" : "Hệ thống"} đoán:{" "}
+          <strong>{doc.detected_type}</strong> ({Math.round(Number(doc.detected_confidence) * 100)}%)
+          — {doc.detected_reason}
+        </p>
+      )}
+
+      {mayDoanKhac && (
+        <button
+          type="button"
+          onClick={() => doiLoai(doc.detected_type)}
+          disabled={saving}
+          className="mt-1.5 rounded border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900 hover:bg-amber-100 disabled:opacity-50"
+        >
+          Máy đoán loại khác — đổi sang «{doc.detected_type}»
+        </button>
+      )}
     </div>
   );
 }
